@@ -1,6 +1,6 @@
 # Production updater release runbook
 
-Goal 04I established the reviewed production updater tooling initially used for `v0.1.1`. Later owner-authorized cycles exercised the same separated candidate, draft and activation boundaries through immutable `v0.1.1` and `v0.1.2`. The current production release is `v0.1.2`, published from source `f0ce82ff92ca3fdbeefc744b828b37eaa546626d`; all release mutations still require explicit owner authorization.
+Goal 04I established the reviewed production updater tooling. All release mutations on `unrealbg/UBGOps` require explicit owner authorization; no `v0.1.2` GitHub Release or tag has been published on `unrealbg/UBGOps` yet.
 
 ## Identity and version
 
@@ -97,10 +97,5 @@ The accepted flow observed `0.1.2` as downloaded and verified against the UBGOps
 ## Current state
 
 - Product metadata is `0.1.2`.
-- Current release source is `f0ce82ff92ca3fdbeefc744b828b37eaa546626d`.
-- Signed candidate run `37149396703` completed successfully at that exact source.
-- Draft-preparation run `37158799683` created and fully re-downloaded/verified the exact seven-asset draft.
-- Publication run `37159270872` completed successfully with the version-bound unsigned-publisher decision.
-- GitHub Release `402717857` / tag `v0.1.2` is published, latest and immutable.
-- The Windows production installer `UBGOps_0.1.2_x64-setup.exe` has SHA-256 `3672d241565afa68cfdc27fdf78fa4f692eac4537e5d6f5d424916a623ba6ac5`.
-- Native Windows `0.1.1 → 0.1.2` acceptance is complete; see the [Goal 04S production release report](../validation/goal-04s-production-release-report.md).
+- No GitHub Release or `v0.1.2` tag has been published on `unrealbg/UBGOps` yet; the `latest.json` endpoint will return 404 until an owner-authorized release cycle runs.
+- Historical pre-rename Windows `0.1.1 → 0.1.2` acceptance is recorded in the [Goal 04S production release report](../validation/goal-04s-production-release-report.md).
