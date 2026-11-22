@@ -5,10 +5,6 @@ use crate::{
         LocalIdentity, local_identity, validate_local_directory_handle, validate_local_source,
     },
 };
-use ubgops_model::{
-    AppError, ConflictPolicy, ErrorCode, FileOperationPlan, HostId, HostSessionId, RemoteEntryKind,
-    SftpSessionId, TransferDirection, TransferJob, TransferJobId, TransferState,
-};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -18,6 +14,10 @@ use std::{
 use tempfile::Builder;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use ubgops_model::{
+    AppError, ConflictPolicy, ErrorCode, FileOperationPlan, HostId, HostSessionId, RemoteEntryKind,
+    SftpSessionId, TransferDirection, TransferJob, TransferJobId, TransferState,
+};
 
 const GLOBAL_ACTIVE: usize = 4;
 const HOST_ACTIVE: usize = 2;
@@ -1331,10 +1331,10 @@ fn transfer_error(message: &'static str) -> AppError {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ubgops_model::{DirectoryListing, RemoteEntry, SftpLimits, SftpSessionInfo};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
     use tokio::sync::Notify;
+    use ubgops_model::{DirectoryListing, RemoteEntry, SftpLimits, SftpSessionInfo};
 
     struct CountingClient {
         info: SftpSessionInfo,

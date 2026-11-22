@@ -1,7 +1,7 @@
 use std::{net::IpAddr, path::Path, sync::Mutex, time::Duration};
 
-use ubgops_model::{AppError, ErrorCode, HostFingerprint, HostKeyChallenge};
 use rusqlite::{Connection, OptionalExtension, params};
+use ubgops_model::{AppError, ErrorCode, HostFingerprint, HostKeyChallenge};
 
 /// Persisted TOFU pins scoped to the canonical configured hostname and SSH port.
 /// Trust never replaces an existing pin, including during competing trust requests.

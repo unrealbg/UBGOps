@@ -1,7 +1,7 @@
 use crate::{ConsumedAuthority, NativeOperation};
 use async_trait::async_trait;
-use ubgops_model::AppError;
 use tokio_util::sync::CancellationToken;
+use ubgops_model::AppError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteOperationOutcome {

@@ -1,5 +1,3 @@
-use ubgops_core::Application;
-use ubgops_model::{AppError, ErrorCode};
 use std::{
     future::Future,
     sync::{Arc, Mutex},
@@ -8,6 +6,8 @@ use std::{
 use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 use tracing_appender::non_blocking::WorkerGuard;
+use ubgops_core::Application;
+use ubgops_model::{AppError, ErrorCode};
 
 const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const CLOSING_MESSAGE: &str = "UBGOps is closing. Restart the application to continue.";

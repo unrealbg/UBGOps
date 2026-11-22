@@ -1,11 +1,11 @@
 use crate::AuditEvent;
-use ubgops_model::{AppError, ErrorCode};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
+use ubgops_model::{AppError, ErrorCode};
 
 const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 

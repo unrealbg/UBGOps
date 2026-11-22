@@ -1,6 +1,6 @@
-use ubgops_model::{AppError, AuthenticationMethod, ErrorCode, Host, HostConnectionConfig, HostId};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex};
+use ubgops_model::{AppError, AuthenticationMethod, ErrorCode, Host, HostConnectionConfig, HostId};
 
 #[derive(Clone)]
 pub struct StoredHost {

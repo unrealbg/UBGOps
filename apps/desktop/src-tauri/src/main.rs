@@ -5,8 +5,8 @@ mod local_access;
 mod update_download;
 mod update_install;
 mod updates;
-use ubgops_core::Application;
 use tauri::Manager;
+use ubgops_core::Application;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let application = tauri::Builder::default()

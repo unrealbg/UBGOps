@@ -1,6 +1,6 @@
 use super::*;
-use ubgops_sftp::{LocalDirectory, LocalItem, MutationSpec, SftpClient};
 use std::sync::Arc;
+use ubgops_sftp::{LocalDirectory, LocalItem, MutationSpec, SftpClient};
 
 impl Application {
     pub async fn open_sftp(&self, host_id: HostId) -> Result<SftpSessionInfo, AppError> {
@@ -232,7 +232,8 @@ impl Application {
         new_name: String,
     ) -> Result<FileOperationPlan, AppError> {
         ubgops_sftp::validate_child_name(&new_name)?;
-        let destination = ubgops_sftp::join_remote(&ubgops_sftp::parent_remote(&source)?, &new_name)?;
+        let destination =
+            ubgops_sftp::join_remote(&ubgops_sftp::parent_remote(&source)?, &new_name)?;
         let startup = self.sftp_lifecycle_gate(host_id).await;
         let _startup_guard = startup.lock().await;
         let client = self

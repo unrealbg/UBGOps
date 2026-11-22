@@ -3,13 +3,13 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
-use ubgops_model::{AppError, ErrorCode, HostId};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+use ubgops_model::{AppError, ErrorCode, HostId};
 use zeroize::Zeroizing;
 
 fn failure() -> AppError {

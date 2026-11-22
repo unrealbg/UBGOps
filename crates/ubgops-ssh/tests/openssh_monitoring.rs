@@ -1,13 +1,13 @@
 //! Opt-in fixed-command monitoring validation against the owned OpenSSH fixture.
 
+use std::{env, fs, sync::Arc, time::Instant};
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{
     AuthenticationMethod, ErrorCode, Host, HostConnectionConfig, HostId, HostSessionId,
 };
 use ubgops_operations::RemoteSession;
 use ubgops_secrets::Credential;
 use ubgops_ssh::{KnownHosts, SshProvider};
-use std::{env, fs, sync::Arc, time::Instant};
-use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 #[tokio::test]

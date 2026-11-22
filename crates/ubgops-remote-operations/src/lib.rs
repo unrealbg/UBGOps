@@ -14,7 +14,6 @@ mod systemd_try_restart;
 
 pub use admission::{ExecutionAdmission, ExecutionPermit};
 pub use authority::{AuthorityBinding, ConsumedAuthority, NativeOperation, PlanDraft, PlanReceipt};
-pub use ubgops_model::RemoteOperationPlanId;
 pub use outcome::{
     AuthorityRevalidator, CompletionUnknownReason, ExecutionResult, ExecutionTerminal,
     MutationTransport, MutationTransportOutcome, NotDispatchedReason, RemoteOperationOutcome,
@@ -26,10 +25,11 @@ pub use systemd_reset_failed::{
 };
 pub use systemd_start::{SystemdStart, SystemdStartPreconditions};
 pub use systemd_try_restart::{SystemdTryRestart, SystemdTryRestartPreconditions};
+pub use ubgops_model::RemoteOperationPlanId;
 
-use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId};
 use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
+use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId};
 
 #[derive(Default)]
 pub struct RemoteOperationFoundation {

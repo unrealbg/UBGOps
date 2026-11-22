@@ -1,7 +1,7 @@
 //! Explicit integration test: exercises the signed-in user's OS keychain.
+use std::sync::Arc;
 use ubgops_model::{AuthenticationMethod, HostId};
 use ubgops_secrets::{CredentialInput, EncryptedSecretStore, PlatformKeyProvider, SecretStore};
-use std::sync::Arc;
 
 #[test]
 #[ignore = "requires an unlocked interactive OS credential store"]

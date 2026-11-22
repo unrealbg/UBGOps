@@ -1,5 +1,4 @@
 use crate::{KnownHosts, error::HandlerError};
-use ubgops_model::{AppError, ErrorCode, HostFingerprint};
 use russh::{
     client,
     keys::{HashAlg, PublicKeyOrCertificate},
@@ -8,6 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use ubgops_model::{AppError, ErrorCode, HostFingerprint};
 pub(crate) struct Client {
     pub(crate) known_hosts: Arc<KnownHosts>,
     pub(crate) hostname: String,
