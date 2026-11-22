@@ -69,9 +69,9 @@ impl AsyncWrite for CancellableStream {
     }
 }
 
-use ubgops_model::{AppError, ErrorCode};
 use std::time::Duration;
 use tokio::time::timeout;
+use ubgops_model::{AppError, ErrorCode};
 
 pub(crate) async fn bounded<T>(
     cancellation: &CancellationToken,

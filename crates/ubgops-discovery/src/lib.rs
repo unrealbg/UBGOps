@@ -23,9 +23,9 @@ pub use probes::{HostProbe, builtin_probes};
 pub use routes::{observe_routes, parse_routes};
 pub use services::{observe_services, parse_services};
 
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{AppError, DiscoverySnapshot, ErrorCode};
 use ubgops_operations::{OperationEngine, RemoteSession};
-use tokio_util::sync::CancellationToken;
 
 /// Discover a connected host. Optional failures become warnings; only cancellation
 /// aborts discovery. A failed probe never disconnects the underlying session.

@@ -1,11 +1,11 @@
 use crate::{
     lifecycle::LogGuardService, local_access::LocalAccessService, updates::InstallAuthority,
 };
-use ubgops_core::Application;
-use ubgops_model::{AppError, ErrorCode};
 use std::future::Future;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_updater::Update;
+use ubgops_core::Application;
+use ubgops_model::{AppError, ErrorCode};
 
 const INSTALL_UNAVAILABLE: &str = "In-app update installation is not available on this platform.";
 const INSTALL_FAILED: &str =

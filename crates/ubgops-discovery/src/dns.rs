@@ -1,10 +1,10 @@
+use std::net::IpAddr;
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{
     AppError, DnsConfigurationSnapshot, DnsNameserverEntry, DnsSearchDirective, DnsSortlistEntry,
     ErrorCode, HostId, HostSessionId, NetworkAddressFamily,
 };
 use ubgops_operations::{OperationEngine, ReadOnlyCommand, RemoteSession};
-use std::net::IpAddr;
-use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_LINES: usize = 256;

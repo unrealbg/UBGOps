@@ -1,7 +1,7 @@
 use crate::{ReadOnlyCommand, RemoteSession};
-use ubgops_model::{AppError, ErrorCode, Operation, OperationRisk};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use ubgops_model::{AppError, ErrorCode, Operation, OperationRisk};
 
 /// A reviewable plan. The command is private so metadata cannot substitute a shell.
 pub struct OperationPlan {

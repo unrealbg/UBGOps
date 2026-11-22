@@ -22,8 +22,8 @@ pub use policy::{
 pub use transfer::TransferManager;
 
 use async_trait::async_trait;
-use ubgops_model::{AppError, HostId, HostSessionId};
 use std::sync::Arc;
+use ubgops_model::{AppError, HostId, HostSessionId};
 
 #[async_trait]
 pub trait SftpConnector: Send + Sync {

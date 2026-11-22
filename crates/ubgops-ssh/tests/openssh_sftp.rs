@@ -1,5 +1,10 @@
 //! Opt-in streamed SFTP acceptance against the marker-owned OpenSSH fixture.
 
+use sha2::{Digest, Sha256};
+use std::{env, fs, sync::Arc};
+use tempfile::tempdir;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{
     AuthenticationMethod, Host, HostConnectionConfig, HostId, HostSessionId, TerminalSize,
 };
@@ -11,11 +16,6 @@ use ubgops_sftp::{
 };
 use ubgops_ssh::{KnownHosts, SshProvider};
 use ubgops_terminal::TerminalConnector;
-use sha2::{Digest, Sha256};
-use std::{env, fs, sync::Arc};
-use tempfile::tempdir;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 struct Fixture {
@@ -226,8 +226,7 @@ async fn openssh_remote_text_editor_interoperability() {
             &format!("goal-02c-{label}-{}.txt", uuid::Uuid::new_v4()),
         )
         .unwrap();
-        let stage =
-            join_remote(&root, &format!(".ubgops-{}.part", uuid::Uuid::new_v4())).unwrap();
+        let stage = join_remote(&root, &format!(".ubgops-{}.part", uuid::Uuid::new_v4())).unwrap();
         let mut reader = std::io::Cursor::new(original.to_vec());
         client
             .upload_staged(
@@ -642,8 +641,7 @@ async fn openssh_sftp_streaming_interoperability() {
         .expect("empty finalize");
     assert!(download_bytes(client.as_ref(), &empty).await.is_empty());
 
-    let conflicting_stage =
-        join_remote(&root, ".ubgops-conflict.part").expect("conflict staging");
+    let conflicting_stage = join_remote(&root, ".ubgops-conflict.part").expect("conflict staging");
     client
         .upload_staged(
             &mut std::io::Cursor::new(b"replacement".to_vec()),

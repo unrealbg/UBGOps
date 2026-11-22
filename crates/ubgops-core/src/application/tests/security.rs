@@ -62,7 +62,9 @@ impl ubgops_remote_operations::MutationTransport<ubgops_remote_operations::Syste
 {
     async fn dispatch(
         &self,
-        _: &ubgops_remote_operations::ConsumedAuthority<ubgops_remote_operations::SystemdResetFailed>,
+        _: &ubgops_remote_operations::ConsumedAuthority<
+            ubgops_remote_operations::SystemdResetFailed,
+        >,
         _: CancellationToken,
     ) -> ubgops_remote_operations::MutationTransportOutcome {
         panic!("trust read dispatched mutation")
@@ -74,7 +76,9 @@ impl ubgops_remote_operations::MutationTransport<ubgops_remote_operations::Syste
 {
     async fn dispatch(
         &self,
-        _: &ubgops_remote_operations::ConsumedAuthority<ubgops_remote_operations::SystemdTryRestart>,
+        _: &ubgops_remote_operations::ConsumedAuthority<
+            ubgops_remote_operations::SystemdTryRestart,
+        >,
         _: CancellationToken,
     ) -> ubgops_remote_operations::MutationTransportOutcome {
         panic!("trust read dispatched mutation")

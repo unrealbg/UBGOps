@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::OwnedMutexGuard;
 use ubgops_remote_operations::{
     AuthorityBinding, AuthorityRevalidator, ConsumedAuthority, ExecutionTerminal,
     MutationTransportOutcome, PlanDraft, RemoteOperationOutcome, SystemdReload,
@@ -6,7 +7,6 @@ use ubgops_remote_operations::{
     SystemdServiceUnitName, SystemdStart, SystemdStartPreconditions, SystemdTryRestart,
     SystemdTryRestartPreconditions,
 };
-use tokio::sync::OwnedMutexGuard;
 
 const RESET_FAILED_EFFECT: &str = "Clears the selected service's failed state and rate-limit/restart counters. It does not intentionally start or stop the service, but it can affect later service behavior.";
 const TRY_RESTART_EFFECT: &str = "Restarts the selected running service, which may be temporarily unavailable. Systemd may affect dependency-related jobs according to the unit configuration. Successful command completion does not guarantee application-level health. If the service becomes inactive before command execution, try-restart may perform no restart. There is no rollback.";

@@ -1,6 +1,5 @@
 use super::*;
 use async_trait::async_trait;
-use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId, OperationRisk};
 use std::{
     sync::{
         Arc, Barrier,
@@ -9,6 +8,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Notify;
+use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId, OperationRisk};
 
 struct FakeOperation;
 impl super::authority::sealed::Sealed for FakeOperation {}

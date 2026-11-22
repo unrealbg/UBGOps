@@ -1,7 +1,7 @@
 //! Single source of truth: emit IPC declarations or check the checked-in contract.
+use ts_rs::{Config, TS};
 use ubgops_model::*;
 use ubgops_secrets::CredentialInput;
-use ts_rs::{Config, TS};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default();

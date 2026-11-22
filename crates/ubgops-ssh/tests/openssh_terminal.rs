@@ -2,6 +2,8 @@
 //! Terminal contents remain in test memory and are never printed or logged.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::{env, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{
     AuthenticationMethod, Host, HostConnectionConfig, HostId, HostSessionId, TerminalSession,
     TerminalSize, TerminalState,
@@ -10,8 +12,6 @@ use ubgops_operations::RemoteSession;
 use ubgops_secrets::Credential;
 use ubgops_ssh::{KnownHosts, SshProvider};
 use ubgops_terminal::{OUTPUT_BATCH_BYTES, OUTPUT_CHUNK_BYTES, TerminalManager};
-use std::{env, sync::Arc, time::Duration};
-use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 struct Fixture {

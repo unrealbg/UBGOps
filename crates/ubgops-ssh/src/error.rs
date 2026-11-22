@@ -1,5 +1,5 @@
-use ubgops_model::{AppError, ErrorCode};
 use std::io;
+use ubgops_model::{AppError, ErrorCode};
 
 // Remote protocol text and key material must not escape via library error formatting.
 pub(crate) enum HandlerError {

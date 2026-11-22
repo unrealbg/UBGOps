@@ -1,8 +1,8 @@
 //! OS-backed encrypted credentials. No plaintext persistence or fallback backend.
 mod vault;
-use ubgops_model::{AppError, AuthenticationMethod, ErrorCode, HostId};
 use serde::Deserialize;
 use ts_rs::TS;
+use ubgops_model::{AppError, AuthenticationMethod, ErrorCode, HostId};
 pub use vault::{EncryptedSecretStore, KeyProvider, PlatformKeyProvider};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
