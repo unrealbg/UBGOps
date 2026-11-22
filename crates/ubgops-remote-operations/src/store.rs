@@ -2,7 +2,6 @@ use crate::{
     AuthorityBinding, ConsumedAuthority, NativeOperation, PlanDraft, PlanReceipt,
     RemoteOperationPlanId, authority::StoredAuthority,
 };
-use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId};
 use std::{
     any::TypeId,
     collections::HashMap,
@@ -10,6 +9,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
+use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId};
 
 pub const PLAN_TTL: Duration = Duration::from_secs(120);
 
@@ -207,7 +207,11 @@ impl AuthorityStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn corrupt_risk(&self, id: RemoteOperationPlanId, risk: ubgops_model::OperationRisk) {
+    pub(crate) fn corrupt_risk(
+        &self,
+        id: RemoteOperationPlanId,
+        risk: ubgops_model::OperationRisk,
+    ) {
         self.state
             .lock()
             .unwrap()

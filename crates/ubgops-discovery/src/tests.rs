@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
-use ubgops_operations::ReadOnlyCommand;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use ubgops_operations::ReadOnlyCommand;
 
 struct PartialSession {
     calls: AtomicUsize,

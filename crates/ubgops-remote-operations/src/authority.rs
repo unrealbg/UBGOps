@@ -1,6 +1,6 @@
-use ubgops_model::{HostId, HostSessionId, OperationRisk, RemoteOperationPlanId};
 use std::{any::Any, marker::PhantomData};
 use tokio::time::Instant;
+use ubgops_model::{HostId, HostSessionId, OperationRisk, RemoteOperationPlanId};
 
 /// Smallest connection binding that identifies the authenticated backend session.
 /// Host configuration and credentials cannot change while this identity remains current.

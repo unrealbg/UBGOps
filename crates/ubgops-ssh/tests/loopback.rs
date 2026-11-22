@@ -12,6 +12,16 @@ use std::{
     time::Duration,
 };
 
+use russh::{
+    Channel, ChannelId, Sig,
+    keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
+    server::{self, Auth, Server as _},
+};
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout},
+};
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{
     AppError, AuthenticationMethod, ErrorCode, Host, HostConnectionConfig, HostFingerprint, HostId,
     HostKeyChallenge, HostSessionId,
@@ -26,16 +36,6 @@ use ubgops_remote_operations::{
 use ubgops_secrets::Credential;
 use ubgops_sftp::SftpConnector;
 use ubgops_ssh::{KnownHosts, SshProvider};
-use russh::{
-    Channel, ChannelId, Sig,
-    keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
-    server::{self, Auth, Server as _},
-};
-use tokio::{
-    net::TcpListener,
-    time::{sleep, timeout},
-};
-use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 #[derive(Clone)]
@@ -71,11 +71,13 @@ impl server::Handler for FixtureHandler {
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         self.auth_attempts.fetch_add(1, Ordering::SeqCst);
-        Ok(if user == "ubgops" && password == "loopback-only-password" {
-            Auth::Accept
-        } else {
-            Auth::reject()
-        })
+        Ok(
+            if user == "ubgops" && password == "loopback-only-password" {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
     }
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {

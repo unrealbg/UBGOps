@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{AppError, Host};
 use ubgops_operations::RemoteSession;
 use ubgops_remote_operations::{
@@ -7,8 +9,6 @@ use ubgops_remote_operations::{
 use ubgops_secrets::Credential;
 use ubgops_sftp::SftpConnector;
 use ubgops_terminal::TerminalConnector;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 /// The application orchestration boundary for future Local, Serial or other providers.
 /// Only SSH is registered in Goal 01; domain/UI code never references russh.

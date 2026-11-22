@@ -1,5 +1,5 @@
-use ubgops_model::{AppError, ErrorCode};
 use std::collections::BTreeMap;
+use ubgops_model::{AppError, ErrorCode};
 
 fn invalid() -> AppError {
     // Never include remote-controlled data in diagnostics.

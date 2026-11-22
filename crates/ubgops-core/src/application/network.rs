@@ -158,13 +158,13 @@ impl Application {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
     use ubgops_operations::{ReadOnlyCommand, RemoteSession};
     use ubgops_remote_operations::{
         ConsumedAuthority, MutationTransport, MutationTransportOutcome, SystemdReload,
         SystemdResetFailed, SystemdStart, SystemdTryRestart,
     };
-    use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
 
     struct Transport {
         stall: Option<ReadOnlyCommand>,

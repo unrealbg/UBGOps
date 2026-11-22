@@ -1,8 +1,8 @@
 use crate::ConnectedTransport;
-use ubgops_model::{HostId, HostSession, HostSessionId};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use ubgops_model::{HostId, HostSession, HostSessionId};
 
 pub(crate) struct SessionSlot {
     pub data: Mutex<SessionData>,

@@ -1,6 +1,13 @@
 //! Opt-in interoperability tests against the disposable OpenSSH fixture in
 //! `tools/openssh-fixture`. These tests use UBGOps' production SSH provider.
 
+use std::{
+    env, fs,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use ubgops_model::{
     AppError, AuthenticationMethod, ErrorCode, Host, HostConnectionConfig, HostId, HostSessionId,
 };
@@ -14,13 +21,6 @@ use ubgops_remote_operations::{
 };
 use ubgops_secrets::Credential;
 use ubgops_ssh::{KnownHosts, SshProvider};
-use std::{
-    env, fs,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 struct Fixture {

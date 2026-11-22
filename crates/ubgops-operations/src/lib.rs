@@ -8,8 +8,8 @@ pub use command::ReadOnlyCommand;
 pub use engine::{OperationEngine, OperationPlan, RollbackStatus};
 
 use async_trait::async_trait;
-use ubgops_model::AppError;
 use tokio_util::sync::CancellationToken;
+use ubgops_model::AppError;
 
 /// A connection owns its transport state; unrelated hosts never share a session.
 /// Implementations must bound command time/output and stop work on cancellation.

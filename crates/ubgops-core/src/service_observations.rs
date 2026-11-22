@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Mutex, time::Duration};
+use tokio::time::Instant;
 use ubgops_model::{
     AppError, ErrorCode, HostId, HostSessionId, ServiceObservationId, ServiceSnapshot,
 };
@@ -5,8 +7,6 @@ use ubgops_remote_operations::{
     AuthorityBinding, SystemdReloadPreconditions, SystemdResetFailedPreconditions,
     SystemdServiceUnitName, SystemdStartPreconditions, SystemdTryRestartPreconditions,
 };
-use std::{collections::HashMap, sync::Mutex, time::Duration};
-use tokio::time::Instant;
 
 pub(crate) const SERVICE_OBSERVATION_TTL: Duration = Duration::from_secs(120);
 const MAX_HOST_SETS: usize = 64;

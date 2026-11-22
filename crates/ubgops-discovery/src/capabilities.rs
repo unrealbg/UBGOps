@@ -1,5 +1,5 @@
-use ubgops_model::{AppError, DiscoverySnapshot, ErrorCode, HostCapability};
 use std::collections::BTreeMap;
+use ubgops_model::{AppError, DiscoverySnapshot, ErrorCode, HostCapability};
 
 /// Stable capability identifiers permit later providers without changing domain enums.
 #[derive(Default)]

@@ -2,11 +2,6 @@ use crate::{
     EditorRevision, EntryIdentity, SftpClient, display_name, encode_text, join_remote,
     validate_child_name, validate_remote_path, validate_windows_file_name,
 };
-use ubgops_model::{
-    AppError, ConflictPolicy, EditorDocumentId, ErrorCode, FileOperationKind, FileOperationPlan,
-    FilePlanId, FilePlanItem, HostId, HostSessionId, OperationRisk, RemoteEntryKind, SftpSessionId,
-    TextNewline,
-};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -14,6 +9,11 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
+};
+use ubgops_model::{
+    AppError, ConflictPolicy, EditorDocumentId, ErrorCode, FileOperationKind, FileOperationPlan,
+    FilePlanId, FilePlanItem, HostId, HostSessionId, OperationRisk, RemoteEntryKind, SftpSessionId,
+    TextNewline,
 };
 
 const PLAN_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -1264,12 +1264,12 @@ fn local_access_error(message: &'static str) -> AppError {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ubgops_model::{
-        DirectoryListing, HostSessionId, RemoteEntry, SftpLimits, SftpSessionId, SftpSessionInfo,
-    };
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncWrite};
     use tokio_util::sync::CancellationToken;
+    use ubgops_model::{
+        DirectoryListing, HostSessionId, RemoteEntry, SftpLimits, SftpSessionId, SftpSessionInfo,
+    };
 
     struct PlanClient {
         info: SftpSessionInfo,

@@ -5,10 +5,6 @@ use crate::update_download::{
 use crate::update_install::{
     InstallerContext, RetainedTauriUpdate, installation_supported, validate_installer_identity,
 };
-use ubgops_model::{
-    AppError, ErrorCode, UpdateAnnouncementId, UpdateOperationSnapshot, UpdatePhase,
-    VerifiedArtifactId,
-};
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU8, Ordering},
@@ -18,6 +14,10 @@ use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
+use ubgops_model::{
+    AppError, ErrorCode, UpdateAnnouncementId, UpdateOperationSnapshot, UpdatePhase,
+    VerifiedArtifactId,
+};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);

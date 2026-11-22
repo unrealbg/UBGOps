@@ -2,6 +2,8 @@ use crate::lifecycle::LifecycleCoordinator;
 use crate::local_access::LocalAccessService;
 use crate::update_install;
 use crate::updates::UpdateService;
+use serde::Deserialize;
+use tauri::State;
 use ubgops_core::Application;
 use ubgops_model::{
     AppError, ContainerSnapshot, DnsConfigurationSnapshot, Host, HostId, HostInput,
@@ -18,8 +20,6 @@ use ubgops_model::{
     LocalSelectionGrant, RemoteEntry, SftpSessionId, SftpSessionInfo, TransferJob, TransferJobId,
 };
 use ubgops_secrets::CredentialInput;
-use serde::Deserialize;
-use tauri::State;
 
 #[tauri::command]
 pub async fn check_for_update(

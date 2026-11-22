@@ -1,5 +1,5 @@
-use ubgops_model::{AppError, ErrorCode, HostId, Operation};
 use serde::{Deserialize, Serialize};
+use ubgops_model::{AppError, ErrorCode, HostId, Operation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

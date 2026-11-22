@@ -1,9 +1,5 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ubgops_model::{
-    AppError, ErrorCode, HostId, HostSessionId, TerminalOutputBatch, TerminalSession,
-    TerminalSessionId, TerminalSize, TerminalState,
-};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, RwLock},
@@ -11,6 +7,10 @@ use std::{
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
+use ubgops_model::{
+    AppError, ErrorCode, HostId, HostSessionId, TerminalOutputBatch, TerminalSession,
+    TerminalSessionId, TerminalSize, TerminalState,
+};
 
 pub const MAX_OPEN_TERMINALS_PER_HOST: usize = 8;
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;

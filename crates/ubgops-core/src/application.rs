@@ -1,5 +1,8 @@
 use crate::service_observations::ServiceObservationStore;
 use crate::{ConnectionProvider, HostRepository, StoredHost, sessions::SessionSlot};
+use std::{collections::HashMap, fs::File, path::Path, sync::Arc, time::Instant};
+use tokio::sync::{Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 use ubgops_audit::{AuditActor, AuditEvent, AuditLog, AuditOutcome};
 use ubgops_model::*;
 use ubgops_remote_operations::RemoteOperationFoundation;
@@ -7,9 +10,6 @@ use ubgops_secrets::{CredentialInput, EncryptedSecretStore, PlatformKeyProvider,
 use ubgops_sftp::{FilePlanStore, SftpClient, TransferManager};
 use ubgops_ssh::{KnownHosts, SshProvider};
 use ubgops_terminal::TerminalManager;
-use std::{collections::HashMap, fs::File, path::Path, sync::Arc, time::Instant};
-use tokio::sync::{Mutex, Semaphore};
-use tokio_util::sync::CancellationToken;
 
 /// Typed application facade. All connection mutations are serialized just long enough
 /// to update local state; network work never holds the metadata gate.
