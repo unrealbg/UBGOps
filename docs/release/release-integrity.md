@@ -1,6 +1,6 @@
 # Release integrity foundation
 
-Goal 04B added development and manual CI release-candidate tooling. Its owner-authorized post-merge provenance run completed for Windows, Ubuntu and macOS without a tag, GitHub Release or package publication. Goal 04C added a separately reviewed public updater key and signed-artifact tooling. Its hosted signing acceptance passed on all three platforms in run `36622670036`, with nine of nine attestations. Goals 04D–04G added manual availability checking, bounded verified download, process-wide quiescence and explicit Windows installation authority. Goal 04I introduced reviewed source tooling for candidate identity, deterministic manifests, verified draft preparation and separately authorized activation. Subsequent owner-authorized release cycles published immutable `v0.1.1` and `v0.1.2`; `v0.1.2` is current latest from source `f0ce82ff92ca3fdbeefc744b828b37eaa546626d`, with production Windows `0.1.1 → 0.1.2` acceptance completed.
+Goal 04B added development and manual CI release-candidate tooling. Goal 04C added a separately reviewed public updater key and signed-artifact tooling. Goals 04D–04G added manual availability checking, bounded verified download, process-wide quiescence and explicit Windows installation authority. Goal 04I introduced reviewed source tooling for candidate identity, deterministic manifests, verified draft preparation and separately authorized activation. Release publication on `unrealbg/UBGOps` remains manual and requires explicit owner authorization.
 
 ## Four different claims
 
