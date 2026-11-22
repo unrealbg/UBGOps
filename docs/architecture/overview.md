@@ -1,0 +1,67 @@
+# Architecture
+
+UBGOps separates transport-independent domain data, application orchestration, infrastructure probes and the desktop adapter. Rust is the source of truth for the wire model. `export_protocol` produces the checked-in TypeScript declarations; CI rejects drift. Components consume the typed application client, not `invoke` directly. Registered IPC commands are narrow host, discovery, session-bound monitoring, terminal, SFTP file-operation, transfer, and native-selection actions; there is no generic command or filesystem IPC.
+
+```mermaid
+flowchart TD
+  UI[React UI] --> API[Typed Application API / Tauri commands]
+  API --> CORE[Domain services / ubgops-core]
+  CORE --> PROVIDERS[Providers / HostProbe and ConnectionProvider]
+  PROVIDERS --> POLICY[Operation / Policy layer]
+  POLICY --> SSH[SSH transport / ubgops-ssh]
+  CORE --> FILES[Typed file plans / ubgops-sftp]
+  CORE --> REMOTE[Internal remote-operation authority / no production operation]
+  FILES --> SSH
+  SSH --> HOST[Remote Linux host / existing SSH server]
+  CORE --> REPO[Local host metadata]
+  CORE --> VAULT[SecretStore / encrypted vault + OS keychain]
+  CORE --> AUDIT[Metadata-only audit log]
+  SSH --> PINS[Persistent host identity pins]
+```
+
+The diagram shows execution flow, not Cargo dependency direction. `ubgops-core` composes concrete providers. `ubgops-operations` defines `RemoteSession`, so SSH can implement the transport boundary without depending on the orchestrator. Discovery depends on this operation boundary and the domain model; neither depends on Tauri. `ConnectionProvider` is the narrow transport creation extension point in core. The host connection DTO currently describes SSH; future transports should introduce a tagged connection configuration with migrations when an actual second provider exists.
+
+## Connection lifecycle
+
+1. Under a short metadata gate, load the host, reject conflicting lifecycle work, clear obsolete discovery and increment the host's session generation.
+2. Retrieve the immutable credential revision on a blocking worker. Secret fields never enter a session or serializable model.
+3. Resolve DNS, establish bounded TCP/SSH handshake and check the presented host key before authentication. Unknown hosts return an observed challenge and close the socket. Trusted hosts proceed. A changed key always blocks.
+4. Explicit first-contact trust must match the application's current pending challenge. The known-host database uses an immediate transaction; only absent or identical pins succeed. Ordinary trust never overwrites an existing fingerprint. A blocked changed-key challenge can instead create a short-lived backend-owned Security review plan; explicit local pin rotation uses an exact old-key compare-and-swap and never reconnects automatically. The next normal connection verifies the server again.
+5. Authenticate, then run the operation engine's fixed read-only probes. Optional failures are safe warnings. Successful data is published only if the session generation still matches.
+6. Disconnect cancels the host token, invalidates the generation and closes its transport. Lifetime guards also close I/O if a connection future is dropped. Each host owns its own token, mutable view and transport.
+
+While a connected Overview is visible, its typed monitoring client requests bounded fixed-command observations. Core serializes samples per host, binds counter baselines to the current `HostSessionId`, and revalidates the session generation before publishing. Disconnect and replacement remove the baseline. The renderer keeps at most 120 session-owned samples in component memory; see [Live host monitoring](monitoring.md).
+
+Discovery results are cleared at the start of a connection and on disconnect. Refresh is serialized per host and cannot republish data after disconnect or edit. Polling exposes remote closure to the UI. Keepalives detect an unresponsive peer; a stale discovery observation is always timestamped.
+
+The Services workspace requests one fixed, bounded `systemctl` read on mount and on manual Refresh. Core binds the request to the exact host/session and revalidates after SSH I/O. Service rows are component-local, never persisted; see [Services](services.md).
+
+The Network workspace requests one fixed, bounded `ip -j address show` read on mount and on manual Refresh. It publishes only validated interface and IP address fields after exact host/session and generation revalidation. Snapshots stay component-local and are never persisted; see [Network](network.md).
+
+The Security workspace reads validated local endpoint pin and configured authentication metadata through `get_host_ssh_trust(HostId)`, serialized with edits/deletion/trust by the existing metadata gate. Its explicit changed-key review uses a five-minute one-shot in-memory plan and a narrow local CAS pin replacement; neither plan nor execution accesses credentials or SSH transport. The replacement records a High-risk metadata-only audit event and leaves the session Disconnected until ordinary reconnect. Component-local trust snapshots are read on entry/manual Refresh or after replacement and cleared on failure or configuration changes. Existing `HostSession` polling remains the sole session-state model. Identity is local pin metadata recorded after a verified connect, not a separately captured remote fingerprint; see [SSH endpoint trust](security.md).
+
+Logs requests a bounded current-boot system journal snapshot through one fixed `journalctl` operation on workspace entry/manual Refresh. It reads potentially sensitive content with the existing account's permissions, without elevation, follow/polling or mutation. Discovery validates JSON-lines and normalizes unsafe display controls before projecting at most ten records. Independent one-per-host/four-global admission and session/generation checks prevent overlap and stale publication. Journal snapshots remain component-local and have no persistence, Copy or Export; see [Logs](logs.md).
+
+Containers requests one fixed `docker --host unix:///var/run/docker.sock container ls --last 64` inventory on entry/manual Refresh. Core binds the request to the exact host/session with independent one-per-host/four-global admission and post-I/O generation checks. Discovery validates selected JSON-lines metadata before publication. Rows and local filters remain component-local with no polling, persistence or container actions; see [Containers](containers.md). No reserved sidebar sections remain.
+
+The application-global update lifecycle is owned by desktop Rust. The native Tauri updater plugin performs the explicit fixed-endpoint availability check; a separate bounded native downloader consumes only the current opaque announcement, streams at most 128 MiB through Minisign verification, checks the authenticated signed version, and keeps verified bytes with the exact retained native `Update`. Supported Windows builds can mint one opaque `VerifiedArtifactId` and, after a second explicit confirmation, consume that one-shot authority through exclusive command quiescence and ordered application/grant/log cleanup before the sole installer call. Linux and macOS have no install action. The renderer supplies no transport, trust, path, byte or installer inputs, and no background check, polling, persistence, automatic restart or relaunch exists. Update work does not pass through host/session services or add Tauri dependencies to transport-independent crates; see [Manual updates](updates.md).
+
+Every custom Tauri command also passes through one native process-lifecycle admission boundary. Ordinary sealing is irreversible for that process, drains already admitted RAII permits against a 60-second absolute command deadline, and rejects later requests before application work. Goal 04G adds a native install-exclusive seal whose caller retains the sole remaining permit while all others drain. Resource shutdown, local-grant revocation and explicit log finalization are separate ordered phases. The generic boundary exposes no renderer lifecycle control and does not itself destroy verified update authority; see [Process lifecycle and quiescence](lifecycle.md).
+
+## Local data
+
+Each OS app-data profile contains `hosts.db`, `known-hosts.db`, `credentials.db`, `profile.lock`, `audit.jsonl` and structured application logs. Metadata uses SQLite schema version 1 and rejects newer schemas. Passwords, keys and passphrases are absent from the metadata schema. The vault stores only AES-256-GCM ciphertext with random nonces, bound to a credential revision ID using authenticated associated data. Its master key is a 32-byte OS secure-store entry, avoiding Windows credential blob size limits for large private keys.
+
+A new credential revision is written before metadata commits its reference. Old revisions are removed afterwards. A crash can leave encrypted orphan records; it cannot commit metadata pointing at an unwritten secret. Cleanup failures are surfaced. A process file lock prevents multiple UBGOps instances from racing master-key creation or state writes in one profile.
+
+The first vault write commits a durable initialization marker with its ciphertext. Key reads are read-only, and an initialized vault refuses to generate another master key if its OS entry disappears. The marker survives deleting the last credential. Connection and refresh cancellations produce explicit canceled audit outcomes while generation checks keep late results out of host state.
+
+Audit events contain host ID, UTC timestamp, operation identity and risk, actor, outcome and elapsed duration. The log rotates at 4 MiB with one backup. Application logs are structured JSON, rotate daily with seven files, and disable third-party debug output. No raw command output enters either log.
+
+## Frontend state and extension points
+
+TanStack Query owns host metadata/session snapshots. Zustand owns selection only. Goal 02C remote text remains in component-local memory and its short-lived typed save authority; see [Remote text editor](editor.md). Live monitoring history is likewise component-local, bounded, and cleared by host/session identity rather than persisted. Credentials remain in uncontrolled form controls and one short-lived IPC payload; save bypasses mutation caches. Components are grouped into shell, hosts, connection and overview concerns. CSS tokens and primitives permit future light themes; only the dark theme is shipped.
+
+Capabilities use a validated registry and observed facts. Future service/container providers can add capability identifiers without changing SSH. The operation engine permanently accepts only its private fixed-command plans with `ReadOnly` risk; it has no serializable command input and still rejects every write risk and tampered kind. File mutations use the adjacent one-shot typed-plan boundary described in [SFTP files architecture](sftp.md). Goal 05A adds a separate internal, memory-only [remote-operation authority foundation](remote-operations.md) with a 120-second one-shot authority, non-queuing admission and explicit dispatch ambiguity. It exposes no production operation, renderer API or SSH mutation mapping.
+
+See the [ADRs](../adr/0001-workspace-and-boundaries.md) for decisions and the [threat model](../security/threat-model.md) for boundaries that remain outside this goal.

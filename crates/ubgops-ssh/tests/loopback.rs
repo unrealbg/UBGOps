@@ -1,0 +1,1883 @@
+//! Real SSH protocol tests bound exclusively to ephemeral loopback ports.
+//! The fixture returns deterministic Linux text; it never invokes a shell.
+
+#[path = "support/probe_responses.rs"]
+mod probe_responses;
+
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use ubgops_model::{
+    AppError, AuthenticationMethod, ErrorCode, Host, HostConnectionConfig, HostFingerprint, HostId,
+    HostKeyChallenge, HostSessionId,
+};
+use ubgops_operations::{ReadOnlyCommand, RemoteSession};
+use ubgops_remote_operations::{
+    AuthorityBinding, AuthorityRevalidator, ConsumedAuthority, MutationTransportOutcome, PlanDraft,
+    RemoteOperationFoundation, SystemdReload, SystemdReloadPreconditions, SystemdResetFailed,
+    SystemdResetFailedPreconditions, SystemdServiceUnitName, SystemdStart,
+    SystemdStartPreconditions, SystemdTryRestart, SystemdTryRestartPreconditions,
+};
+use ubgops_secrets::Credential;
+use ubgops_sftp::SftpConnector;
+use ubgops_ssh::{KnownHosts, SshProvider};
+use russh::{
+    Channel, ChannelId, Sig,
+    keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
+    server::{self, Auth, Server as _},
+};
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout},
+};
+use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
+
+#[derive(Clone)]
+struct FixtureHandler {
+    connection_count: Arc<AtomicUsize>,
+    auth_attempts: Arc<AtomicUsize>,
+    command_count: Arc<AtomicUsize>,
+    journal_commands: Arc<AtomicUsize>,
+    docker_commands: Arc<AtomicUsize>,
+    reset_failed_commands: Arc<AtomicUsize>,
+    last_reset_failed_command: Arc<std::sync::Mutex<Vec<u8>>>,
+    try_restart_commands: Arc<AtomicUsize>,
+    last_try_restart_command: Arc<std::sync::Mutex<Vec<u8>>>,
+    reload_commands: Arc<AtomicUsize>,
+    last_reload_command: Arc<std::sync::Mutex<Vec<u8>>>,
+    start_commands: Arc<AtomicUsize>,
+    last_start_command: Arc<std::sync::Mutex<Vec<u8>>>,
+    channel_closes: Arc<AtomicUsize>,
+    mode: Arc<AtomicU8>,
+    approved_key: PublicKey,
+}
+
+impl server::Server for FixtureHandler {
+    type Handler = Self;
+    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
+        self.connection_count.fetch_add(1, Ordering::SeqCst);
+        self.clone()
+    }
+}
+
+impl server::Handler for FixtureHandler {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.auth_attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(if user == "ubgops" && password == "loopback-only-password" {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+        self.auth_attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(if user == "ubgops" && key == &self.approved_key {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.channel_closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        _name: &str,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        command: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.command_count.fetch_add(1, Ordering::SeqCst);
+        if command == b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 journalctl --system --no-pager --quiet --boot=0 --reverse --lines=10 --output=json --output-fields=MESSAGE,PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER" {
+            self.journal_commands.fetch_add(1, Ordering::SeqCst);
+        }
+        if command == ReadOnlyCommand::DockerContainers.command().as_bytes() {
+            self.docker_commands.fetch_add(1, Ordering::SeqCst);
+        }
+        let reset_failed = command == b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password reset-failed -- broken.service";
+        if reset_failed {
+            self.reset_failed_commands.fetch_add(1, Ordering::SeqCst);
+            *self.last_reset_failed_command.lock().unwrap() = command.to_vec();
+        }
+        let try_restart = command == b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password try-restart -- running.service";
+        if try_restart {
+            self.try_restart_commands.fetch_add(1, Ordering::SeqCst);
+            *self.last_try_restart_command.lock().unwrap() = command.to_vec();
+        }
+        let reload = command == b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password reload -- running-reloadable.service";
+        if reload {
+            self.reload_commands.fetch_add(1, Ordering::SeqCst);
+            *self.last_reload_command.lock().unwrap() = command.to_vec();
+        }
+        let start = command == b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password start -- inactive-startable.service";
+        if start {
+            self.start_commands.fetch_add(1, Ordering::SeqCst);
+            *self.last_start_command.lock().unwrap() = command.to_vec();
+        }
+        let mode = self.mode.load(Ordering::SeqCst);
+        if mode == 6 {
+            session.channel_failure(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 8 {
+            session.exit_status_request(channel, 0)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 10 {
+            session.data(channel, &b"pre-accept anomaly"[..])?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 11 {
+            session.exit_status_request(channel, 1)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 12 {
+            session.exit_signal_request(channel, Sig::TERM, false, "", "")?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 13 {
+            session.data(channel, &b"pre-accept stdout"[..])?;
+            session.extended_data(channel, 1, &b"pre-accept stderr"[..])?;
+            session.channel_success(channel)?;
+            session.exit_status_request(channel, 0)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 15 {
+            session.data(channel, &b"possible execution"[..])?;
+            session.channel_failure(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 17 {
+            session.data(channel, vec![b'x'; 8 * 1024 + 1])?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 18 {
+            session.eof(channel)?;
+            session.exit_status_request(channel, 0)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 19 {
+            session.eof(channel)?;
+            session.exit_status_request(channel, 1)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 20 {
+            session.eof(channel)?;
+            session.exit_signal_request(channel, Sig::TERM, false, "", "")?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 21 {
+            session.eof(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+        if mode == 22 {
+            session.eof(channel)?;
+            return Ok(());
+        }
+        session.channel_success(channel)?;
+        match mode {
+            1 => {
+                // Output is sent incrementally by russh with SSH window backpressure.
+                session.data(channel, vec![b'x'; 128 * 1024])?;
+            }
+            2 => return Ok(()), // Deliberately stalls until the client closes the channel.
+            4 => {
+                session.data(channel, &b"{malformed synthetic journal data}"[..])?;
+            }
+            5 => {} // Valid successful empty Docker inventory.
+            7 => {
+                session.close(channel)?;
+                return Ok(());
+            }
+            9 => {
+                session.exit_signal_request(channel, Sig::TERM, false, "", "")?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            16 => {
+                session.channel_failure(channel)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            3 => {
+                session.exit_status_request(channel, 1)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            _ => {
+                if reset_failed || try_restart || reload || start {
+                    session.exit_status_request(channel, 0)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+                let Some(text) = probe_responses::response(command) else {
+                    session.channel_failure(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                };
+                session.data(channel, text.as_bytes())?;
+            }
+        }
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+}
+
+struct Fixture {
+    host: Host,
+    fingerprint: HostFingerprint,
+    user_key: PrivateKey,
+    handler: FixtureHandler,
+    cancellation: CancellationToken,
+}
+
+impl Fixture {
+    async fn start() -> Self {
+        let server_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("server key");
+        let user_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("user key");
+        let fingerprint = HostFingerprint {
+            algorithm: server_key.algorithm().to_string(),
+            sha256: server_key
+                .public_key()
+                .fingerprint(HashAlg::Sha256)
+                .to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let port = listener.local_addr().expect("address").port();
+        let handler = FixtureHandler {
+            connection_count: Arc::new(AtomicUsize::new(0)),
+            auth_attempts: Arc::new(AtomicUsize::new(0)),
+            command_count: Arc::new(AtomicUsize::new(0)),
+            journal_commands: Arc::new(AtomicUsize::new(0)),
+            docker_commands: Arc::new(AtomicUsize::new(0)),
+            reset_failed_commands: Arc::new(AtomicUsize::new(0)),
+            last_reset_failed_command: Arc::new(std::sync::Mutex::new(Vec::new())),
+            try_restart_commands: Arc::new(AtomicUsize::new(0)),
+            last_try_restart_command: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reload_commands: Arc::new(AtomicUsize::new(0)),
+            last_reload_command: Arc::new(std::sync::Mutex::new(Vec::new())),
+            start_commands: Arc::new(AtomicUsize::new(0)),
+            last_start_command: Arc::new(std::sync::Mutex::new(Vec::new())),
+            channel_closes: Arc::new(AtomicUsize::new(0)),
+            mode: Arc::new(AtomicU8::new(0)),
+            approved_key: user_key.public_key().clone(),
+        };
+        let mut server = handler.clone();
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        tokio::spawn(async move {
+            let config = Arc::new(server::Config {
+                keys: vec![server_key],
+                auth_rejection_time: Duration::from_millis(5),
+                auth_rejection_time_initial: Some(Duration::from_millis(5)),
+                ..Default::default()
+            });
+            let running = server.run_on_socket(config, &listener);
+            let shutdown = running.handle();
+            tokio::select! {
+                result = running => result.expect("fixture server"),
+                _ = stop.cancelled() => shutdown.shutdown("test finished".into()),
+            }
+        });
+        Self {
+            host: Host {
+                id: HostId::new(),
+                display_name: "Loopback SSH fixture".into(),
+                connection: HostConnectionConfig {
+                    hostname: "127.0.0.1".into(),
+                    port,
+                    username: "ubgops".into(),
+                    authentication: AuthenticationMethod::Password,
+                },
+            },
+            fingerprint,
+            user_key,
+            handler,
+            cancellation,
+        }
+    }
+
+    fn trusted_provider(&self) -> SshProvider {
+        let store = Arc::new(KnownHosts::open(":memory:").expect("pins"));
+        store
+            .trust(&HostKeyChallenge {
+                hostname: self.host.connection.hostname.clone(),
+                port: self.host.connection.port,
+                algorithm: self.fingerprint.algorithm.clone(),
+                fingerprint: self.fingerprint.sha256.clone(),
+                previous_fingerprint: None,
+            })
+            .expect("trust fixture");
+        SshProvider::new(store)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+fn password() -> Credential {
+    Credential {
+        password: Some(Zeroizing::new("loopback-only-password".into())),
+        private_key: None,
+        passphrase: None,
+    }
+}
+
+struct AllowResetFailed;
+struct AllowTryRestart;
+struct AllowReload;
+struct AllowStart;
+
+#[async_trait::async_trait]
+impl AuthorityRevalidator<SystemdResetFailed> for AllowResetFailed {
+    type DispatchGuard = ();
+
+    async fn revalidate(&self, _: &ConsumedAuthority<SystemdResetFailed>) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityRevalidator<SystemdTryRestart> for AllowTryRestart {
+    type DispatchGuard = ();
+
+    async fn revalidate(&self, _: &ConsumedAuthority<SystemdTryRestart>) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityRevalidator<SystemdReload> for AllowReload {
+    type DispatchGuard = ();
+    async fn revalidate(&self, _: &ConsumedAuthority<SystemdReload>) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityRevalidator<SystemdStart> for AllowStart {
+    type DispatchGuard = ();
+    async fn revalidate(&self, _: &ConsumedAuthority<SystemdStart>) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+async fn execute_reset_failed(
+    session: &ubgops_ssh::SshSession,
+    host_id: HostId,
+    cancellation: CancellationToken,
+) -> ubgops_remote_operations::ExecutionResult {
+    let binding = AuthorityBinding {
+        host_id,
+        host_session_id: HostSessionId::new(),
+        generation: 1,
+    };
+    let foundation = RemoteOperationFoundation::default();
+    let receipt = foundation
+        .plan::<SystemdResetFailed>(
+            PlanDraft::new(
+                binding,
+                SystemdServiceUnitName::parse("broken.service").unwrap(),
+                SystemdResetFailedPreconditions,
+                (),
+            ),
+            binding,
+        )
+        .unwrap();
+    foundation
+        .execute::<SystemdResetFailed, _, _>(
+            receipt.id,
+            binding,
+            &AllowResetFailed,
+            session,
+            cancellation,
+        )
+        .await
+        .unwrap()
+}
+
+async fn execute_try_restart(
+    session: &ubgops_ssh::SshSession,
+    host_id: HostId,
+    cancellation: CancellationToken,
+) -> ubgops_remote_operations::ExecutionResult {
+    let binding = AuthorityBinding {
+        host_id,
+        host_session_id: HostSessionId::new(),
+        generation: 1,
+    };
+    let foundation = RemoteOperationFoundation::default();
+    let receipt = foundation
+        .plan::<SystemdTryRestart>(
+            PlanDraft::new(
+                binding,
+                SystemdServiceUnitName::parse("running.service").unwrap(),
+                SystemdTryRestartPreconditions,
+                (),
+            ),
+            binding,
+        )
+        .unwrap();
+    foundation
+        .execute::<SystemdTryRestart, _, _>(
+            receipt.id,
+            binding,
+            &AllowTryRestart,
+            session,
+            cancellation,
+        )
+        .await
+        .unwrap()
+}
+
+async fn execute_reload(
+    session: &ubgops_ssh::SshSession,
+    host_id: HostId,
+    cancellation: CancellationToken,
+) -> ubgops_remote_operations::ExecutionResult {
+    let binding = AuthorityBinding {
+        host_id,
+        host_session_id: HostSessionId::new(),
+        generation: 1,
+    };
+    let foundation = RemoteOperationFoundation::default();
+    let receipt = foundation
+        .plan::<SystemdReload>(
+            PlanDraft::new(
+                binding,
+                SystemdServiceUnitName::parse("running-reloadable.service").unwrap(),
+                SystemdReloadPreconditions,
+                (),
+            ),
+            binding,
+        )
+        .unwrap();
+    foundation
+        .execute::<SystemdReload, _, _>(receipt.id, binding, &AllowReload, session, cancellation)
+        .await
+        .unwrap()
+}
+
+async fn execute_start(
+    session: &ubgops_ssh::SshSession,
+    host_id: HostId,
+    cancellation: CancellationToken,
+) -> ubgops_remote_operations::ExecutionResult {
+    let binding = AuthorityBinding {
+        host_id,
+        host_session_id: HostSessionId::new(),
+        generation: 1,
+    };
+    let foundation = RemoteOperationFoundation::default();
+    let receipt = foundation
+        .plan::<SystemdStart>(
+            PlanDraft::new(
+                binding,
+                SystemdServiceUnitName::parse("inactive-startable.service").unwrap(),
+                SystemdStartPreconditions,
+                (),
+            ),
+            binding,
+        )
+        .unwrap();
+    foundation
+        .execute::<SystemdStart, _, _>(receipt.id, binding, &AllowStart, session, cancellation)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn try_restart_uses_exact_command_and_classifies_bounded_completion() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    for (mode, expected) in [
+        (
+            0,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            6,
+            MutationTransportOutcome::NotDispatched(
+                ubgops_remote_operations::NotDispatchedReason::Rejected,
+            ),
+        ),
+        (
+            7,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            15,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            8,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            11,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            12,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            13,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            16,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            17,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::OutputLimit,
+            ),
+        ),
+        (
+            18,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            19,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            20,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            21,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+    ] {
+        let before = fixture.handler.try_restart_commands.load(Ordering::SeqCst);
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let result =
+            execute_try_restart(session.as_ref(), fixture.host.id, CancellationToken::new()).await;
+        assert_eq!(
+            result.terminal,
+            ubgops_remote_operations::ExecutionTerminal::Transport(expected),
+            "mode {mode}"
+        );
+        assert_eq!(
+            fixture.handler.try_restart_commands.load(Ordering::SeqCst),
+            before + 1,
+            "mode {mode} must dispatch exactly once"
+        );
+    }
+    assert_eq!(
+        fixture.handler.last_try_restart_command.lock().unwrap().as_slice(),
+        b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password try-restart -- running.service"
+    );
+}
+
+#[tokio::test]
+async fn reload_uses_exact_command_and_classifies_bounded_completion() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    for (mode, expected) in [
+        (
+            0,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            6,
+            MutationTransportOutcome::NotDispatched(
+                ubgops_remote_operations::NotDispatchedReason::Rejected,
+            ),
+        ),
+        (
+            7,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            15,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            8,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            11,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            12,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            13,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            16,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            17,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::OutputLimit,
+            ),
+        ),
+        (
+            18,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            19,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            20,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            21,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+    ] {
+        let before = fixture.handler.reload_commands.load(Ordering::SeqCst);
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let result =
+            execute_reload(session.as_ref(), fixture.host.id, CancellationToken::new()).await;
+        assert_eq!(
+            result.terminal,
+            ubgops_remote_operations::ExecutionTerminal::Transport(expected),
+            "mode {mode}"
+        );
+        assert_eq!(
+            fixture.handler.reload_commands.load(Ordering::SeqCst),
+            before + 1,
+            "mode {mode} must dispatch exactly once"
+        );
+    }
+    assert_eq!(
+        fixture.handler.last_reload_command.lock().unwrap().as_slice(),
+        b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password reload -- running-reloadable.service"
+    );
+}
+
+#[tokio::test]
+async fn reload_post_dispatch_cancellation_and_lifetime_loss_are_unknown() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(22, Ordering::SeqCst);
+    let cancellation = CancellationToken::new();
+    let task = {
+        let session = session.clone();
+        let cancellation = cancellation.clone();
+        let host = fixture.host.id;
+        tokio::spawn(async move { execute_reload(session.as_ref(), host, cancellation).await })
+    };
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.reload_commands.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reload dispatched");
+    cancellation.cancel();
+    assert_eq!(
+        task.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::Cancelled
+            )
+        )
+    );
+
+    let lost = {
+        let session = session.clone();
+        let host = fixture.host.id;
+        tokio::spawn(async move {
+            execute_reload(session.as_ref(), host, CancellationToken::new()).await
+        })
+    };
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.reload_commands.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reload dispatched");
+    fixture.cancellation.cancel();
+    assert_eq!(
+        lost.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost
+            )
+        )
+    );
+}
+
+#[tokio::test]
+async fn start_uses_exact_command_and_classifies_bounded_completion() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    for (mode, expected) in [
+        (
+            0,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            6,
+            MutationTransportOutcome::NotDispatched(
+                ubgops_remote_operations::NotDispatchedReason::Rejected,
+            ),
+        ),
+        (
+            7,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            15,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            8,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            11,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            12,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            13,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            16,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            17,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::OutputLimit,
+            ),
+        ),
+        (
+            18,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            19,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            20,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            21,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+    ] {
+        let before = fixture.handler.start_commands.load(Ordering::SeqCst);
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let result =
+            execute_start(session.as_ref(), fixture.host.id, CancellationToken::new()).await;
+        assert_eq!(
+            result.terminal,
+            ubgops_remote_operations::ExecutionTerminal::Transport(expected),
+            "mode {mode}"
+        );
+        assert_eq!(
+            fixture.handler.start_commands.load(Ordering::SeqCst),
+            before + 1,
+            "mode {mode} must dispatch exactly once"
+        );
+    }
+    assert_eq!(
+        fixture.handler.last_start_command.lock().unwrap().as_slice(),
+        b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password start -- inactive-startable.service"
+    );
+}
+
+#[tokio::test]
+async fn start_post_dispatch_cancellation_and_lifetime_loss_are_unknown() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(22, Ordering::SeqCst);
+    let cancellation = CancellationToken::new();
+    let task = {
+        let session = session.clone();
+        let cancellation = cancellation.clone();
+        let host = fixture.host.id;
+        tokio::spawn(async move { execute_start(session.as_ref(), host, cancellation).await })
+    };
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.start_commands.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("start dispatched");
+    cancellation.cancel();
+    assert_eq!(
+        task.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::Cancelled
+            )
+        )
+    );
+
+    let lost = {
+        let session = session.clone();
+        let host = fixture.host.id;
+        tokio::spawn(async move {
+            execute_start(session.as_ref(), host, CancellationToken::new()).await
+        })
+    };
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.start_commands.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("start dispatched");
+    fixture.cancellation.cancel();
+    assert_eq!(
+        lost.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost
+            )
+        )
+    );
+}
+
+#[tokio::test]
+async fn try_restart_eof_stall_timeout_and_post_dispatch_cancellation_are_unknown() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(22, Ordering::SeqCst);
+    let timed_session = session.clone();
+    let timed_host = fixture.host.id;
+    let timed = tokio::spawn(async move {
+        execute_try_restart(timed_session.as_ref(), timed_host, CancellationToken::new()).await
+    });
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.try_restart_commands.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request dispatched");
+    assert_eq!(
+        timed.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::Timeout,
+            )
+        )
+    );
+
+    let cancellation = CancellationToken::new();
+    let cancelling = cancellation.clone();
+    let cancelled_session = session.clone();
+    let cancelled_host = fixture.host.id;
+    let cancelled = tokio::spawn(async move {
+        execute_try_restart(cancelled_session.as_ref(), cancelled_host, cancelling).await
+    });
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.try_restart_commands.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request dispatched");
+    cancellation.cancel();
+    assert_eq!(
+        cancelled.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::Cancelled,
+            )
+        )
+    );
+    assert_eq!(
+        fixture.handler.try_restart_commands.load(Ordering::SeqCst),
+        2
+    );
+
+    let lost_session = session.clone();
+    let lost_host = fixture.host.id;
+    let lost = tokio::spawn(async move {
+        execute_try_restart(lost_session.as_ref(), lost_host, CancellationToken::new()).await
+    });
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.try_restart_commands.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request dispatched");
+    fixture.cancellation.cancel();
+    assert_eq!(
+        lost.await.unwrap().terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            )
+        )
+    );
+    assert_eq!(
+        fixture.handler.try_restart_commands.load(Ordering::SeqCst),
+        3
+    );
+}
+
+#[tokio::test]
+async fn reset_failed_uses_the_exact_fixed_command_and_confirms_exit_status() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    let execution =
+        execute_reset_failed(session.as_ref(), fixture.host.id, CancellationToken::new()).await;
+    assert_eq!(
+        execution.terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionConfirmed { success: true }
+        )
+    );
+    assert_eq!(
+        fixture.handler.reset_failed_commands.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.handler.last_reset_failed_command.lock().unwrap().as_slice(),
+        b"LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 systemctl --system --no-pager --no-ask-password reset-failed -- broken.service"
+    );
+    assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn reset_failed_transport_classifies_rejection_failure_and_ambiguous_completion() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    for (mode, expected) in [
+        (
+            6,
+            MutationTransportOutcome::NotDispatched(
+                ubgops_remote_operations::NotDispatchedReason::Rejected,
+            ),
+        ),
+        (
+            3,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            7,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            1,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::OutputLimit,
+            ),
+        ),
+    ] {
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let result =
+            execute_reset_failed(session.as_ref(), fixture.host.id, CancellationToken::new()).await;
+        assert_eq!(
+            result.terminal,
+            ubgops_remote_operations::ExecutionTerminal::Transport(expected),
+            "mode {mode}"
+        );
+    }
+    assert_eq!(
+        fixture.handler.reset_failed_commands.load(Ordering::SeqCst),
+        4
+    );
+
+    let before = fixture.handler.reset_failed_commands.load(Ordering::SeqCst);
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let result = execute_reset_failed(session.as_ref(), fixture.host.id, cancelled).await;
+    assert_eq!(
+        result.terminal,
+        ubgops_remote_operations::ExecutionTerminal::CancelledBeforeDispatch
+    );
+    assert_eq!(
+        fixture.handler.reset_failed_commands.load(Ordering::SeqCst),
+        before
+    );
+}
+
+#[tokio::test]
+async fn reset_failed_accepts_terminal_evidence_without_prior_request_success() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    for (mode, expected) in [
+        (
+            9,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            8,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            11,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            12,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            13,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            10,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            15,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            16,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+        (
+            17,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::OutputLimit,
+            ),
+        ),
+        (
+            18,
+            MutationTransportOutcome::CompletionConfirmed { success: true },
+        ),
+        (
+            19,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            20,
+            MutationTransportOutcome::CompletionConfirmed { success: false },
+        ),
+        (
+            21,
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::ConnectionLost,
+            ),
+        ),
+    ] {
+        let before = fixture.handler.reset_failed_commands.load(Ordering::SeqCst);
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let result =
+            execute_reset_failed(session.as_ref(), fixture.host.id, CancellationToken::new()).await;
+        assert_eq!(
+            result.terminal,
+            ubgops_remote_operations::ExecutionTerminal::Transport(expected),
+            "mode {mode}"
+        );
+        assert_eq!(
+            fixture.handler.reset_failed_commands.load(Ordering::SeqCst),
+            before + 1,
+            "mode {mode} must dispatch exactly once"
+        );
+    }
+    assert_eq!(
+        fixture.handler.reset_failed_commands.load(Ordering::SeqCst),
+        13
+    );
+}
+
+#[tokio::test]
+async fn reset_failed_timeout_and_cancellation_after_dispatch_are_unknown() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(22, Ordering::SeqCst);
+
+    let timed_session = session.clone();
+    let timed_host = fixture.host.id;
+    let timed = tokio::spawn(async move {
+        execute_reset_failed(timed_session.as_ref(), timed_host, CancellationToken::new()).await
+    });
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.reset_failed_commands.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request dispatched");
+    let timed = timed.await.unwrap();
+    assert_eq!(
+        timed.terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::Timeout,
+            )
+        )
+    );
+
+    let cancellation = CancellationToken::new();
+    let cancelling = cancellation.clone();
+    let cancelled_session = session.clone();
+    let cancelled_host = fixture.host.id;
+    let cancelled = tokio::spawn(async move {
+        execute_reset_failed(cancelled_session.as_ref(), cancelled_host, cancelling).await
+    });
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.reset_failed_commands.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second request dispatched");
+    cancellation.cancel();
+    let cancelled = cancelled.await.unwrap();
+    assert_eq!(
+        cancelled.terminal,
+        ubgops_remote_operations::ExecutionTerminal::Transport(
+            MutationTransportOutcome::CompletionUnknown(
+                ubgops_remote_operations::CompletionUnknownReason::Cancelled,
+            )
+        )
+    );
+    assert_eq!(
+        fixture.handler.reset_failed_commands.load(Ordering::SeqCst),
+        2,
+        "timeout and cancellation scenarios must each dispatch exactly once"
+    );
+}
+
+#[tokio::test]
+async fn rejected_sftp_subsystem_is_typed_and_leaves_ssh_usable() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    let error = session
+        .open_sftp(fixture.host.id, HostSessionId::new())
+        .await
+        .err()
+        .expect("fixture does not provide SFTP");
+    assert_eq!(error.code, ErrorCode::SftpDenied);
+    let hostname = session
+        .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+        .await
+        .expect("SSH discovery remains usable after SFTP rejection");
+    assert_eq!(hostname.trim(), "ubgops-fixture");
+}
+
+#[tokio::test]
+async fn unsupported_service_inventory_is_not_empty_success_and_keeps_ssh_usable() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    let result = ubgops_discovery::observe_services(
+        session.as_ref(),
+        CancellationToken::new(),
+        fixture.host.id,
+        HostSessionId::new(),
+    )
+    .await;
+    let error = result.expect_err("the fixture has no systemd manager");
+    assert!(!error.message.contains("systemctl:"));
+    assert!(!session.is_closed());
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .expect("other read still works"),
+        "ubgops-fixture\n"
+    );
+}
+
+#[tokio::test]
+async fn fixed_network_inventory_uses_production_ssh_and_ignores_link_address() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    let snapshot = ubgops_discovery::observe_network(
+        session.as_ref(),
+        CancellationToken::new(),
+        fixture.host.id,
+        HostSessionId::new(),
+    )
+    .await
+    .expect("network inventory");
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].name, "lo");
+    assert_eq!(snapshot.entries[0].addresses[1].address, "::1");
+    assert!(!format!("{snapshot:?}").contains("00:00:00:00:00:00"));
+    assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn journal_json_lines_use_exact_fixed_command_over_production_ssh() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .unwrap();
+    let id = HostSessionId::new();
+    let snapshot = ubgops_discovery::observe_system_journal(
+        session.as_ref(),
+        CancellationToken::new(),
+        fixture.host.id,
+        id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.host_id, fixture.host.id);
+    assert_eq!(snapshot.host_session_id, id);
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(
+        snapshot.entries[0].message.as_deref(),
+        Some("synthetic journal entry")
+    );
+    assert_eq!(
+        snapshot.entries[1].message_state,
+        ubgops_model::SystemJournalMessageState::Omitted
+    );
+    assert_eq!(fixture.handler.command_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.handler.journal_commands.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn journal_malformed_oversized_and_unavailable_responses_are_safe_failures() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .unwrap();
+    for mode in [4, 1, 3] {
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let error = ubgops_discovery::observe_system_journal(
+            session.as_ref(),
+            CancellationToken::new(),
+            fixture.host.id,
+            HostSessionId::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "System journal entries are unavailable for this connection."
+        );
+        assert!(error.host_key.is_none());
+        assert!(!session.is_closed());
+    }
+    assert_eq!(fixture.handler.journal_commands.load(Ordering::SeqCst), 3);
+    fixture.handler.mode.store(0, Ordering::SeqCst);
+    assert!(
+        ubgops_discovery::observe_system_journal(
+            session.as_ref(),
+            CancellationToken::new(),
+            fixture.host.id,
+            HostSessionId::new()
+        )
+        .await
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn docker_inventory_uses_only_the_exact_fixed_command_over_production_ssh() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .unwrap();
+    let id = HostSessionId::new();
+    let snapshot = ubgops_discovery::observe_docker_containers(
+        session.as_ref(),
+        CancellationToken::new(),
+        fixture.host.id,
+        id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.host_id, fixture.host.id);
+    assert_eq!(snapshot.host_session_id, id);
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].name, "synthetic-container");
+    assert_eq!(fixture.handler.docker_commands.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.handler.command_count.load(Ordering::SeqCst), 1);
+    assert!(probe_responses::response(b"docker container ls").is_none());
+    assert!(
+        probe_responses::response(b"docker --host tcp://127.0.0.1:2375 container ls").is_none()
+    );
+}
+
+#[tokio::test]
+async fn docker_empty_and_failure_responses_do_not_break_other_fixed_ssh_reads() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .unwrap();
+    fixture.handler.mode.store(5, Ordering::SeqCst);
+    let empty = ubgops_discovery::observe_docker_containers(
+        session.as_ref(),
+        CancellationToken::new(),
+        fixture.host.id,
+        HostSessionId::new(),
+    )
+    .await
+    .unwrap();
+    assert!(empty.entries.is_empty());
+
+    for mode in [4, 1, 3] {
+        fixture.handler.mode.store(mode, Ordering::SeqCst);
+        let error = ubgops_discovery::observe_docker_containers(
+            session.as_ref(),
+            CancellationToken::new(),
+            fixture.host.id,
+            HostSessionId::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "Docker container inventory is unavailable for this connection."
+        );
+        assert!(!session.is_closed());
+    }
+    assert_eq!(fixture.handler.docker_commands.load(Ordering::SeqCst), 4);
+    fixture.handler.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .unwrap(),
+        "ubgops-fixture\n"
+    );
+    assert_eq!(fixture.handler.docker_commands.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn failing_network_command_keeps_other_fixed_reads_usable() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(3, Ordering::SeqCst);
+    let result = ubgops_discovery::observe_network(
+        session.as_ref(),
+        CancellationToken::new(),
+        fixture.host.id,
+        HostSessionId::new(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!session.is_closed());
+    fixture.handler.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .unwrap(),
+        "ubgops-fixture\n"
+    );
+}
+
+#[tokio::test]
+async fn unknown_key_blocks_before_auth_then_explicit_trust_allows_discovery() {
+    let fixture = Fixture::start().await;
+    let store = Arc::new(KnownHosts::open(":memory:").expect("pins"));
+    let provider = SshProvider::new(store.clone());
+    let error = provider
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .err()
+        .expect("unknown key");
+    assert_eq!(error.code, ErrorCode::UnknownHostKey);
+    assert_eq!(fixture.handler.auth_attempts.load(Ordering::SeqCst), 0);
+    let challenge = error.host_key.expect("challenge");
+    assert_eq!(challenge.fingerprint, fixture.fingerprint.sha256);
+    store.trust(&challenge).expect("explicit trust");
+    let session = provider
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    let snapshot = ubgops_discovery::discover(session.as_ref(), CancellationToken::new())
+        .await
+        .expect("discovery");
+    assert_eq!(snapshot.hostname.as_deref(), Some("ubgops-fixture"));
+    assert_eq!(snapshot.kernel.as_deref(), Some("6.12.0-fixture"));
+    assert_eq!(snapshot.architecture.as_deref(), Some("x86_64"));
+    assert_eq!(snapshot.load_one, Some(0.25));
+    assert_eq!(snapshot.memory_total_bytes, Some(8192000 * 1024));
+    assert_eq!(snapshot.root_used_bytes, Some(250000 * 1024));
+    assert!(
+        snapshot.warnings.is_empty(),
+        "discovery warnings: {:?}",
+        snapshot.warnings
+    );
+    assert_eq!(fixture.handler.command_count.load(Ordering::SeqCst), 8);
+    // The same production pin accessor used by the local trust getter adds no SSH work.
+    let before = (
+        fixture.handler.connection_count.load(Ordering::SeqCst),
+        fixture.handler.auth_attempts.load(Ordering::SeqCst),
+        fixture.handler.command_count.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        store
+            .fingerprint(
+                &fixture.host.connection.hostname,
+                fixture.host.connection.port
+            )
+            .unwrap(),
+        Some(fixture.fingerprint.clone())
+    );
+    assert_eq!(
+        (
+            fixture.handler.connection_count.load(Ordering::SeqCst),
+            fixture.handler.auth_attempts.load(Ordering::SeqCst),
+            fixture.handler.command_count.load(Ordering::SeqCst),
+        ),
+        before
+    );
+    session.disconnect().await.expect("disconnect");
+    assert!(session.is_closed());
+}
+
+#[tokio::test]
+async fn changed_actual_server_key_is_rejected_before_authentication() {
+    let fixture = Fixture::start().await;
+    let store = Arc::new(KnownHosts::open(":memory:").expect("pins"));
+    store
+        .trust(&HostKeyChallenge {
+            hostname: "127.0.0.1".into(),
+            port: fixture.host.connection.port,
+            algorithm: "ssh-ed25519".into(),
+            fingerprint: format!("SHA256:{}", "A".repeat(43)),
+            previous_fingerprint: None,
+        })
+        .expect("old pin");
+    let provider = SshProvider::new(store.clone());
+    let error = provider
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .err()
+        .expect("changed key");
+    assert_eq!(error.code, ErrorCode::ChangedHostKey);
+    assert_eq!(fixture.handler.auth_attempts.load(Ordering::SeqCst), 0);
+    let challenge = error.host_key.expect("blocked handshake challenge");
+    assert_eq!(challenge.fingerprint, fixture.fingerprint.sha256);
+    assert_eq!(
+        store.trust(&challenge).unwrap_err().code,
+        ErrorCode::ChangedHostKey
+    );
+    let before = (
+        fixture.handler.connection_count.load(Ordering::SeqCst),
+        fixture.handler.auth_attempts.load(Ordering::SeqCst),
+        fixture.handler.command_count.load(Ordering::SeqCst),
+    );
+    let old = store
+        .fingerprint("127.0.0.1", fixture.host.connection.port)
+        .unwrap()
+        .unwrap();
+    store
+        .rotate(
+            "127.0.0.1",
+            fixture.host.connection.port,
+            &old,
+            &fixture.fingerprint,
+        )
+        .expect("local CAS replacement");
+    assert_eq!(
+        (
+            fixture.handler.connection_count.load(Ordering::SeqCst),
+            fixture.handler.auth_attempts.load(Ordering::SeqCst),
+            fixture.handler.command_count.load(Ordering::SeqCst),
+        ),
+        before,
+        "local pin replacement must not touch SSH"
+    );
+    let session = provider
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("ordinary fresh connect verifies replacement before auth");
+    assert_eq!(
+        fixture.handler.auth_attempts.load(Ordering::SeqCst),
+        before.1 + 1
+    );
+    session.disconnect().await.expect("close verified session");
+    let wrong = HostFingerprint {
+        algorithm: fixture.fingerprint.algorithm.clone(),
+        sha256: format!("SHA256:{}", "C".repeat(43)),
+    };
+    store
+        .rotate(
+            "127.0.0.1",
+            fixture.host.connection.port,
+            &fixture.fingerprint,
+            &wrong,
+        )
+        .expect("test-controlled pin change");
+    let error = provider
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .err()
+        .expect("new mismatch still blocks");
+    assert_eq!(error.code, ErrorCode::ChangedHostKey);
+    assert_eq!(
+        fixture.handler.auth_attempts.load(Ordering::SeqCst),
+        before.1 + 1
+    );
+}
+
+#[tokio::test]
+async fn private_key_authentication_and_rejected_password_are_distinct() {
+    let fixture = Fixture::start().await;
+    let provider = fixture.trusted_provider();
+    let rejected = Credential {
+        password: Some(Zeroizing::new("incorrect".into())),
+        private_key: None,
+        passphrase: None,
+    };
+    let error = provider
+        .connect(&fixture.host, rejected, CancellationToken::new())
+        .await
+        .err()
+        .expect("rejected password");
+    assert_eq!(error.code, ErrorCode::Authentication);
+    let mut host = fixture.host.clone();
+    host.connection.authentication = AuthenticationMethod::PrivateKey;
+    let private_key = fixture
+        .user_key
+        .to_openssh(LineEnding::LF)
+        .expect("encode key");
+    let credential = Credential {
+        password: None,
+        private_key: Some(Zeroizing::new(private_key.as_str().into())),
+        passphrase: None,
+    };
+    let session = provider
+        .connect(&host, credential, CancellationToken::new())
+        .await
+        .expect("private key connect");
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .expect("command"),
+        "ubgops-fixture\n"
+    );
+    session.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn encrypted_private_key_requires_the_correct_passphrase() {
+    let fixture = Fixture::start().await;
+    let provider = fixture.trusted_provider();
+    let mut host = fixture.host.clone();
+    host.connection.authentication = AuthenticationMethod::PrivateKey;
+    let encrypted_key = fixture
+        .user_key
+        .encrypt(&mut rand::rng(), "fixture-passphrase")
+        .expect("encrypt fixture key")
+        .to_openssh(LineEnding::LF)
+        .expect("encode key");
+    let credential = |passphrase: &str| Credential {
+        password: None,
+        private_key: Some(Zeroizing::new(encrypted_key.as_str().into())),
+        passphrase: Some(Zeroizing::new(passphrase.into())),
+    };
+    let error = provider
+        .connect(&host, credential("incorrect"), CancellationToken::new())
+        .await
+        .err()
+        .expect("wrong passphrase");
+    assert_eq!(error.code, ErrorCode::Authentication);
+    assert_eq!(fixture.handler.auth_attempts.load(Ordering::SeqCst), 0);
+    let session = provider
+        .connect(
+            &host,
+            credential("fixture-passphrase"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("encrypted key authentication");
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .expect("command"),
+        "ubgops-fixture\n"
+    );
+    session.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn independent_hosts_do_not_share_session_lifetime() {
+    let first = Fixture::start().await;
+    let second = Fixture::start().await;
+    let first_session = first
+        .trusted_provider()
+        .connect(&first.host, password(), CancellationToken::new())
+        .await
+        .expect("first host");
+    let second_session = second
+        .trusted_provider()
+        .connect(&second.host, password(), CancellationToken::new())
+        .await
+        .expect("second host");
+    first_session.disconnect().await.expect("first disconnect");
+    assert!(first_session.is_closed());
+    assert!(!second_session.is_closed());
+    assert_eq!(
+        second_session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .expect("second still usable"),
+        "ubgops-fixture\n"
+    );
+    second_session
+        .disconnect()
+        .await
+        .expect("second disconnect");
+}
+
+#[tokio::test]
+async fn output_limit_and_optional_probe_failure_preserve_session() {
+    let fixture = Fixture::start().await;
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), CancellationToken::new())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .expect_err("bounded output")
+            .code,
+        ErrorCode::Discovery
+    );
+    fixture.handler.mode.store(3, Ordering::SeqCst);
+    let snapshot = ubgops_discovery::discover(session.as_ref(), CancellationToken::new())
+        .await
+        .expect("optional failures");
+    assert_eq!(snapshot.warnings.len(), 8);
+    assert!(!session.is_closed());
+    fixture.handler.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        session
+            .execute(ReadOnlyCommand::Hostname, CancellationToken::new())
+            .await
+            .expect("healthy again"),
+        "ubgops-fixture\n"
+    );
+    session.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn cancelling_operation_closes_channel_and_lifetime_closes_session() {
+    let fixture = Fixture::start().await;
+    let lifetime = CancellationToken::new();
+    let session = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), lifetime.clone())
+        .await
+        .expect("connect");
+    fixture.handler.mode.store(2, Ordering::SeqCst);
+    let operation = CancellationToken::new();
+    let execution = tokio::spawn({
+        let session = session.clone();
+        let token = operation.clone();
+        async move { session.execute(ReadOnlyCommand::Hostname, token).await }
+    });
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.command_count.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("command began");
+    operation.cancel();
+    assert_eq!(
+        timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("bounded cancellation")
+            .expect("task")
+            .expect_err("cancelled")
+            .code,
+        ErrorCode::Cancelled
+    );
+    timeout(Duration::from_secs(2), async {
+        while fixture.handler.channel_closes.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("channel closed after cancellation");
+    assert!(!session.is_closed());
+    lifetime.cancel();
+    assert!(session.is_closed());
+}
+
+#[tokio::test]
+async fn pre_cancelled_connect_never_authenticates() {
+    let fixture = Fixture::start().await;
+    let token = CancellationToken::new();
+    token.cancel();
+    let error = fixture
+        .trusted_provider()
+        .connect(&fixture.host, password(), token)
+        .await
+        .err()
+        .expect("cancelled");
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(fixture.handler.auth_attempts.load(Ordering::SeqCst), 0);
+}

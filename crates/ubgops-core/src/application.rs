@@ -1,0 +1,263 @@
+use crate::service_observations::ServiceObservationStore;
+use crate::{ConnectionProvider, HostRepository, StoredHost, sessions::SessionSlot};
+use ubgops_audit::{AuditActor, AuditEvent, AuditLog, AuditOutcome};
+use ubgops_model::*;
+use ubgops_remote_operations::RemoteOperationFoundation;
+use ubgops_secrets::{CredentialInput, EncryptedSecretStore, PlatformKeyProvider, SecretStore};
+use ubgops_sftp::{FilePlanStore, SftpClient, TransferManager};
+use ubgops_ssh::{KnownHosts, SshProvider};
+use ubgops_terminal::TerminalManager;
+use std::{collections::HashMap, fs::File, path::Path, sync::Arc, time::Instant};
+use tokio::sync::{Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
+
+/// Typed application facade. All connection mutations are serialized just long enough
+/// to update local state; network work never holds the metadata gate.
+pub struct Application {
+    pub(crate) repository: Arc<HostRepository>,
+    pub(crate) secrets: Arc<dyn SecretStore>,
+    pub(crate) provider: Arc<dyn ConnectionProvider>,
+    pub(crate) known_hosts: Arc<KnownHosts>,
+    pub(crate) audit: Arc<AuditLog>,
+    pub(crate) terminals: Arc<TerminalManager>,
+    pub(crate) sftp_sessions: Mutex<HashMap<HostId, Arc<dyn SftpClient>>>,
+    pub(crate) sftp_startups: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
+    pub(crate) file_plans: FilePlanStore,
+    pub(crate) transfers: TransferManager,
+    pub(crate) monitor_baselines: Mutex<HashMap<HostId, MonitorState>>,
+    pub(crate) monitor_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
+    pub(crate) service_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
+    pub(crate) service_limit: Semaphore,
+    pub(crate) service_observations: ServiceObservationStore,
+    pub(crate) network_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
+    pub(crate) network_limit: Semaphore,
+    pub(crate) log_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
+    pub(crate) log_limit: Semaphore,
+    pub(crate) container_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
+    pub(crate) container_limit: Semaphore,
+    pub(crate) remote_operations: RemoteOperationFoundation,
+    rotation_plans: Mutex<HashMap<HostId, RotationAuthority>>,
+    sessions: Mutex<HashMap<HostId, Arc<SessionSlot>>>,
+    mutation: Mutex<()>,
+    _profile_lock: Option<File>,
+}
+fn persistence() -> AppError {
+    AppError::new(
+        ErrorCode::Persistence,
+        "Cannot open the UBGOps data directory.",
+    )
+}
+fn cancelled() -> AppError {
+    AppError::new(ErrorCode::Cancelled, "Connection was cancelled.")
+}
+fn error_outcome(error: &AppError) -> AuditOutcome {
+    if error.code == ErrorCode::Cancelled {
+        AuditOutcome::Cancelled
+    } else {
+        AuditOutcome::Failed
+    }
+}
+mod connection;
+mod containers;
+mod files;
+mod hosts;
+mod identity;
+mod lifecycle;
+mod logs;
+mod monitoring;
+mod network;
+mod rotation;
+mod security;
+mod services;
+mod terminal;
+
+pub(crate) struct MonitorState {
+    pub session_id: HostSessionId,
+    pub baseline: ubgops_discovery::MonitorBaseline,
+    pub observed_at: Instant,
+}
+pub(crate) struct RotationAuthority {
+    pub plan: HostKeyRotationPlan,
+    pub generation: u64,
+    pub expires_at: Instant,
+}
+#[cfg(test)]
+mod tests;
+impl Application {
+    pub fn open(directory: &Path) -> Result<Self, AppError> {
+        std::fs::create_dir_all(directory).map_err(|_| persistence())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| persistence())?;
+        }
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("profile.lock"))
+            .map_err(|_| persistence())?;
+        lock.try_lock().map_err(|_| {
+            AppError::new(
+                ErrorCode::Conflict,
+                "This UBGOps profile is already open in another process.",
+            )
+        })?;
+        let repository = Arc::new(HostRepository::open(directory.join("hosts.db"))?);
+        let keys = Arc::new(PlatformKeyProvider::new(&repository.profile_id()?));
+        let secrets = Arc::new(EncryptedSecretStore::open(
+            directory.join("credentials.db"),
+            keys,
+        )?);
+        let known_hosts = Arc::new(KnownHosts::open(directory.join("known-hosts.db"))?);
+        let audit = Arc::new(AuditLog::open(directory.join("audit.jsonl"))?);
+        let provider = Arc::new(SshProvider::new(known_hosts.clone()));
+        Ok(Self {
+            repository,
+            secrets,
+            provider,
+            known_hosts,
+            audit,
+            terminals: Arc::new(TerminalManager::new()),
+            sftp_sessions: Mutex::new(HashMap::new()),
+            sftp_startups: Mutex::new(HashMap::new()),
+            file_plans: FilePlanStore::default(),
+            transfers: TransferManager::new(),
+            monitor_baselines: Mutex::new(HashMap::new()),
+            monitor_gates: Mutex::new(HashMap::new()),
+            service_gates: Mutex::new(HashMap::new()),
+            service_limit: Semaphore::new(4),
+            service_observations: ServiceObservationStore::default(),
+            network_gates: Mutex::new(HashMap::new()),
+            network_limit: Semaphore::new(4),
+            log_gates: Mutex::new(HashMap::new()),
+            log_limit: Semaphore::new(4),
+            container_gates: Mutex::new(HashMap::new()),
+            container_limit: Semaphore::new(4),
+            remote_operations: RemoteOperationFoundation::default(),
+            rotation_plans: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            mutation: Mutex::new(()),
+            _profile_lock: Some(lock),
+        })
+    }
+    async fn slot(&self, id: HostId) -> Arc<SessionSlot> {
+        self.sessions
+            .lock()
+            .await
+            .entry(id)
+            .or_insert_with(|| Arc::new(SessionSlot::new(id)))
+            .clone()
+    }
+    fn record(
+        &self,
+        id: HostId,
+        kind: &str,
+        outcome: AuditOutcome,
+        started: Instant,
+    ) -> Result<(), AppError> {
+        let risk = match kind {
+            "connection.connect" | "connection.disconnect" | "discovery.refresh" => {
+                OperationRisk::ReadOnly
+            }
+            "identity.trust" | "identity.rotate" => OperationRisk::High,
+            "host.save" | "host.delete" | "file.create_directory" => OperationRisk::Low,
+            "file.rename" | "file.transfer.accepted" | "file.editor_save.accepted" => {
+                OperationRisk::Moderate
+            }
+            "file.delete" => OperationRisk::Destructive,
+            _ => {
+                return Err(AppError::new(
+                    ErrorCode::Policy,
+                    "The audit operation kind has no reviewed risk classification.",
+                ));
+            }
+        };
+        self.record_with_risk(id, kind, risk, outcome, started)
+    }
+
+    /// Records native-controlled operation identity and risk. Future mutation
+    /// callers must provide their reviewed risk explicitly; unknown kinds never
+    /// fall back to ReadOnly.
+    fn record_with_risk(
+        &self,
+        id: HostId,
+        kind: &str,
+        risk: OperationRisk,
+        outcome: AuditOutcome,
+        started: Instant,
+    ) -> Result<(), AppError> {
+        self.audit.record(&AuditEvent::new(
+            id,
+            Operation {
+                id: HostId::new().to_string(),
+                kind: kind.into(),
+                risk,
+            },
+            AuditActor::User,
+            outcome,
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        ))
+    }
+    /// Performs resource shutdown after process-wide command admission is sealed and drained.
+    /// Repeating this operation after successful cleanup is safe; transfer admission remains
+    /// permanently closed and remote session resources are not recreated here.
+    pub async fn shutdown(&self) -> Result<(), AppError> {
+        self.remote_operations.begin_shutdown()?;
+        self.service_observations.seal_and_revoke_all()?;
+        let slots = {
+            let _mutation = self.mutation.lock().await;
+            self.rotation_plans.lock().await.clear();
+            let slots = self
+                .sessions
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for slot in &slots {
+                let mut data = slot.data.lock().await;
+                data.generation += 1;
+                data.refreshing = false;
+                if data.view.state == ConnectionState::Connecting {
+                    data.cancel.cancel();
+                } else if data.view.state == ConnectionState::Connected {
+                    data.view.state = ConnectionState::Disconnecting;
+                }
+            }
+            slots
+        };
+        self.transfers.shutdown();
+        let sessions = self
+            .sftp_sessions
+            .lock()
+            .await
+            .values()
+            .map(|client| (client.info().host_id, client.info().host_session_id))
+            .collect::<Vec<_>>();
+        for (host, session) in sessions {
+            self.close_sftp(host, session).await?;
+        }
+        self.transfers.quiesce_all().await?;
+        self.file_plans.revoke_all()?;
+        self.sftp_startups.lock().await.clear();
+        self.terminals.shutdown().await;
+        self.monitor_baselines.lock().await.clear();
+        self.monitor_gates.lock().await.clear();
+        self.service_gates.lock().await.clear();
+        self.network_gates.lock().await.clear();
+        self.log_gates.lock().await.clear();
+        self.container_gates.lock().await.clear();
+        for slot in slots {
+            let mut data = slot.data.lock().await;
+            data.cancel.cancel();
+            data.refreshing = false;
+            data.transport = None;
+            data.connection_id = None;
+            data.view = HostSession::disconnected(data.view.host_id);
+        }
+        Ok(())
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "ubgops-operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ubgops-model = { path = "../ubgops-model" }
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

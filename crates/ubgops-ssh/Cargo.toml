@@ -1,0 +1,33 @@
+[package]
+name = "ubgops-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ubgops-model = { path = "../ubgops-model" }
+ubgops-operations = { path = "../ubgops-operations" }
+ubgops-remote-operations = { path = "../ubgops-remote-operations" }
+ubgops-secrets = { path = "../ubgops-secrets" }
+ubgops-terminal.workspace = true
+ubgops-sftp.workspace = true
+rusqlite.workspace = true
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+ubgops-discovery = { path = "../ubgops-discovery" }
+rand = "0.10"
+serde_json.workspace = true
+sha2 = "0.10"
+tempfile.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

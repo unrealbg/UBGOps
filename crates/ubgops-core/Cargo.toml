@@ -1,0 +1,34 @@
+[package]
+name = "ubgops-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ubgops-model.workspace = true
+ubgops-secrets.workspace = true
+ubgops-ssh.workspace = true
+ubgops-discovery.workspace = true
+ubgops-operations.workspace = true
+ubgops-audit.workspace = true
+ubgops-terminal.workspace = true
+ubgops-sftp.workspace = true
+ubgops-remote-operations.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ts-rs.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+minisign-verify.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

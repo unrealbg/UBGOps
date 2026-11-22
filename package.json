@@ -1,0 +1,43 @@
+{
+  "name": "ubgops",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/desktop", "packages/ui", "packages/protocol"],
+  "engines": { "node": ">=24.15.0" },
+  "scripts": {
+    "dev": "npm run dev --workspace @ubgops/desktop",
+    "build": "npm run build --workspace @ubgops/desktop",
+    "typecheck": "tsc --noEmit -p apps/desktop/tsconfig.json",
+    "lint": "eslint apps/desktop/src packages/ui/src apps/desktop/vite.config.ts eslint.config.js",
+    "test": "vitest run --config apps/desktop/vite.config.ts",
+    "release:verify": "node tools/release/verify-release-version.mjs",
+    "release:source": "node tools/release/verify-release-source.mjs",
+    "release:stage": "node tools/release/stage-release-candidate.mjs",
+    "release:manifest": "node tools/release/create-release-manifest.mjs",
+    "release:manifest:verify": "node tools/release/verify-release-manifest.mjs",
+    "test:release": "node --test tools/release/release-version.test.mjs tools/release/release-manifest.test.mjs tools/release/release-source.test.mjs tools/release/tauri-generation.test.mjs tools/release/release-identity.test.mjs tools/release/latest-json.test.mjs tools/release/signed-updater-candidate.test.mjs tools/release/signed-updater-workflow.test.mjs tools/release/updater-crypto.test.mjs tools/release/release-publication-common.test.mjs tools/release/prepare-publication-set.test.mjs tools/release/verify-published-release.test.mjs tools/release/release-workflow-policy.test.mjs tools/release/prepare-updater-bundle-config.test.mjs tools/release/update-ipc.test.mjs tools/release/lifecycle-source.test.mjs",
+    "test:remote-operations-source": "node --test tools/policy/remote-operations-source.test.mjs",
+    "format:frontend": "prettier --write \"apps/desktop/src/**/*.{ts,tsx,css,html}\" \"packages/ui/src/**/*.{tsx,css}\" apps/desktop/vite.config.ts eslint.config.js",
+    "tauri": "npm exec --workspace @ubgops/desktop -- tauri"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "26.5.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "eslint": "10.10.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "jsdom": "30.0.1",
+    "prettier": "3.9.6",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0",
+    "vite": "8.3.0",
+    "vitest": "5.0.0"
+  }
+}

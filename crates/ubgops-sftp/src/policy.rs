@@ -1,0 +1,2418 @@
+use crate::{
+    EditorRevision, EntryIdentity, SftpClient, display_name, encode_text, join_remote,
+    validate_child_name, validate_remote_path, validate_windows_file_name,
+};
+use ubgops_model::{
+    AppError, ConflictPolicy, EditorDocumentId, ErrorCode, FileOperationKind, FileOperationPlan,
+    FilePlanId, FilePlanItem, HostId, HostSessionId, OperationRisk, RemoteEntryKind, SftpSessionId,
+    TextNewline,
+};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    fs::File,
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
+};
+
+const PLAN_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const PLAN_CAP: usize = 100;
+const DOCUMENT_LIFETIME: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+struct EditorDocumentAuthority {
+    host: HostId,
+    host_session: HostSessionId,
+    sftp: SftpSessionId,
+    path: String,
+    revision: EditorRevision,
+    content_digest: [u8; 32],
+    newline: TextNewline,
+    bom: bool,
+    expires: Instant,
+    use_state: EditorDocumentUse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorDocumentUse {
+    Ready,
+    Planning(FilePlanId),
+    Pending(FilePlanId),
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalItem {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub identity: LocalIdentity,
+    pub handle: Arc<File>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalDirectory {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub identity: LocalIdentity,
+    pub handle: Arc<File>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteSource {
+    pub path: String,
+    pub name: String,
+    pub size: Option<u64>,
+    pub identity: EntryIdentity,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannedUpload {
+    pub source: LocalItem,
+    pub destination: String,
+    pub action: DestinationAction<EntryIdentity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannedDownload {
+    pub source: RemoteSource,
+    pub destination: LocalDirectory,
+    pub file_name: String,
+    pub action: DestinationAction<LocalIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalIdentity {
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub object_id: LocalObjectId,
+}
+
+/// Immutable filesystem object identity. Mutable size and timestamps remain
+/// separate preconditions in [`LocalIdentity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalObjectId {
+    pub storage_id: u64,
+    pub file_id: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DestinationAction<T> {
+    Skip,
+    CreateNew,
+    ReplaceExisting(T),
+}
+
+#[derive(Clone, Debug)]
+pub enum MutationSpec {
+    CreateDirectory {
+        path: String,
+    },
+    Rename {
+        source: String,
+        destination: String,
+        expected_source: EntryIdentity,
+    },
+    Delete {
+        path: String,
+        kind: RemoteEntryKind,
+        expected: EntryIdentity,
+    },
+}
+
+#[derive(Clone)]
+pub enum PlanPayload {
+    EditorSave {
+        client: std::sync::Arc<dyn SftpClient>,
+        path: String,
+        expected: EditorRevision,
+        original_digest: [u8; 32],
+        bytes: Vec<u8>,
+    },
+    Upload {
+        client: std::sync::Arc<dyn SftpClient>,
+        policy: ConflictPolicy,
+        items: Vec<PlannedUpload>,
+    },
+    Download {
+        client: std::sync::Arc<dyn SftpClient>,
+        policy: ConflictPolicy,
+        items: Vec<PlannedDownload>,
+    },
+    Mutation {
+        client: std::sync::Arc<dyn SftpClient>,
+        spec: MutationSpec,
+    },
+}
+
+pub struct InternalPlan {
+    pub view: FileOperationPlan,
+    pub payload: PlanPayload,
+}
+
+struct StoredPlan {
+    plan: Option<InternalPlan>,
+    expires: Instant,
+    editor_document: Option<EditorDocumentId>,
+}
+
+struct PlanInsert {
+    id: FilePlanId,
+    info: ubgops_model::SftpSessionInfo,
+    kind: FileOperationKind,
+    risk: OperationRisk,
+    conflict_policy: Option<ConflictPolicy>,
+    items: Vec<FilePlanItem>,
+    payload: PlanPayload,
+    editor_document: Option<EditorDocumentId>,
+}
+
+pub struct FilePlanStore {
+    plans: Arc<Mutex<HashMap<FilePlanId, StoredPlan>>>,
+    documents: Arc<Mutex<HashMap<EditorDocumentId, EditorDocumentAuthority>>>,
+    lifetime: Duration,
+}
+
+/// A dropped or failed planning future releases only its own reservation.
+/// Retirement, expiry and session revocation remove the record and cannot be undone here.
+struct EditorPlanningGuard {
+    documents: Weak<Mutex<HashMap<EditorDocumentId, EditorDocumentAuthority>>>,
+    document_id: EditorDocumentId,
+    reservation: FilePlanId,
+    active: bool,
+}
+
+impl Drop for EditorPlanningGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(documents) = self.documents.upgrade() else {
+            return;
+        };
+        let Ok(mut documents) = documents.lock() else {
+            return;
+        };
+        release_editor_reservation(
+            &mut documents,
+            self.document_id,
+            EditorDocumentUse::Planning(self.reservation),
+        );
+    }
+}
+
+fn release_editor_reservation(
+    documents: &mut HashMap<EditorDocumentId, EditorDocumentAuthority>,
+    document_id: EditorDocumentId,
+    expected: EditorDocumentUse,
+) -> bool {
+    let Some(document) = documents.get_mut(&document_id) else {
+        return false;
+    };
+    if document.use_state != expected {
+        return false;
+    }
+    if document.expires <= Instant::now() {
+        documents.remove(&document_id);
+        false
+    } else {
+        document.use_state = EditorDocumentUse::Ready;
+        true
+    }
+}
+
+impl Default for FilePlanStore {
+    fn default() -> Self {
+        Self {
+            plans: Arc::default(),
+            documents: Arc::default(),
+            lifetime: PLAN_LIFETIME,
+        }
+    }
+}
+
+impl FilePlanStore {
+    /// Revokes every unconsumed plan and editor-document authority during process shutdown.
+    pub fn revoke_all(&self) -> Result<(), AppError> {
+        self.documents
+            .lock()
+            .map_err(|_| policy_error("File authority is unavailable."))?
+            .clear();
+        self.plans
+            .lock()
+            .map_err(|_| policy_error("File authority is unavailable."))?
+            .clear();
+        Ok(())
+    }
+
+    pub fn revoke_session(&self, host: HostId, host_session: HostSessionId) {
+        let mut documents = self.documents.lock().ok();
+        if let Some(documents) = documents.as_mut() {
+            documents.retain(|_, value| value.host != host || value.host_session != host_session);
+        }
+        if let Ok(mut plans) = self.plans.lock() {
+            plans.retain(|_, stored| {
+                stored.plan.as_ref().is_some_and(|plan| {
+                    plan.view.host_id != host || plan.view.host_session_id != host_session
+                })
+            });
+        }
+    }
+
+    pub fn register_editor_document(
+        &self,
+        client: &dyn SftpClient,
+        path: String,
+        revision: EditorRevision,
+        original_bytes: &[u8],
+        newline: TextNewline,
+        bom: bool,
+    ) -> Result<EditorDocumentId, AppError> {
+        let info = client.info();
+        validate_remote_path(&path)?;
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+        let retired: Vec<_> = documents
+            .iter()
+            .filter_map(|(id, value)| {
+                (value.expires <= Instant::now()
+                    || (
+                        value.host,
+                        value.host_session,
+                        value.sftp,
+                        value.path.as_str(),
+                    ) == (info.host_id, info.host_session_id, info.id, path.as_str()))
+                    .then_some(*id)
+            })
+            .collect();
+        for id in &retired {
+            documents.remove(id);
+        }
+        if !retired.is_empty() {
+            let mut plans = self
+                .plans
+                .lock()
+                .map_err(|_| policy_error("The file plan store is unavailable."))?;
+            plans.retain(|_, stored| {
+                !stored
+                    .editor_document
+                    .is_some_and(|id| retired.contains(&id))
+            });
+        }
+        if documents.len() >= PLAN_CAP {
+            return Err(policy_error("Too many editor documents are open."));
+        }
+        let id = EditorDocumentId::new();
+        documents.insert(
+            id,
+            EditorDocumentAuthority {
+                host: info.host_id,
+                host_session: info.host_session_id,
+                sftp: info.id,
+                path,
+                revision,
+                content_digest: Sha256::digest(original_bytes).into(),
+                newline,
+                bom,
+                expires: Instant::now() + DOCUMENT_LIFETIME,
+                use_state: EditorDocumentUse::Ready,
+            },
+        );
+        let expires = documents.get(&id).expect("inserted document").expires;
+        drop(documents);
+        schedule_document_expiry(
+            Arc::downgrade(&self.documents),
+            Arc::downgrade(&self.plans),
+            id,
+            expires,
+        );
+        Ok(id)
+    }
+
+    /// Retires only a matching, still-pending editor document. A consumed or
+    /// session-revoked token is already retired and may be discarded again.
+    pub fn discard_editor_document(
+        &self,
+        id: EditorDocumentId,
+        host: HostId,
+        host_session: HostSessionId,
+        sftp: SftpSessionId,
+    ) -> Result<(), AppError> {
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+        let Some(document) = documents.get(&id) else {
+            return Ok(());
+        };
+        if (document.host, document.host_session, document.sftp) != (host, host_session, sftp) {
+            return Err(policy_error(
+                "The editor document belongs to another SFTP session.",
+            ));
+        }
+        let pending = match document.use_state {
+            EditorDocumentUse::Pending(plan_id) => Some(plan_id),
+            _ => None,
+        };
+        documents.remove(&id);
+        if let Some(plan_id) = pending {
+            let mut plans = self
+                .plans
+                .lock()
+                .map_err(|_| policy_error("The file plan store is unavailable."))?;
+            if plans
+                .get(&plan_id)
+                .is_some_and(|stored| stored.editor_document == Some(id))
+            {
+                plans.remove(&plan_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn plan_editor_save(
+        &self,
+        client: std::sync::Arc<dyn SftpClient>,
+        document_id: EditorDocumentId,
+        text: String,
+    ) -> Result<FileOperationPlan, AppError> {
+        let info = client.info();
+        let reservation = FilePlanId::new();
+        let document = {
+            let mut documents = self
+                .documents
+                .lock()
+                .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+            let existing = documents
+                .get_mut(&document_id)
+                .ok_or_else(|| policy_error("The editor document is stale; reload it."))?;
+            if existing.expires <= Instant::now()
+                || (existing.host, existing.host_session, existing.sftp)
+                    != (info.host_id, info.host_session_id, info.id)
+            {
+                return Err(policy_error(
+                    "The editor document belongs to an old or expired session.",
+                ));
+            }
+            if existing.use_state != EditorDocumentUse::Ready {
+                return Err(policy_error(
+                    "A save is already being prepared or reviewed for this document.",
+                ));
+            }
+            existing.use_state = EditorDocumentUse::Planning(reservation);
+            existing.clone()
+        };
+        let mut guard = EditorPlanningGuard {
+            documents: Arc::downgrade(&self.documents),
+            document_id,
+            reservation,
+            active: true,
+        };
+        if !supports(&info, "posix-rename@openssh.com", "1") {
+            return Err(AppError::new(
+                ErrorCode::SftpUnavailable,
+                "Safe editor replacement requires posix-rename@openssh.com v1.",
+            ));
+        }
+        let bytes = encode_text(&text, document.newline, document.bom)?;
+        if client.editor_revision(&document.path).await? != document.revision {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "The remote file changed since it was opened.",
+            ));
+        }
+        let current_bytes = client.read_editor_bytes(&document.path).await?;
+        if <[u8; 32]>::from(Sha256::digest(&current_bytes)) != document.content_digest {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "The remote file contents changed since it was opened.",
+            ));
+        }
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+        let current = documents
+            .get(&document_id)
+            .ok_or_else(|| policy_error("The editor document was retired during planning."))?;
+        if current.expires <= Instant::now()
+            || current.use_state != EditorDocumentUse::Planning(reservation)
+            || (current.host, current.host_session, current.sftp)
+                != (info.host_id, info.host_session_id, info.id)
+        {
+            return Err(policy_error(
+                "The editor document was retired or expired during planning.",
+            ));
+        }
+        let view = self.insert_with_id(PlanInsert {
+            id: reservation,
+            info,
+            kind: FileOperationKind::EditText,
+            risk: OperationRisk::High,
+            conflict_policy: None,
+            items: vec![FilePlanItem {
+                source_display: "Edited text".into(),
+                destination_display: display_name(&document.path),
+                size_bytes: Some(bytes.len().to_string()),
+            }],
+            payload: PlanPayload::EditorSave {
+                client,
+                path: document.path,
+                expected: document.revision,
+                original_digest: document.content_digest,
+                bytes,
+            },
+            editor_document: Some(document_id),
+        })?;
+        documents
+            .get_mut(&document_id)
+            .expect("verified reservation")
+            .use_state = EditorDocumentUse::Pending(reservation);
+        guard.active = false;
+        Ok(view)
+    }
+
+    /// Discards only the named pending plan. If execution consumed it first,
+    /// the active job owns its resources and this operation is idempotent.
+    pub fn discard(
+        &self,
+        id: FilePlanId,
+        host: HostId,
+        host_session: HostSessionId,
+        sftp: SftpSessionId,
+    ) -> Result<bool, AppError> {
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|_| policy_error("The file plan store is unavailable."))?;
+        let Some(stored) = plans.get(&id) else {
+            return Ok(false);
+        };
+        let editor_document = stored.editor_document;
+        if stored.expires <= Instant::now() {
+            plans.remove(&id);
+            if let Some(document_id) = editor_document {
+                release_editor_reservation(
+                    &mut documents,
+                    document_id,
+                    EditorDocumentUse::Pending(id),
+                );
+            }
+            return Ok(false);
+        }
+        let Some(plan) = stored.plan.as_ref() else {
+            plans.remove(&id);
+            return Ok(false);
+        };
+        if (
+            plan.view.host_id,
+            plan.view.host_session_id,
+            plan.view.sftp_session_id,
+        ) != (host, host_session, sftp)
+        {
+            return Err(policy_error(
+                "The file-operation plan does not belong to this host session.",
+            ));
+        }
+        plans.remove(&id);
+        if let Some(document_id) = editor_document {
+            return Ok(release_editor_reservation(
+                &mut documents,
+                document_id,
+                EditorDocumentUse::Pending(id),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub async fn plan_upload(
+        &self,
+        client: std::sync::Arc<dyn SftpClient>,
+        sources: Vec<LocalItem>,
+        remote_directory: &str,
+        policy: ConflictPolicy,
+    ) -> Result<FileOperationPlan, AppError> {
+        validate_remote_path(remote_directory)?;
+        if sources.is_empty() {
+            return Err(policy_error("Select at least one regular file."));
+        }
+        let mut planned = Vec::with_capacity(sources.len());
+        let mut items = Vec::with_capacity(sources.len());
+        for source in sources {
+            validate_local_source(&source)?;
+            validate_child_name(&source.display_name)?;
+            let base = join_remote(remote_directory, &source.display_name)?;
+            let existing = client.identity(&base).await?;
+            let (destination, action) = match (existing, policy) {
+                (None, _) if supports(&client.info(), "hardlink@openssh.com", "1") => {
+                    (base, DestinationAction::CreateNew)
+                }
+                (None, _) => {
+                    return Err(policy_error(
+                        "Safe new-file finalization requires hardlink@openssh.com v1.",
+                    ));
+                }
+                (Some(_), ConflictPolicy::Skip) => (base, DestinationAction::Skip),
+                (Some(identity), ConflictPolicy::Replace)
+                    if identity.kind == RemoteEntryKind::File
+                        && supports(&client.info(), "posix-rename@openssh.com", "1") =>
+                {
+                    (base, DestinationAction::ReplaceExisting(identity))
+                }
+                (Some(_), ConflictPolicy::Replace) => {
+                    return Err(policy_error(
+                        "Replace is limited to an existing regular file.",
+                    ));
+                }
+                (Some(_), ConflictPolicy::KeepBoth) => {
+                    if !supports(&client.info(), "hardlink@openssh.com", "1") {
+                        return Err(policy_error(
+                            "Safe Keep both finalization requires hardlink@openssh.com v1.",
+                        ));
+                    }
+                    let candidate =
+                        keep_both_remote(client.as_ref(), remote_directory, &source.display_name)
+                            .await?;
+                    (candidate, DestinationAction::CreateNew)
+                }
+            };
+            items.push(FilePlanItem {
+                source_display: display_name(&source.display_name),
+                destination_display: display_name(&destination),
+                size_bytes: Some(source.size.to_string()),
+            });
+            planned.push(PlannedUpload {
+                source,
+                destination,
+                action,
+            });
+        }
+        self.insert(
+            client.info(),
+            FileOperationKind::Upload,
+            OperationRisk::Moderate,
+            Some(policy),
+            items,
+            PlanPayload::Upload {
+                client,
+                policy,
+                items: planned,
+            },
+        )
+    }
+
+    pub async fn plan_download(
+        &self,
+        client: std::sync::Arc<dyn SftpClient>,
+        remote_paths: Vec<String>,
+        local_directory: LocalDirectory,
+        policy: ConflictPolicy,
+    ) -> Result<FileOperationPlan, AppError> {
+        if remote_paths.is_empty() {
+            return Err(policy_error("Select at least one regular file."));
+        }
+        let mut planned = Vec::with_capacity(remote_paths.len());
+        let mut items = Vec::with_capacity(remote_paths.len());
+        for path in remote_paths {
+            let entry = client.stat(&path).await?;
+            if entry.kind != RemoteEntryKind::File {
+                return Err(policy_error("Only regular files can be downloaded."));
+            }
+            validate_windows_file_name(&entry.name)?;
+            validate_local_directory_handle(&local_directory)?;
+            let mut destination = local_directory.path.join(&entry.name);
+            let existing = local_identity(&destination)?;
+            let action = match (existing, policy) {
+                (None, _) => DestinationAction::CreateNew,
+                (Some(_), ConflictPolicy::Skip) => DestinationAction::Skip,
+                (Some(value), ConflictPolicy::Replace) => DestinationAction::ReplaceExisting(value),
+                (Some(_), ConflictPolicy::KeepBoth) => {
+                    destination = keep_both_local(&local_directory.path, &entry.name)?;
+                    DestinationAction::CreateNew
+                }
+            };
+            let identity = client.identity(&path).await?.ok_or_else(|| {
+                AppError::new(ErrorCode::NotFound, "The remote source no longer exists.")
+            })?;
+            items.push(FilePlanItem {
+                source_display: entry.display_name,
+                destination_display: display_name(&destination.to_string_lossy()),
+                size_bytes: entry.size_bytes,
+            });
+            planned.push(PlannedDownload {
+                source: RemoteSource {
+                    path,
+                    name: entry.name,
+                    size: identity.size,
+                    identity,
+                },
+                destination: local_directory.clone(),
+                file_name: destination
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| policy_error("The local filename is unavailable."))?
+                    .to_owned(),
+                action,
+            });
+        }
+        self.insert(
+            client.info(),
+            FileOperationKind::Download,
+            OperationRisk::Moderate,
+            Some(policy),
+            items,
+            PlanPayload::Download {
+                client,
+                policy,
+                items: planned,
+            },
+        )
+    }
+
+    pub fn plan_mutation(
+        &self,
+        client: std::sync::Arc<dyn SftpClient>,
+        spec: MutationSpec,
+    ) -> Result<FileOperationPlan, AppError> {
+        let (kind, risk, item) = match &spec {
+            MutationSpec::CreateDirectory { path } => {
+                validate_remote_path(path)?;
+                (
+                    FileOperationKind::CreateDirectory,
+                    OperationRisk::Low,
+                    FilePlanItem {
+                        source_display: "New directory".into(),
+                        destination_display: display_name(path),
+                        size_bytes: None,
+                    },
+                )
+            }
+            MutationSpec::Rename {
+                source,
+                destination,
+                ..
+            } => {
+                validate_remote_path(source)?;
+                validate_remote_path(destination)?;
+                (
+                    FileOperationKind::Rename,
+                    OperationRisk::Moderate,
+                    FilePlanItem {
+                        source_display: display_name(source),
+                        destination_display: display_name(destination),
+                        size_bytes: None,
+                    },
+                )
+            }
+            MutationSpec::Delete { path, .. } => {
+                validate_remote_path(path)?;
+                (
+                    FileOperationKind::Delete,
+                    OperationRisk::Destructive,
+                    FilePlanItem {
+                        source_display: display_name(path),
+                        destination_display: "Permanent deletion".into(),
+                        size_bytes: None,
+                    },
+                )
+            }
+        };
+        self.insert(
+            client.info(),
+            kind,
+            risk,
+            None,
+            vec![item],
+            PlanPayload::Mutation { client, spec },
+        )
+    }
+
+    pub fn consume(
+        &self,
+        id: FilePlanId,
+        host: HostId,
+        host_session: HostSessionId,
+        sftp: SftpSessionId,
+    ) -> Result<InternalPlan, AppError> {
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|_| policy_error("The file plan store is unavailable."))?;
+        let expired = plans
+            .get(&id)
+            .is_some_and(|stored| Instant::now() > stored.expires);
+        if expired {
+            let editor_document = plans.get(&id).and_then(|stored| stored.editor_document);
+            plans.remove(&id);
+            if let Some(document_id) = editor_document {
+                release_editor_reservation(
+                    &mut documents,
+                    document_id,
+                    EditorDocumentUse::Pending(id),
+                );
+            }
+            return Err(policy_error("The file-operation plan expired."));
+        }
+        let stored = plans.get_mut(&id).ok_or_else(|| {
+            policy_error("The file-operation plan is missing or was already used.")
+        })?;
+        if stored.plan.as_ref().is_none_or(|plan| {
+            plan.view.host_id != host
+                || plan.view.host_session_id != host_session
+                || plan.view.sftp_session_id != sftp
+        }) {
+            return Err(policy_error(
+                "The file-operation plan does not belong to this host session.",
+            ));
+        }
+        if let Some(document_id) = stored.editor_document {
+            let authorized = documents.get(&document_id).is_some_and(|document| {
+                document.expires > Instant::now()
+                    && document.use_state == EditorDocumentUse::Pending(id)
+                    && (document.host, document.host_session, document.sftp)
+                        == (host, host_session, sftp)
+            });
+            if !authorized {
+                plans.remove(&id);
+                return Err(policy_error("The editor document was retired or expired."));
+            }
+            documents.remove(&document_id); // Execution permanently consumes this document authority.
+        }
+        let plan = stored
+            .plan
+            .take()
+            .ok_or_else(|| policy_error("The file-operation plan was already used."))?;
+        Ok(plan)
+    }
+
+    fn insert(
+        &self,
+        info: ubgops_model::SftpSessionInfo,
+        kind: FileOperationKind,
+        risk: OperationRisk,
+        conflict_policy: Option<ConflictPolicy>,
+        items: Vec<FilePlanItem>,
+        payload: PlanPayload,
+    ) -> Result<FileOperationPlan, AppError> {
+        self.insert_with_id(PlanInsert {
+            id: FilePlanId::new(),
+            info,
+            kind,
+            risk,
+            conflict_policy,
+            items,
+            payload,
+            editor_document: None,
+        })
+    }
+
+    fn insert_with_id(&self, request: PlanInsert) -> Result<FileOperationPlan, AppError> {
+        let PlanInsert {
+            id,
+            info,
+            kind,
+            risk,
+            conflict_policy,
+            items,
+            payload,
+            editor_document,
+        } = request;
+        let expires = Instant::now() + self.lifetime;
+        let view = FileOperationPlan {
+            id,
+            host_id: info.host_id,
+            host_session_id: info.host_session_id,
+            sftp_session_id: info.id,
+            kind,
+            risk,
+            conflict_policy,
+            items,
+            expires_at: (chrono::Utc::now()
+                + chrono::Duration::from_std(self.lifetime)
+                    .map_err(|_| policy_error("The file plan lifetime is invalid."))?)
+            .to_rfc3339(),
+        };
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|_| policy_error("The file plan store is unavailable."))?;
+        plans.retain(|_, value| value.expires > Instant::now() && value.plan.is_some());
+        if plans.len() >= PLAN_CAP {
+            return Err(policy_error(
+                "Too many file-operation plans are awaiting approval.",
+            ));
+        }
+        plans.insert(
+            id,
+            StoredPlan {
+                plan: Some(InternalPlan {
+                    view: view.clone(),
+                    payload,
+                }),
+                expires,
+                editor_document,
+            },
+        );
+        schedule_plan_expiry(
+            Arc::downgrade(&self.plans),
+            Arc::downgrade(&self.documents),
+            id,
+            expires,
+            editor_document,
+        );
+        Ok(view)
+    }
+}
+
+fn schedule_plan_expiry(
+    plans: Weak<Mutex<HashMap<FilePlanId, StoredPlan>>>,
+    documents: Weak<Mutex<HashMap<EditorDocumentId, EditorDocumentAuthority>>>,
+    id: FilePlanId,
+    expires: Instant,
+    editor_document: Option<EditorDocumentId>,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(expires)).await;
+        let Some(documents) = documents.upgrade() else {
+            return;
+        };
+        let Ok(mut documents) = documents.lock() else {
+            return;
+        };
+        let Some(plans) = plans.upgrade() else {
+            return;
+        };
+        if let Ok(mut plans) = plans.lock()
+            && plans
+                .get(&id)
+                .is_some_and(|stored| stored.expires == expires)
+        {
+            plans.remove(&id);
+        }
+        if let Some(document_id) = editor_document {
+            release_editor_reservation(&mut documents, document_id, EditorDocumentUse::Pending(id));
+        }
+    });
+}
+
+fn schedule_document_expiry(
+    documents: Weak<Mutex<HashMap<EditorDocumentId, EditorDocumentAuthority>>>,
+    plans: Weak<Mutex<HashMap<FilePlanId, StoredPlan>>>,
+    id: EditorDocumentId,
+    expires: Instant,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(expires)).await;
+        let Some(documents) = documents.upgrade() else {
+            return;
+        };
+        if let Ok(mut documents) = documents.lock()
+            && documents
+                .get(&id)
+                .is_some_and(|value| value.expires == expires)
+        {
+            let pending = match documents.remove(&id).map(|value| value.use_state) {
+                Some(EditorDocumentUse::Pending(plan_id)) => Some(plan_id),
+                _ => None,
+            };
+            if let Some(plan_id) = pending
+                && let Some(plans) = plans.upgrade()
+                && let Ok(mut plans) = plans.lock()
+                && plans
+                    .get(&plan_id)
+                    .is_some_and(|stored| stored.editor_document == Some(id))
+            {
+                plans.remove(&plan_id);
+            }
+        }
+    });
+}
+
+fn supports(info: &ubgops_model::SftpSessionInfo, name: &str, version: &str) -> bool {
+    info.extensions
+        .iter()
+        .any(|extension| extension.name == name && extension.version == version)
+}
+
+async fn keep_both_remote(
+    client: &dyn SftpClient,
+    directory: &str,
+    name: &str,
+) -> Result<String, AppError> {
+    let (stem, extension) = split_name(name);
+    for number in 1..=1_000 {
+        let candidate = join_remote(directory, &format!("{stem} ({number}){extension}"))?;
+        if client.identity(&candidate).await?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(policy_error("No available Keep both name was found."))
+}
+
+fn keep_both_local(directory: &std::path::Path, name: &str) -> Result<PathBuf, AppError> {
+    let (stem, extension) = split_name(name);
+    for number in 1..=1_000 {
+        let candidate = directory.join(format!("{stem} ({number}){extension}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(policy_error("No available Keep both name was found."))
+}
+
+fn split_name(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    }
+}
+
+pub fn local_identity(path: &std::path::Path) -> Result<Option<LocalIdentity>, AppError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || is_reparse(&metadata) {
+                return Err(policy_error(
+                    "The local destination is not a regular non-reparse file.",
+                ));
+            }
+            let handle = open_file_identity_handle(path)?;
+            let handle_metadata = handle.metadata().map_err(|_| {
+                local_access_error("The local destination identity could not be read.")
+            })?;
+            if !handle_metadata.file_type().is_file() || is_reparse(&handle_metadata) {
+                return Err(policy_error(
+                    "The local destination is not a regular non-reparse file.",
+                ));
+            }
+            Ok(Some(handle_identity(&handle, &handle_metadata)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(AppError::new(
+            ErrorCode::LocalAccess,
+            "The local destination metadata could not be read.",
+        )),
+    }
+}
+
+pub fn validate_local_directory(path: &std::path::Path) -> Result<(), AppError> {
+    for component in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if component.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(component).map_err(|_| {
+            AppError::new(
+                ErrorCode::LocalAccess,
+                "The selected local directory ancestry is unavailable.",
+            )
+        })?;
+        if is_reparse(&metadata) {
+            return Err(policy_error(
+                "The selected local directory ancestry contains a symlink or reparse point.",
+            ));
+        }
+    }
+    if !std::fs::symlink_metadata(path)
+        .map_err(|_| local_access_error("The selected local directory is unavailable."))?
+        .is_dir()
+    {
+        return Err(policy_error(
+            "The selected local destination is not a directory.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn open_local_source(path: PathBuf, display_name: String) -> Result<LocalItem, AppError> {
+    if let Some(parent) = path.parent() {
+        validate_local_directory(parent)?;
+    }
+    let path_metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| local_access_error("A selected local file is unavailable."))?;
+    if !path_metadata.file_type().is_file() || is_reparse(&path_metadata) {
+        return Err(local_access_error(
+            "Uploads accept only regular non-reparse files.",
+        ));
+    }
+    let handle = open_source_handle(&path)?;
+    let handle_metadata = handle
+        .metadata()
+        .map_err(|_| local_access_error("A selected local file identity is unavailable."))?;
+    if !handle_metadata.file_type().is_file() || is_reparse(&handle_metadata) {
+        return Err(local_access_error(
+            "Uploads accept only regular non-reparse files.",
+        ));
+    }
+    let identity = handle_identity(&handle, &handle_metadata)?;
+    let path_handle = open_file_identity_handle(&path)?;
+    let path_handle_metadata = path_handle
+        .metadata()
+        .map_err(|_| local_access_error("A selected local file identity is unavailable."))?;
+    if identity != handle_identity(&path_handle, &path_handle_metadata)? {
+        return Err(local_access_error(
+            "The selected local file changed while it was opened.",
+        ));
+    }
+    Ok(LocalItem {
+        path,
+        display_name,
+        size: identity.size,
+        modified: identity.modified,
+        identity,
+        handle: Arc::new(handle),
+    })
+}
+
+pub fn open_local_directory(path: PathBuf) -> Result<LocalDirectory, AppError> {
+    validate_local_directory(&path)?;
+    let handle = open_directory_handle(&path)?;
+    let handle_metadata = handle
+        .metadata()
+        .map_err(|_| local_access_error("The selected directory identity is unavailable."))?;
+    let identity = handle_identity(&handle, &handle_metadata)?;
+    let path_handle = open_directory_handle(&path)?;
+    let path_metadata = path_handle
+        .metadata()
+        .map_err(|_| local_access_error("The selected directory identity is unavailable."))?;
+    let path_identity = handle_identity(&path_handle, &path_metadata)?;
+    if identity != path_identity {
+        return Err(local_access_error(
+            "The selected directory changed while it was opened.",
+        ));
+    }
+    let display_name = display_name(&path.to_string_lossy());
+    Ok(LocalDirectory {
+        path,
+        display_name,
+        identity,
+        handle: Arc::new(handle),
+    })
+}
+
+pub fn validate_local_source(item: &LocalItem) -> Result<(), AppError> {
+    if let Some(parent) = item.path.parent() {
+        validate_local_directory(parent)?;
+    }
+    let path_metadata = std::fs::symlink_metadata(&item.path).map_err(|_| {
+        AppError::new(
+            ErrorCode::LocalAccess,
+            "The selected local source is unavailable.",
+        )
+    })?;
+    let path_handle = open_file_identity_handle(&item.path)?;
+    let path_handle_metadata = path_handle
+        .metadata()
+        .map_err(|_| local_access_error("The selected local source is unavailable."))?;
+    let handle_metadata = item
+        .handle
+        .metadata()
+        .map_err(|_| local_access_error("The selected local source handle is unavailable."))?;
+    if !path_metadata.file_type().is_file()
+        || is_reparse(&path_metadata)
+        || !path_handle_metadata.file_type().is_file()
+        || is_reparse(&path_handle_metadata)
+        || handle_identity(&path_handle, &path_handle_metadata)? != item.identity
+        || handle_identity(&item.handle, &handle_metadata)? != item.identity
+    {
+        return Err(policy_error(
+            "The selected local source changed after approval.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_local_directory_handle(directory: &LocalDirectory) -> Result<(), AppError> {
+    validate_local_directory(&directory.path)?;
+    let path_handle = open_directory_handle(&directory.path)?;
+    let path_metadata = path_handle
+        .metadata()
+        .map_err(|_| local_access_error("The selected local directory is unavailable."))?;
+    let path_identity = handle_identity(&path_handle, &path_metadata)?;
+    let selected_metadata = directory
+        .handle
+        .metadata()
+        .map_err(|_| local_access_error("The selected directory handle is unavailable."))?;
+    let selected_identity = handle_identity(&directory.handle, &selected_metadata)?;
+    if !same_local_object(&path_identity, &directory.identity)
+        || !same_local_object(&selected_identity, &directory.identity)
+    {
+        return Err(policy_error(
+            "The selected local directory changed after selection.",
+        ));
+    }
+    Ok(())
+}
+
+fn same_local_object(left: &LocalIdentity, right: &LocalIdentity) -> bool {
+    left.object_id == right.object_id
+}
+
+#[cfg(windows)]
+fn handle_identity(handle: &File, metadata: &std::fs::Metadata) -> Result<LocalIdentity, AppError> {
+    let id = fs_id::FileID::new(handle).map_err(|_| {
+        local_access_error("Strong local filesystem identity is unavailable for this object.")
+    })?;
+    Ok(LocalIdentity {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        object_id: LocalObjectId {
+            storage_id: id.storage_id(),
+            file_id: id.internal_file_id(),
+        },
+    })
+}
+
+#[cfg(unix)]
+fn handle_identity(
+    _handle: &File,
+    metadata: &std::fs::Metadata,
+) -> Result<LocalIdentity, AppError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(LocalIdentity {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        object_id: LocalObjectId {
+            storage_id: metadata.dev(),
+            file_id: u128::from(metadata.ino()),
+        },
+    })
+}
+
+#[cfg(windows)]
+fn open_directory_handle(path: &std::path::Path) -> Result<File, AppError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001 | 0x0000_0002)
+        .custom_flags(0x0200_0000 | 0x0020_0000)
+        .open(path)
+        .map_err(|_| local_access_error("The selected directory could not be opened safely."))
+}
+#[cfg(not(windows))]
+fn open_directory_handle(path: &std::path::Path) -> Result<File, AppError> {
+    File::open(path)
+        .map_err(|_| local_access_error("The selected directory could not be opened safely."))
+}
+
+#[cfg(windows)]
+fn open_source_handle(path: &std::path::Path) -> Result<File, AppError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .custom_flags(0x0020_0000)
+        .open(path)
+        .map_err(|_| local_access_error("The selected local file could not be locked for reading."))
+}
+
+#[cfg(windows)]
+fn open_file_identity_handle(path: &std::path::Path) -> Result<File, AppError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .custom_flags(0x0020_0000)
+        .open(path)
+        .map_err(|_| local_access_error("The local filesystem object could not be identified."))
+}
+#[cfg(not(windows))]
+fn open_file_identity_handle(path: &std::path::Path) -> Result<File, AppError> {
+    File::open(path)
+        .map_err(|_| local_access_error("The local filesystem object could not be identified."))
+}
+#[cfg(not(windows))]
+fn open_source_handle(path: &std::path::Path) -> Result<File, AppError> {
+    File::open(path).map_err(|_| local_access_error("The selected local file could not be opened."))
+}
+
+#[cfg(windows)]
+fn is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+#[cfg(not(windows))]
+fn is_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn policy_error(message: &'static str) -> AppError {
+    AppError::new(ErrorCode::FilePolicy, message)
+}
+
+fn local_access_error(message: &'static str) -> AppError {
+    AppError::new(ErrorCode::LocalAccess, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use ubgops_model::{
+        DirectoryListing, HostSessionId, RemoteEntry, SftpLimits, SftpSessionId, SftpSessionInfo,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio_util::sync::CancellationToken;
+
+    struct PlanClient {
+        info: SftpSessionInfo,
+        editor_bytes: Mutex<Vec<u8>>,
+        editor_read_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    }
+
+    impl PlanClient {
+        fn new() -> Arc<Self> {
+            Self::with_extensions(Vec::new())
+        }
+        fn with_extensions(extensions: Vec<ubgops_model::SftpExtension>) -> Arc<Self> {
+            Arc::new(Self {
+                info: SftpSessionInfo {
+                    id: SftpSessionId::new(),
+                    host_id: HostId::new(),
+                    host_session_id: HostSessionId::new(),
+                    protocol_version: 3,
+                    extensions,
+                    limits: SftpLimits {
+                        max_packet_bytes: None,
+                        max_read_bytes: None,
+                        max_write_bytes: None,
+                        max_open_handles: None,
+                        client_chunk_bytes: "65536".into(),
+                        listing_entry_cap: 5_000,
+                    },
+                    root_path: "/home/test".into(),
+                },
+                editor_bytes: Mutex::new(b"data".to_vec()),
+                editor_read_gate: Mutex::new(None),
+            })
+        }
+    }
+
+    fn unused() -> AppError {
+        AppError::new(ErrorCode::SftpProtocol, "Unused mock operation.")
+    }
+
+    #[async_trait]
+    impl SftpClient for PlanClient {
+        fn info(&self) -> SftpSessionInfo {
+            self.info.clone()
+        }
+        async fn list(&self, _: &str, _: CancellationToken) -> Result<DirectoryListing, AppError> {
+            Err(unused())
+        }
+        async fn stat(&self, _: &str) -> Result<RemoteEntry, AppError> {
+            Ok(RemoteEntry {
+                name: "remote-source.bin".into(),
+                display_name: "remote-source.bin".into(),
+                path: "/home/test/remote-source.bin".into(),
+                kind: RemoteEntryKind::File,
+                size_bytes: Some("4".into()),
+                modified_at: None,
+                permissions: None,
+                uid: None,
+                gid: None,
+            })
+        }
+        async fn identity(&self, path: &str) -> Result<Option<EntryIdentity>, AppError> {
+            if path.ends_with("remote-source.bin") {
+                Ok(Some(EntryIdentity {
+                    kind: RemoteEntryKind::File,
+                    size: Some(4),
+                    modified: Some(1),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn editor_revision(&self, _: &str) -> Result<EditorRevision, AppError> {
+            Ok(EditorRevision {
+                identity: EntryIdentity {
+                    kind: RemoteEntryKind::File,
+                    size: Some(4),
+                    modified: Some(1),
+                },
+                raw_mode: 0o100640,
+                uid: 1000,
+                gid: 1000,
+            })
+        }
+        async fn read_editor_bytes(&self, _: &str) -> Result<Vec<u8>, AppError> {
+            let gate = self.editor_read_gate.lock().unwrap().clone();
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+            Ok(self.editor_bytes.lock().unwrap().clone())
+        }
+        async fn create_dir(&self, _: &str) -> Result<(), AppError> {
+            Err(unused())
+        }
+        async fn remove_file(&self, _: &str) -> Result<(), AppError> {
+            Err(unused())
+        }
+        async fn remove_dir(&self, _: &str) -> Result<(), AppError> {
+            Err(unused())
+        }
+        async fn rename_noclobber(&self, _: &str, _: &str) -> Result<(), AppError> {
+            Err(unused())
+        }
+        async fn upload_staged(
+            &self,
+            _: &mut (dyn AsyncRead + Unpin + Send),
+            _: &str,
+            _: crate::StagingOwnership,
+            _: CancellationToken,
+            _: crate::Progress,
+        ) -> crate::StagedUploadResult {
+            Err(crate::StagedUploadFailure::NotCreated(unused()))
+        }
+        async fn download(
+            &self,
+            _: &str,
+            _: &mut (dyn AsyncWrite + Unpin + Send),
+            _: CancellationToken,
+            _: crate::Progress,
+        ) -> Result<u64, AppError> {
+            Err(unused())
+        }
+        async fn commit_new(&self, _: &str, _: &str) -> Result<(), AppError> {
+            Err(unused())
+        }
+        async fn commit_replace(&self, _: &str, _: &str) -> Result<(), AppError> {
+            Err(unused())
+        }
+        async fn remove_owned_staging(&self, _: &str) -> Result<crate::StagingCleanup, AppError> {
+            Ok(crate::StagingCleanup::Removed)
+        }
+        async fn close(&self) {}
+    }
+
+    #[test]
+    fn keep_both_names_are_bounded_and_preserve_extension() {
+        assert_eq!(split_name("archive.tar.gz"), ("archive.tar", ".gz"));
+        assert_eq!(split_name("README"), ("README", ""));
+    }
+
+    #[test]
+    fn plans_are_owned_one_shot_and_expire() {
+        let client = PlanClient::new();
+        let store = FilePlanStore::default();
+        let first = store
+            .plan_mutation(
+                client.clone(),
+                MutationSpec::CreateDirectory {
+                    path: "/home/test/new".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .consume(
+                    first.id,
+                    HostId::new(),
+                    first.host_session_id,
+                    first.sftp_session_id
+                )
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::FilePolicy
+        );
+        // A wrong owner cannot consume another session's authority.
+        store
+            .consume(
+                first.id,
+                first.host_id,
+                first.host_session_id,
+                first.sftp_session_id,
+            )
+            .unwrap();
+
+        let replay = store
+            .plan_mutation(
+                client.clone(),
+                MutationSpec::CreateDirectory {
+                    path: "/home/test/once".into(),
+                },
+            )
+            .unwrap();
+        store
+            .consume(
+                replay.id,
+                replay.host_id,
+                replay.host_session_id,
+                replay.sftp_session_id,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .consume(
+                    replay.id,
+                    replay.host_id,
+                    replay.host_session_id,
+                    replay.sftp_session_id
+                )
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::FilePolicy
+        );
+
+        let expired = store
+            .plan_mutation(
+                client,
+                MutationSpec::CreateDirectory {
+                    path: "/home/test/expired".into(),
+                },
+            )
+            .unwrap();
+        store
+            .plans
+            .lock()
+            .unwrap()
+            .get_mut(&expired.id)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            store
+                .consume(
+                    expired.id,
+                    expired.host_id,
+                    expired.host_session_id,
+                    expired.sftp_session_id
+                )
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::FilePolicy
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_plan_binds_session_revision_bytes_and_single_use() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = FilePlanStore::default();
+        let revision = client.editor_revision("/home/test/a.txt").await.unwrap();
+        let document = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                revision.clone(),
+                b"data",
+                TextNewline::CrLf,
+                true,
+            )
+            .unwrap();
+        let unrelated = PlanClient::with_extensions(client.info.extensions.clone());
+        assert!(
+            store
+                .plan_editor_save(unrelated, document, "wrong session".into())
+                .await
+                .is_err()
+        );
+        let plan = store
+            .plan_editor_save(client.clone(), document, "new\ntext".into())
+            .await
+            .unwrap();
+        assert_eq!(plan.kind, FileOperationKind::EditText);
+        assert!(
+            store
+                .consume(
+                    plan.id,
+                    HostId::new(),
+                    plan.host_session_id,
+                    plan.sftp_session_id
+                )
+                .is_err()
+        );
+        let consumed = store
+            .consume(
+                plan.id,
+                plan.host_id,
+                plan.host_session_id,
+                plan.sftp_session_id,
+            )
+            .unwrap();
+        match consumed.payload {
+            PlanPayload::EditorSave {
+                path,
+                expected,
+                bytes,
+                ..
+            } => {
+                assert_eq!(path, "/home/test/a.txt");
+                assert_eq!(expected, revision);
+                assert_eq!(bytes, b"\xef\xbb\xbfnew\r\ntext");
+            }
+            _ => panic!("wrong plan payload"),
+        }
+        assert!(
+            store
+                .consume(
+                    plan.id,
+                    plan.host_id,
+                    plan.host_session_id,
+                    plan.sftp_session_id
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .plan_editor_save(client.clone(), document, "again".into())
+                .await
+                .is_err()
+        );
+        let another = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                revision,
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let pending = store
+            .plan_editor_save(client.clone(), another, "cancel".into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .discard(
+                    pending.id,
+                    plan.host_id,
+                    plan.host_session_id,
+                    plan.sftp_session_id,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .discard(
+                    pending.id,
+                    plan.host_id,
+                    plan.host_session_id,
+                    plan.sftp_session_id,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .consume(
+                    pending.id,
+                    plan.host_id,
+                    plan.host_session_id,
+                    plan.sftp_session_id
+                )
+                .is_err()
+        );
+        let replacement = store
+            .plan_editor_save(client.clone(), another, "new after cancel".into())
+            .await
+            .unwrap();
+        assert_ne!(replacement.id, pending.id);
+        let replacement_payload = store
+            .consume(
+                replacement.id,
+                replacement.host_id,
+                replacement.host_session_id,
+                replacement.sftp_session_id,
+            )
+            .unwrap();
+        assert!(
+            matches!(replacement_payload.payload, PlanPayload::EditorSave { bytes, .. } if bytes == b"new after cancel")
+        );
+        assert!(
+            !store
+                .discard(
+                    replacement.id,
+                    replacement.host_id,
+                    replacement.host_session_id,
+                    replacement.sftp_session_id
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .plan_editor_save(client.clone(), another, "third".into())
+                .await
+                .is_err()
+        );
+        let revoked = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        store.revoke_session(plan.host_id, plan.host_session_id);
+        assert!(
+            store
+                .plan_editor_save(client, revoked, "stale".into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_editor_plans_consume_document_authority_once() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = Arc::new(FilePlanStore::default());
+        let token = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let (left, right) = tokio::join!(
+            store.plan_editor_save(client.clone(), token, "left".into()),
+            store.plan_editor_save(client.clone(), token, "right".into()),
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_editor_plan_rechecks_original_digest_even_with_unchanged_metadata() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = FilePlanStore::default();
+        let document = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let first = store
+            .plan_editor_save(client.clone(), document, "local text".into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .discard(
+                    first.id,
+                    first.host_id,
+                    first.host_session_id,
+                    first.sftp_session_id
+                )
+                .unwrap()
+        );
+        *client.editor_bytes.lock().unwrap() = b"evil".to_vec(); // Same length; mock revision/mtime remain unchanged.
+        let error = store
+            .plan_editor_save(client.clone(), document, "local text".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(store.plans.lock().unwrap().is_empty());
+        assert_eq!(client.editor_bytes.lock().unwrap().as_slice(), b"evil");
+    }
+
+    #[tokio::test]
+    async fn delayed_editor_planning_cannot_publish_after_close_or_revoke() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = Arc::new(FilePlanStore::default());
+        let info = client.info();
+        for revoke in [false, true] {
+            let document = store
+                .register_editor_document(
+                    client.as_ref(),
+                    "/home/test/a.txt".into(),
+                    client.editor_revision("/home/test/a.txt").await.unwrap(),
+                    b"data",
+                    TextNewline::Lf,
+                    false,
+                )
+                .unwrap();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *client.editor_read_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+            let task_store = store.clone();
+            let task_client = client.clone();
+            let task = tokio::spawn(async move {
+                task_store
+                    .plan_editor_save(task_client, document, "new".into())
+                    .await
+            });
+            started.notified().await;
+            if revoke {
+                store.revoke_session(info.host_id, info.host_session_id);
+            } else {
+                store
+                    .discard_editor_document(document, info.host_id, info.host_session_id, info.id)
+                    .unwrap();
+            }
+            release.notify_one();
+            assert!(task.await.unwrap().is_err());
+            *client.editor_read_gate.lock().unwrap() = None;
+            assert!(store.plans.lock().unwrap().is_empty());
+            assert!(!store.documents.lock().unwrap().contains_key(&document));
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_editor_planning_releases_only_its_own_reservation() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = Arc::new(FilePlanStore::default());
+        let document = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *client.editor_read_gate.lock().unwrap() = Some((started.clone(), release));
+        let task_store = store.clone();
+        let task_client = client.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .plan_editor_save(task_client, document, "aborted".into())
+                .await
+        });
+        started.notified().await;
+        task.abort();
+        assert!(task.await.is_err());
+        *client.editor_read_gate.lock().unwrap() = None;
+        assert_eq!(
+            store
+                .documents
+                .lock()
+                .unwrap()
+                .get(&document)
+                .unwrap()
+                .use_state,
+            EditorDocumentUse::Ready
+        );
+        let next = store
+            .plan_editor_save(client.clone(), document, "new".into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .discard(
+                    next.id,
+                    next.host_id,
+                    next.host_session_id,
+                    next.sftp_session_id
+                )
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_cancel_and_execute_race_has_only_one_winner() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = Arc::new(FilePlanStore::default());
+        let document = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let plan = store
+            .plan_editor_save(client.clone(), document, "new".into())
+            .await
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let cancel_store = store.clone();
+        let cancel_barrier = barrier.clone();
+        let cancel = tokio::task::spawn_blocking(move || {
+            cancel_barrier.wait();
+            cancel_store
+                .discard(
+                    plan.id,
+                    plan.host_id,
+                    plan.host_session_id,
+                    plan.sftp_session_id,
+                )
+                .unwrap()
+        });
+        let execute_store = store.clone();
+        let execute = tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            execute_store.consume(
+                plan.id,
+                plan.host_id,
+                plan.host_session_id,
+                plan.sftp_session_id,
+            )
+        });
+        let cancelled = cancel.await.unwrap();
+        let consumed = execute.await.unwrap();
+        assert_ne!(cancelled, consumed.is_ok());
+        if cancelled {
+            assert_eq!(
+                store
+                    .documents
+                    .lock()
+                    .unwrap()
+                    .get(&document)
+                    .unwrap()
+                    .use_state,
+                EditorDocumentUse::Ready
+            );
+        } else {
+            assert!(!store.documents.lock().unwrap().contains_key(&document));
+            assert!(
+                store
+                    .plan_editor_save(client, document, "retry".into())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_editor_plan_expiry_releases_reservation_without_extending_document() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = FilePlanStore {
+            plans: Arc::default(),
+            documents: Arc::default(),
+            lifetime: Duration::from_millis(10),
+        };
+        let document = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let original_expiry = store
+            .documents
+            .lock()
+            .unwrap()
+            .get(&document)
+            .unwrap()
+            .expires;
+        let first = store
+            .plan_editor_save(client.clone(), document, "first".into())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!store.plans.lock().unwrap().contains_key(&first.id));
+        assert!(
+            !store
+                .discard(
+                    first.id,
+                    first.host_id,
+                    first.host_session_id,
+                    first.sftp_session_id
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .documents
+                .lock()
+                .unwrap()
+                .get(&document)
+                .unwrap()
+                .use_state,
+            EditorDocumentUse::Ready
+        );
+        assert_eq!(
+            store
+                .documents
+                .lock()
+                .unwrap()
+                .get(&document)
+                .unwrap()
+                .expires,
+            original_expiry
+        );
+        let second = store
+            .plan_editor_save(client, document, "second".into())
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn repeated_editor_cancel_releases_payloads_without_extending_document_expiry() {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = FilePlanStore::default();
+        let info = client.info();
+        let document = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/a.txt".into(),
+                client.editor_revision("/home/test/a.txt").await.unwrap(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        let original_expiry = store
+            .documents
+            .lock()
+            .unwrap()
+            .get(&document)
+            .unwrap()
+            .expires;
+        for index in 0..(PLAN_CAP + 20) {
+            let plan = store
+                .plan_editor_save(client.clone(), document, format!("local-{index}"))
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .discard(plan.id, info.host_id, info.host_session_id, info.id)
+                    .unwrap()
+            );
+            assert!(store.plans.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            store
+                .documents
+                .lock()
+                .unwrap()
+                .get(&document)
+                .unwrap()
+                .expires,
+            original_expiry
+        );
+        let plan = store
+            .plan_editor_save(client.clone(), document, "final".into())
+            .await
+            .unwrap();
+        store
+            .documents
+            .lock()
+            .unwrap()
+            .get_mut(&document)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        assert!(
+            !store
+                .discard(plan.id, info.host_id, info.host_session_id, info.id)
+                .unwrap()
+        );
+        assert!(!store.documents.lock().unwrap().contains_key(&document));
+        assert!(
+            store
+                .plan_editor_save(client, document, "retry".into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ed03_explicit_document_close_is_scoped_idempotent_and_releases_capacity() {
+        let client = PlanClient::new();
+        let other = PlanClient::new();
+        let info = client.info();
+        let revision = client.editor_revision("/home/test/a.txt").await.unwrap();
+        let store = FilePlanStore::default();
+        let retained = store
+            .register_editor_document(
+                other.as_ref(),
+                "/home/test/retained".into(),
+                revision.clone(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        for index in 0..=PLAN_CAP {
+            let id = store
+                .register_editor_document(
+                    client.as_ref(),
+                    format!("/home/test/{index}.txt"),
+                    revision.clone(),
+                    b"data",
+                    TextNewline::Lf,
+                    false,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .discard_editor_document(
+                        id,
+                        other.info.host_id,
+                        other.info.host_session_id,
+                        other.info.id
+                    )
+                    .is_err()
+            );
+            assert!(store.documents.lock().unwrap().contains_key(&id));
+            store
+                .discard_editor_document(id, info.host_id, info.host_session_id, info.id)
+                .unwrap();
+            store
+                .discard_editor_document(id, info.host_id, info.host_session_id, info.id)
+                .unwrap();
+        }
+        assert!(store.documents.lock().unwrap().contains_key(&retained));
+        store
+            .documents
+            .lock()
+            .unwrap()
+            .get_mut(&retained)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_millis(1);
+        assert!(
+            store
+                .plan_editor_save(other.clone(), retained, "new".into())
+                .await
+                .is_err()
+        );
+        store
+            .discard_editor_document(
+                retained,
+                other.info.host_id,
+                other.info.host_session_id,
+                other.info.id,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_plan_rejects_servers_without_safe_no_clobber_extension() {
+        let client = PlanClient::new();
+        let store = FilePlanStore::default();
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("data.bin");
+        std::fs::write(&source_path, [1_u8]).unwrap();
+        let error = store
+            .plan_upload(
+                client,
+                vec![
+                    open_local_source(source_path.canonicalize().unwrap(), "data.bin".into())
+                        .unwrap(),
+                ],
+                "/home/test",
+                ConflictPolicy::Skip,
+            )
+            .await
+            .expect_err("unsafe server must be rejected before approval");
+        assert_eq!(error.code, ErrorCode::FilePolicy);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selected_directory_handle_blocks_parent_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let selected = open_local_directory(destination.canonicalize().unwrap()).unwrap();
+        assert!(std::fs::rename(&destination, parent.path().join("moved")).is_err());
+        validate_local_directory_handle(&selected).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_preference_plans_absent_targets_as_create_new() {
+        let client = PlanClient::with_extensions(vec![
+            ubgops_model::SftpExtension {
+                name: "hardlink@openssh.com".into(),
+                version: "1".into(),
+            },
+            ubgops_model::SftpExtension {
+                name: "posix-rename@openssh.com".into(),
+                version: "1".into(),
+            },
+        ]);
+        let store = FilePlanStore::default();
+        let local = tempfile::tempdir().unwrap();
+        let upload_path = local.path().join("upload.bin");
+        std::fs::write(&upload_path, b"data").unwrap();
+        let upload = store
+            .plan_upload(
+                client.clone(),
+                vec![
+                    open_local_source(upload_path.canonicalize().unwrap(), "upload.bin".into())
+                        .unwrap(),
+                ],
+                "/home/test",
+                ConflictPolicy::Replace,
+            )
+            .await
+            .unwrap();
+        let upload = store
+            .consume(
+                upload.id,
+                upload.host_id,
+                upload.host_session_id,
+                upload.sftp_session_id,
+            )
+            .unwrap();
+        assert!(matches!(
+            upload.payload,
+            PlanPayload::Upload { ref items, .. }
+                if items.len() == 1 && items[0].action == DestinationAction::CreateNew
+        ));
+
+        let destination = open_local_directory(local.path().canonicalize().unwrap()).unwrap();
+        let download = store
+            .plan_download(
+                client,
+                vec!["/home/test/remote-source.bin".into()],
+                destination,
+                ConflictPolicy::Replace,
+            )
+            .await
+            .unwrap();
+        let download = store
+            .consume(
+                download.id,
+                download.host_id,
+                download.host_session_id,
+                download.sftp_session_id,
+            )
+            .unwrap();
+        assert!(matches!(
+            download.payload,
+            PlanPayload::Download { ref items, .. }
+                if items.len() == 1 && items[0].action == DestinationAction::CreateNew
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_approval_displays_full_final_destination() {
+        let client = PlanClient::new();
+        let store = FilePlanStore::default();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        let first_plan = store
+            .plan_download(
+                client.clone(),
+                vec!["/home/test/remote-source.bin".into()],
+                open_local_directory(first.path().canonicalize().unwrap()).unwrap(),
+                ConflictPolicy::Skip,
+            )
+            .await
+            .unwrap();
+        let second_plan = store
+            .plan_download(
+                client.clone(),
+                vec!["/home/test/remote-source.bin".into()],
+                open_local_directory(second.path().canonicalize().unwrap()).unwrap(),
+                ConflictPolicy::Skip,
+            )
+            .await
+            .unwrap();
+        let first_display = &first_plan.items[0].destination_display;
+        let second_display = &second_plan.items[0].destination_display;
+        assert_ne!(first_display, second_display);
+        assert!(first_display.ends_with("remote-source.bin"));
+        assert!(second_display.ends_with("remote-source.bin"));
+
+        std::fs::write(first.path().join("remote-source.bin"), b"existing").unwrap();
+        let keep_both = store
+            .plan_download(
+                client,
+                vec!["/home/test/remote-source.bin".into()],
+                open_local_directory(first.path().canonicalize().unwrap()).unwrap(),
+                ConflictPolicy::KeepBoth,
+            )
+            .await
+            .unwrap();
+        assert!(
+            keep_both.items[0]
+                .destination_display
+                .ends_with("remote-source (1).bin")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_object_identity_uses_volume_and_full_file_id() {
+        use std::os::windows::fs::{FileTimesExt, MetadataExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.bin");
+        let second_path = directory.path().join("second.bin");
+        std::fs::write(&first_path, b"same-size").unwrap();
+        std::fs::write(&second_path, b"same-size").unwrap();
+        let timestamp = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let times = std::fs::FileTimes::new()
+            .set_created(timestamp)
+            .set_modified(timestamp);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&first_path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&second_path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let first_metadata = std::fs::metadata(&first_path).unwrap();
+        let second_metadata = std::fs::metadata(&second_path).unwrap();
+        assert_eq!(
+            first_metadata.creation_time(),
+            second_metadata.creation_time()
+        );
+        assert_eq!(first_metadata.file_size(), second_metadata.file_size());
+
+        let first = local_identity(&first_path).unwrap().unwrap();
+        let second = local_identity(&second_path).unwrap().unwrap();
+        assert_eq!(first.size, second.size);
+        assert_ne!(first.object_id, second.object_id);
+
+        let first_again = local_identity(&first_path).unwrap().unwrap();
+        assert_eq!(first.object_id, first_again.object_id);
+
+        std::fs::write(&first_path, b"changed-size-and-content").unwrap();
+        let changed = local_identity(&first_path).unwrap().unwrap();
+        assert_eq!(first.object_id, changed.object_id);
+        assert_ne!(first, changed);
+
+        let first_directory =
+            open_local_directory(directory.path().canonicalize().unwrap()).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let second_directory = open_local_directory(other.path().canonicalize().unwrap()).unwrap();
+        assert_ne!(
+            first_directory.identity.object_id,
+            second_directory.identity.object_id
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn pending_plan_discard_and_idle_expiry_release_directory_handles() {
+        let client = PlanClient::new();
+        let parent = tempfile::tempdir().unwrap();
+
+        let discarded_path = parent.path().join("discarded");
+        std::fs::create_dir(&discarded_path).unwrap();
+        let discarded_store = FilePlanStore::default();
+        let discarded = discarded_store
+            .plan_download(
+                client.clone(),
+                vec!["/home/test/remote-source.bin".into()],
+                open_local_directory(discarded_path.canonicalize().unwrap()).unwrap(),
+                ConflictPolicy::Skip,
+            )
+            .await
+            .unwrap();
+        assert!(std::fs::rename(&discarded_path, parent.path().join("still-locked")).is_err());
+        discarded_store
+            .discard(
+                discarded.id,
+                discarded.host_id,
+                discarded.host_session_id,
+                discarded.sftp_session_id,
+            )
+            .unwrap();
+        std::fs::rename(&discarded_path, parent.path().join("discard-released")).unwrap();
+
+        let consumed_path = parent.path().join("consumed");
+        std::fs::create_dir(&consumed_path).unwrap();
+        let consumed_store = FilePlanStore::default();
+        let consumed_view = consumed_store
+            .plan_download(
+                client.clone(),
+                vec!["/home/test/remote-source.bin".into()],
+                open_local_directory(consumed_path.canonicalize().unwrap()).unwrap(),
+                ConflictPolicy::Skip,
+            )
+            .await
+            .unwrap();
+        let consumed = consumed_store
+            .consume(
+                consumed_view.id,
+                consumed_view.host_id,
+                consumed_view.host_session_id,
+                consumed_view.sftp_session_id,
+            )
+            .unwrap();
+        consumed_store
+            .discard(
+                consumed_view.id,
+                consumed_view.host_id,
+                consumed_view.host_session_id,
+                consumed_view.sftp_session_id,
+            )
+            .unwrap();
+        assert!(std::fs::rename(&consumed_path, parent.path().join("active-plan")).is_err());
+        drop(consumed);
+        std::fs::rename(&consumed_path, parent.path().join("consume-released")).unwrap();
+
+        let expiring_path = parent.path().join("expiring");
+        std::fs::create_dir(&expiring_path).unwrap();
+        let expiring_store = FilePlanStore {
+            plans: Arc::default(),
+            documents: Arc::default(),
+            lifetime: Duration::from_secs(10),
+        };
+        expiring_store
+            .plan_download(
+                client,
+                vec!["/home/test/remote-source.bin".into()],
+                open_local_directory(expiring_path.canonicalize().unwrap()).unwrap(),
+                ConflictPolicy::Skip,
+            )
+            .await
+            .unwrap();
+        assert!(std::fs::rename(&expiring_path, parent.path().join("not-yet")).is_err());
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(expiring_store.plans.lock().unwrap().is_empty());
+        std::fs::rename(&expiring_path, parent.path().join("expiry-released")).unwrap();
+    }
+}
