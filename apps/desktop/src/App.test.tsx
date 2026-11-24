@@ -642,4 +642,62 @@ describe('workspace flows', () => {
     expect(screen.queryByText('Debian GNU/Linux')).not.toBeInTheDocument();
     expect(screen.getByText('Ready when you are')).toBeInTheDocument();
   });
+
+  it('opens Command Palette with Ctrl+K, ignores Ctrl+Shift+K, and toggles Terminal focus without remounting active PTY/SFTP', async () => {
+    const other: Host = {
+      ...host,
+      id: 'test-host-2',
+      displayName: 'Test worker',
+      connection: { ...host.connection, hostname: 'worker.example.test' },
+    };
+    vi.mocked(hostApi.list).mockResolvedValue([host, other]);
+    vi.mocked(hostApi.session).mockResolvedValue(connected);
+    vi.mocked(terminalApi.open).mockImplementation(async (id, size) => ({
+      id: `${id}-pty`,
+      hostId: id,
+      hostSessionId: connected.hostSessionId!,
+      label: 'Shell',
+      size,
+      state: 'open',
+      error: null,
+    }));
+
+    const { container } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+          })
+        }
+      >
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    await userEvent.click(screen.getByRole('button', { name: 'Terminal' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Open terminal' }));
+    const ptyInput = await screen.findByRole('textbox', { name: 'Synthetic Shell' });
+    await userEvent.type(ptyInput, ' persisted');
+
+    fireEvent.keyDown(window, { key: 'K', ctrlKey: true, shiftKey: true });
+    expect(screen.queryByRole('dialog', { name: 'Command palette' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(container.querySelector('.app-shell')).toHaveClass('app-shell--terminal-focus');
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback persisted',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const palette = screen.getByRole('dialog', { name: 'Command palette' });
+    expect(palette).toBeInTheDocument();
+    await userEvent.click(within(palette).getByRole('option', { name: /Exit terminal focus mode/i }));
+    expect(container.querySelector('.app-shell')).not.toHaveClass('app-shell--terminal-focus');
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback persisted',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+  });
 });

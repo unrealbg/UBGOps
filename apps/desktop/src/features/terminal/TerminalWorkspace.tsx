@@ -20,12 +20,16 @@ export function TerminalWorkspace({
   onShowOverview,
   combined = false,
   onToggleFiles,
+  focused = false,
+  onToggleFocus,
 }: {
   host: Host;
   visible: boolean;
   onShowOverview: () => void;
   combined?: boolean;
   onToggleFiles?: () => void;
+  focused?: boolean;
+  onToggleFocus?: () => void;
 }) {
   const hostSession = useHostSession(host.id);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
@@ -147,22 +151,38 @@ export function TerminalWorkspace({
   }
 
   return (
-    <section className="terminal-workspace" aria-label={`${host.displayName} terminal workspace`}>
+    <section
+      className={`terminal-workspace ${focused ? 'terminal-workspace--focused' : ''}`}
+      aria-label={`${host.displayName} terminal workspace`}
+    >
       <header className="terminal-heading">
-        <div>
+        <div className="terminal-heading-identity">
           <div className="eyebrow">REMOTE TERMINAL</div>
           <div className="terminal-title-line">
             <h1>{host.displayName}</h1>
             <ConnectionBadge state={hostSession.data?.state ?? 'disconnected'} />
+            <span className="terminal-endpoint mono">
+              {host.connection.username}@{host.connection.hostname}:{host.connection.port}
+            </span>
           </div>
-          <p className="mono">
-            {host.connection.username}@{host.connection.hostname}:{host.connection.port}
-          </p>
         </div>
         <div className="heading-actions">
-          {onToggleFiles && <Button aria-pressed={combined} onClick={onToggleFiles}>
-            {combined ? 'Hide files panel' : 'Combine Terminal + Files'}
-          </Button>}
+          {onToggleFiles && (
+            <Button aria-pressed={combined} onClick={onToggleFiles}>
+              {combined ? 'Hide files panel' : 'Combine Terminal + Files'}
+            </Button>
+          )}
+          {onToggleFocus && (
+            <Button
+              variant="ghost"
+              aria-pressed={focused}
+              title={focused ? 'Exit terminal focus mode' : 'Focus terminal workspace'}
+              onClick={onToggleFocus}
+            >
+              <Icon name={focused ? 'minimize' : 'maximize'} size={14} />
+              {focused ? 'Exit focus' : 'Focus'}
+            </Button>
+          )}
           <Button variant="ghost" onClick={onShowOverview}>
             Overview
           </Button>

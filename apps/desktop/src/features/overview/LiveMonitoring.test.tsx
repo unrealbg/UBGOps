@@ -170,4 +170,37 @@ describe('live monitoring lifecycle', () => {
     });
     expect(mocks.sample).toHaveBeenCalledTimes(1);
   });
+
+  it('renders resource progress bars only for supported metrics without fabricating Disk I/O', async () => {
+    mocks.sample.mockResolvedValue(
+      sample({
+        cpuUsagePercent: 42.5,
+        swapTotalBytes: 2 * 1024 ** 3,
+        swapUsedBytes: 512 * 1024 ** 2,
+        networkRxBytesPerSecond: 1024,
+        networkTxBytesPerSecond: 2048,
+      }),
+    );
+    render(<LiveMonitoring hostId="host-a" hostSessionId={SESSION_A} connected visible />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole('progressbar', { name: 'CPU utilization' })).toHaveAttribute(
+      'aria-valuenow',
+      '43',
+    );
+    expect(screen.getByRole('progressbar', { name: 'Memory utilization' })).toHaveAttribute(
+      'aria-valuenow',
+      '25',
+    );
+    expect(screen.getByRole('progressbar', { name: 'Swap utilization' })).toHaveAttribute(
+      'aria-valuenow',
+      '25',
+    );
+    expect(screen.getByRole('progressbar', { name: 'Root disk utilization' })).toHaveAttribute(
+      'aria-valuenow',
+      '25',
+    );
+    expect(screen.queryByText(/disk i\/o/i)).not.toBeInTheDocument();
+  });
 });
