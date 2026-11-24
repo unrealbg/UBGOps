@@ -6,7 +6,9 @@ import { Button, Modal, Notice, Spinner } from '@ubgops/ui';
 import { hostApi, applicationError } from './api/client';
 import { hostKeys, useHosts, useHostSession } from './api/queries';
 import { useSelection } from './state/selection';
-import { HostSidebar } from './components/HostSidebar';
+import { CommandPalette } from './components/CommandPalette';
+import { HostSidebar, type WorkspaceSection } from './components/HostSidebar';
+import { Icon } from './components/Icon';
 import { UpdateCheck } from './components/UpdateCheck';
 import { HostForm } from './features/hosts/HostForm';
 import { HostList } from './features/hosts/HostList';
@@ -20,17 +22,50 @@ import { NetworkWorkspace } from './features/network/NetworkWorkspace';
 import { CompactMonitorStrip } from './features/overview/CompactMonitorStrip';
 
 type DialogState =
-  { type: 'add' } | { type: 'edit'; host: Host } | { type: 'delete'; host: Host } | null;
+  | { type: 'add' }
+  | { type: 'edit'; host: Host }
+  | { type: 'delete'; host: Host }
+  | null;
 
 const FILES_MIN_WIDTH = 280;
 const TERMINAL_MIN_WIDTH = 400;
 const SPLIT_HANDLE_WIDTH = 8;
 
+const SECTION_LABELS: Record<WorkspaceSection, string> = {
+  overview: 'Overview',
+  terminal: 'Terminal',
+  files: 'Files',
+  services: 'Services',
+  network: 'Network',
+  security: 'Security',
+  logs: 'Logs',
+  containers: 'Containers',
+};
+
 // A host's two workspaces always occupy these same parent slots. Modes change
 // visibility and presentation, never the owner or parent of a mounted pane.
-function SshWorkspace({ host, mode, terminalVisited, filesVisited, onShowOverview, onShowFiles }: {
-  host: Host; mode: 'terminal' | 'files' | null; terminalVisited: boolean; filesVisited: boolean;
-  onShowOverview: () => void; onShowFiles: () => void;
+function SshWorkspace({
+  host,
+  mode,
+  terminalVisited,
+  filesVisited,
+  focused,
+  embedded = false,
+  showCompactMonitor = false,
+  onToggleFocus,
+  onShowOverview,
+  onShowFiles,
+}: {
+  host: Host;
+  mode: 'terminal' | 'files' | null;
+  terminalVisited: boolean;
+  filesVisited: boolean;
+  focused: boolean;
+  embedded?: boolean;
+  showCompactMonitor?: boolean;
+  onToggleFocus: () => void;
+  onShowOverview: () => void;
+  onShowFiles: () => void;
 }) {
   const connection = useHostSession(host.id);
   const [combined, setCombined] = useState(false);
@@ -38,18 +73,28 @@ function SshWorkspace({ host, mode, terminalVisited, filesVisited, onShowOvervie
   const [fraction, setFraction] = useState(0.33);
   const [width, setWidth] = useState(0);
   const root = useRef<HTMLDivElement>(null);
-  const drag = useRef<{ pointer: number; element: HTMLElement; startX: number; startLeft: number } | null>(null);
+  const drag = useRef<{
+    pointer: number;
+    element: HTMLElement;
+    startX: number;
+    startLeft: number;
+  } | null>(null);
   const panelId = useId();
   const narrow = width < FILES_MIN_WIDTH + TERMINAL_MIN_WIDTH + SPLIT_HANDLE_WIDTH;
   const split = mode === 'terminal' && combined && !narrow;
   const filesVisible = mode === 'files' || split;
   const maximum = Math.max(FILES_MIN_WIDTH, width - TERMINAL_MIN_WIDTH - SPLIT_HANDLE_WIDTH);
-  const left = Math.min(maximum, Math.max(FILES_MIN_WIDTH, (width - SPLIT_HANDLE_WIDTH) * fraction));
+  const left = Math.min(
+    maximum,
+    Math.max(FILES_MIN_WIDTH, (width - SPLIT_HANDLE_WIDTH) * fraction),
+  );
 
   const stopDrag = useCallback(() => {
     const current = drag.current;
     drag.current = null;
-    if (current?.element.hasPointerCapture(current.pointer)) current.element.releasePointerCapture(current.pointer);
+    if (current?.element.hasPointerCapture(current.pointer)) {
+      current.element.releasePointerCapture(current.pointer);
+    }
   }, []);
 
   useLayoutEffect(() => {
@@ -68,44 +113,109 @@ function SshWorkspace({ host, mode, terminalVisited, filesVisited, onShowOvervie
     setFraction(Math.min(maximum, Math.max(FILES_MIN_WIDTH, next)) / (width - SPLIT_HANDLE_WIDTH));
   }
 
-  return <div className="ssh-host-root" hidden={mode === null}>
-    <div ref={root} className={`ssh-layout ${split ? 'ssh-layout--split' : ''}`}
-      style={split ? { gridTemplateColumns: `${left}px ${SPLIT_HANDLE_WIDTH}px minmax(0, 1fr)` } : undefined}>
-      <div id={`${panelId}-files`} className="ssh-files-slot" hidden={!filesVisible}>
-        {(filesVisited || filesRequested) && <FilesWorkspace host={host} visible={filesVisible}
-          presentation={mode === 'files' ? 'full' : 'compact'} onShowFull={onShowFiles} onShowOverview={onShowOverview} />}
+  return (
+    <div className="ssh-host-root" hidden={mode === null}>
+      <div
+        ref={root}
+        className={`ssh-layout ${split ? 'ssh-layout--split' : ''}`}
+        style={
+          split
+            ? { gridTemplateColumns: `${left}px ${SPLIT_HANDLE_WIDTH}px minmax(0, 1fr)` }
+            : undefined
+        }
+      >
+        <div id={`${panelId}-files`} className="ssh-files-slot" hidden={!filesVisible}>
+          {(filesVisited || filesRequested) && (
+            <FilesWorkspace
+              host={host}
+              visible={filesVisible}
+              presentation={mode === 'files' ? 'full' : 'compact'}
+              onShowFull={onShowFiles}
+              onShowOverview={onShowOverview}
+            />
+          )}
+        </div>
+        <div
+          className="ssh-separator"
+          hidden={!split}
+          role="separator"
+          aria-label="Resize files panel"
+          aria-orientation="vertical"
+          aria-controls={`${panelId}-files ${panelId}-terminal`}
+          aria-valuemin={FILES_MIN_WIDTH}
+          aria-valuemax={Math.round(maximum)}
+          aria-valuenow={Math.round(left)}
+          aria-valuetext={`${Math.round(left)} pixels for files`}
+          tabIndex={split ? 0 : -1}
+          onKeyDown={(event) => {
+            const next =
+              event.key === 'ArrowLeft'
+                ? left - 16
+                : event.key === 'ArrowRight'
+                  ? left + 16
+                  : event.key === 'Home'
+                    ? FILES_MIN_WIDTH
+                    : event.key === 'End'
+                      ? maximum
+                      : null;
+            if (next !== null) {
+              event.preventDefault();
+              resize(next);
+            }
+          }}
+          onPointerDown={(event) => {
+            if (!split || event.button !== 0) return;
+            event.preventDefault();
+            event.currentTarget.focus();
+            event.currentTarget.setPointerCapture(event.pointerId);
+            drag.current = {
+              pointer: event.pointerId,
+              element: event.currentTarget,
+              startX: event.clientX,
+              startLeft: left,
+            };
+          }}
+          onPointerMove={(event) => {
+            if (drag.current?.pointer === event.pointerId) {
+              resize(drag.current.startLeft + event.clientX - drag.current.startX);
+            }
+          }}
+          onPointerUp={stopDrag}
+          onPointerCancel={stopDrag}
+          onLostPointerCapture={stopDrag}
+        />
+        <div id={`${panelId}-terminal`} className="ssh-terminal-slot" hidden={mode !== 'terminal'}>
+          {terminalVisited && (
+            <TerminalWorkspace
+              host={host}
+              visible={mode === 'terminal'}
+              onShowOverview={onShowOverview}
+              combined={combined}
+              focused={focused}
+              embedded={embedded}
+              onToggleFocus={onToggleFocus}
+              onToggleFiles={() => {
+                setFilesRequested(true);
+                setCombined((current) => !current);
+              }}
+            />
+          )}
+        </div>
       </div>
-      <div className="ssh-separator" hidden={!split} role="separator" aria-label="Resize files panel"
-        aria-orientation="vertical" aria-controls={`${panelId}-files ${panelId}-terminal`}
-        aria-valuemin={FILES_MIN_WIDTH} aria-valuemax={Math.round(maximum)} aria-valuenow={Math.round(left)}
-        aria-valuetext={`${Math.round(left)} pixels for files`} tabIndex={split ? 0 : -1}
-        onKeyDown={(event) => {
-          const next = event.key === 'ArrowLeft' ? left - 16 : event.key === 'ArrowRight' ? left + 16
-            : event.key === 'Home' ? FILES_MIN_WIDTH : event.key === 'End' ? maximum : null;
-          if (next !== null) { event.preventDefault(); resize(next); }
-        }}
-        onPointerDown={(event) => {
-          if (!split || event.button !== 0) return;
-          event.preventDefault();
-          event.currentTarget.focus();
-          event.currentTarget.setPointerCapture(event.pointerId);
-          drag.current = { pointer: event.pointerId, element: event.currentTarget, startX: event.clientX, startLeft: left };
-        }}
-        onPointerMove={(event) => {
-          if (drag.current?.pointer === event.pointerId) resize(drag.current.startLeft + event.clientX - drag.current.startX);
-        }}
-        onPointerUp={stopDrag} onPointerCancel={stopDrag} onLostPointerCapture={stopDrag} />
-      <div id={`${panelId}-terminal`} className="ssh-terminal-slot" hidden={mode !== 'terminal'}>
-        {terminalVisited && <TerminalWorkspace host={host} visible={mode === 'terminal'} onShowOverview={onShowOverview}
-          combined={combined} onToggleFiles={() => { setFilesRequested(true); setCombined((current) => !current); }} />}
-      </div>
+      {mode === 'terminal' && combined && narrow && (
+        <div className="ssh-collapsed-files" role="status">
+          Files panel collapsed to keep the terminal usable.{' '}
+          <Button onClick={onShowFiles}>Open full Files view</Button>
+        </div>
+      )}
+      <CompactMonitorStrip
+        hostId={host.id}
+        hostSessionId={connection.data?.hostSessionId ?? null}
+        connected={connection.data?.state === 'connected'}
+        visible={showCompactMonitor && mode === 'terminal' && combined}
+      />
     </div>
-    {mode === 'terminal' && combined && narrow && <div className="ssh-collapsed-files" role="status">
-      Files panel collapsed to keep the terminal usable. <Button onClick={onShowFiles}>Open full Files view</Button>
-    </div>}
-    <CompactMonitorStrip hostId={host.id} hostSessionId={connection.data?.hostSessionId ?? null}
-      connected={connection.data?.state === 'connected'} visible={mode === 'terminal' && combined} />
-  </div>;
+  );
 }
 
 export default function App() {
@@ -115,27 +225,73 @@ export default function App() {
   const [dialog, setDialog] = useState<DialogState>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [section, setSection] = useState<'overview' | 'terminal' | 'files' | 'services' | 'network' | 'security' | 'logs' | 'containers'>('overview');
+  const [section, setSection] = useState<WorkspaceSection>('overview');
   const [terminalHosts, setTerminalHosts] = useState<string[]>([]);
   const [fileHosts, setFileHosts] = useState<string[]>([]);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [terminalFocus, setTerminalFocus] = useState(false);
+  const [systemInfoOpen, setSystemInfoOpen] = useState(false);
+
   const hosts = hostsQuery.data ?? [];
   const selectedHost = hosts.find((host) => host.id === hostId) ?? null;
+  const selectedSession = useHostSession(selectedHost?.id ?? '');
+  const isSelectedConnected = Boolean(selectedHost && selectedSession.data?.state === 'connected');
+  const unifiedConnectedMode = Boolean(
+    selectedHost && isSelectedConnected && (section === 'overview' || section === 'terminal'),
+  );
+  const activeTerminalFocus = Boolean(
+    terminalFocus && selectedHost && (section === 'terminal' || unifiedConnectedMode),
+  );
+  const terminalViewportLocked = Boolean(
+    selectedHost && (section === 'terminal' || unifiedConnectedMode),
+  );
+
+  useEffect(() => {
+    const handleGlobalKey = (event: KeyboardEvent) => {
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.shiftKey &&
+        !event.altKey &&
+        event.key.toLowerCase() === 'k'
+      ) {
+        event.preventDefault();
+        setPaletteOpen((current) => !current);
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKey, true);
+    return () => window.removeEventListener('keydown', handleGlobalKey, true);
+  }, []);
 
   function visitTerminal(host: Host) {
     setTerminalHosts((current) => (current.includes(host.id) ? current : [...current, host.id]));
   }
 
   function selectHost(id: string | null) {
+    if (unifiedConnectedMode && selectedHost) visitTerminal(selectedHost);
     select(id);
+    setSystemInfoOpen(false);
     const host = hosts.find((candidate) => candidate.id === id);
+    if (!host) setTerminalFocus(false);
     if (host && section === 'terminal') visitTerminal(host);
-    if (host && section === 'files') setFileHosts((current) => current.includes(host.id) ? current : [...current, host.id]);
+    if (host && section === 'files') {
+      setFileHosts((current) => (current.includes(host.id) ? current : [...current, host.id]));
+    }
   }
 
-  function selectSection(next: 'overview' | 'terminal' | 'files' | 'services' | 'network' | 'security' | 'logs' | 'containers') {
+  function selectSection(next: WorkspaceSection) {
+    if (unifiedConnectedMode && selectedHost) visitTerminal(selectedHost);
     setSection(next);
+    if (next !== 'overview') setSystemInfoOpen(false);
+    if (next !== 'terminal' && !(next === 'overview' && isSelectedConnected)) {
+      setTerminalFocus(false);
+    }
     if (next === 'terminal' && selectedHost) visitTerminal(selectedHost);
-    if (next === 'files' && selectedHost) setFileHosts((current) => current.includes(selectedHost.id) ? current : [...current, selectedHost.id]);
+    if (next === 'files' && selectedHost) {
+      setFileHosts((current) =>
+        current.includes(selectedHost.id) ? current : [...current, selectedHost.id],
+      );
+    }
   }
 
   // Do not move this into useMutation: its cache retains mutation variables, including secrets.
@@ -162,8 +318,14 @@ export default function App() {
     }
   }
 
+  const showHostOverview = Boolean(
+    selectedHost && (section === 'overview' || (isSelectedConnected && section === 'terminal')),
+  );
+
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell ${terminalViewportLocked ? 'app-shell--viewport-locked' : ''} ${activeTerminalFocus ? 'app-shell--terminal-focus' : ''}`}
+    >
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
@@ -174,15 +336,46 @@ export default function App() {
         onAdd={() => setDialog({ type: 'add' })}
         activeSection={section}
         onSection={selectSection}
+        loading={hostsQuery.isPending}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed((current) => !current)}
       />
       <div className="main-shell">
-        <div className="topbar">
+        <header className="topbar">
           <div className="breadcrumbs">
-            <button onClick={() => selectHost(null)}>Workspace</button>
-            <span>/</span>
-            <span>{selectedHost?.displayName ?? 'Overview'}</span>
-            {selectedHost && <span>{section === 'terminal' ? 'Terminal' : section === 'files' ? 'Files' : section === 'services' ? 'Services' : section === 'network' ? 'Network' : section === 'security' ? 'Security' : section === 'logs' ? 'Logs' : section === 'containers' ? 'Containers' : 'Overview'}</span>}
+            <button
+              type="button"
+              onClick={() => {
+                selectHost(null);
+                selectSection('overview');
+              }}
+            >
+              Workspace
+            </button>
+            <span className="breadcrumb-sep">/</span>
+            <span className="breadcrumb-host">{selectedHost?.displayName ?? 'Overview'}</span>
+            {selectedHost && (
+              <>
+                <span className="breadcrumb-sep">/</span>
+                <span className="breadcrumb-current">{SECTION_LABELS[section]}</span>
+              </>
+            )}
           </div>
+
+          <div className="topbar-center">
+            <button
+              type="button"
+              className="command-trigger"
+              aria-label="Open command palette"
+              aria-keyshortcuts="Control+K"
+              onClick={() => setPaletteOpen(true)}
+            >
+              <Icon name="search" size={14} />
+              <span className="command-trigger-text">Jump to host or workspace…</span>
+              <kbd className="command-shortcut">Ctrl+K</kbd>
+            </button>
+          </div>
+
           <div className="topbar-actions">
             <UpdateCheck />
             <span className="topbar-label">
@@ -190,11 +383,11 @@ export default function App() {
               Local control plane
             </span>
           </div>
-        </div>
+        </header>
         <main
           id="main-content"
           tabIndex={-1}
-          className={`main-content ${section === 'terminal' ? 'main-content--terminal' : ''} ${section === 'files' ? 'main-content--files' : ''}`}
+          className={`main-content ${unifiedConnectedMode ? 'main-content--unified' : ''} ${section === 'terminal' && !unifiedConnectedMode ? 'main-content--terminal' : ''} ${section === 'files' ? 'main-content--files' : ''}`}
         >
           {hostsQuery.isPending ? (
             <div className="state-panel">
@@ -221,10 +414,14 @@ export default function App() {
                 </div>
               </Notice>
             </>
-          ) : selectedHost && section === 'overview' ? (
+          ) : showHostOverview && selectedHost ? (
             <HostOverview
               key={selectedHost.id}
               host={selectedHost}
+              compactUnified={isSelectedConnected}
+              monitoringVisible={!activeTerminalFocus}
+              systemInfoOpen={systemInfoOpen}
+              onToggleSystemInfo={() => setSystemInfoOpen((current) => !current)}
               onEdit={() => setDialog({ type: 'edit', host: selectedHost })}
               onDelete={() => {
                 setDeleteError(null);
@@ -232,21 +429,55 @@ export default function App() {
               }}
             />
           ) : !selectedHost ? (
-            <HostList hosts={hosts} onSelect={selectHost} onAdd={() => setDialog({ type: 'add' })} />
+            <HostList
+              hosts={hosts}
+              onSelect={selectHost}
+              onAdd={() => setDialog({ type: 'add' })}
+            />
           ) : null}
-          {[...new Set([...terminalHosts, ...fileHosts])].map((id) => {
+          {[
+            ...new Set([
+              ...terminalHosts,
+              ...fileHosts,
+              ...(unifiedConnectedMode && selectedHost ? [selectedHost.id] : []),
+            ]),
+          ].map((id) => {
             const host = hosts.find((candidate) => candidate.id === id);
             if (!host) return null;
-            return <SshWorkspace key={host.id} host={host}
-              mode={selectedHost?.id === id && (section === 'terminal' || section === 'files') ? section : null}
-              terminalVisited={terminalHosts.includes(id)} filesVisited={fileHosts.includes(id)}
-              onShowOverview={() => setSection('overview')} onShowFiles={() => selectSection('files')} />;
+            const isSelected = selectedHost?.id === id;
+            const hostUnified = isSelected && unifiedConnectedMode;
+            const mode: 'terminal' | 'files' | null = isSelected
+              ? section === 'files'
+                ? 'files'
+                : section === 'terminal' || hostUnified
+                  ? 'terminal'
+                  : null
+              : null;
+            return (
+              <SshWorkspace
+                key={host.id}
+                host={host}
+                mode={mode}
+                terminalVisited={terminalHosts.includes(id) || hostUnified}
+                filesVisited={fileHosts.includes(id)}
+                focused={activeTerminalFocus && isSelected}
+                embedded={hostUnified}
+                showCompactMonitor={!hostUnified}
+                onToggleFocus={() => setTerminalFocus((current) => !current)}
+                onShowOverview={() => selectSection('overview')}
+                onShowFiles={() => selectSection('files')}
+              />
+            );
           })}
           {selectedHost && section === 'services' && (
             <ServicesWorkspace key={selectedHost.id} host={selectedHost} />
           )}
-          {selectedHost && section === 'logs' && <LogsWorkspace key={selectedHost.id} host={selectedHost} />}
-          {selectedHost && section === 'containers' && <ContainersWorkspace key={selectedHost.id} host={selectedHost} />}
+          {selectedHost && section === 'logs' && (
+            <LogsWorkspace key={selectedHost.id} host={selectedHost} />
+          )}
+          {selectedHost && section === 'containers' && (
+            <ContainersWorkspace key={selectedHost.id} host={selectedHost} />
+          )}
           {selectedHost && section === 'network' && (
             <NetworkWorkspace key={selectedHost.id} host={selectedHost} />
           )}
@@ -256,11 +487,56 @@ export default function App() {
         </main>
         <footer className="app-footer">
           <span>
-            UBGOps <span className="footer-divider">/</span> {section === 'files' ? 'SFTP files' : section === 'services' ? 'System services' : section === 'network' ? 'Network interfaces' : section === 'security' ? 'SSH endpoint trust' : section === 'containers' ? 'Docker containers' : 'Terminal workspace'}
+            UBGOps <span className="footer-divider">/</span>{' '}
+            {unifiedConnectedMode
+              ? 'Unified SSH workspace'
+              : section === 'files'
+                ? 'SFTP files'
+                : section === 'services'
+                  ? 'System services'
+                  : section === 'network'
+                    ? 'Network interfaces'
+                    : section === 'security'
+                      ? 'SSH endpoint trust'
+                      : section === 'containers'
+                        ? 'Docker containers'
+                        : section === 'logs'
+                          ? 'System journal'
+                          : section === 'overview'
+                            ? 'Infrastructure overview'
+                            : 'Terminal workspace'}
           </span>
-          <span>{section === 'security' ? 'Local trust metadata · on demand' : section === 'files' ? 'Agentless · streamed transfers' : section === 'services' || section === 'network' || section === 'containers' || section === 'logs' ? 'Read-only · on demand' : 'Interactive PTY · local scrollback'}</span>
+          <span>
+            {section === 'security'
+              ? 'Local trust metadata · on demand'
+              : section === 'files'
+                ? 'Agentless · streamed transfers'
+                : section === 'services' ||
+                    section === 'network' ||
+                    section === 'containers' ||
+                    section === 'logs'
+                  ? 'Read-only · on demand'
+                  : 'Interactive PTY · local scrollback'}
+          </span>
         </footer>
       </div>
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        hosts={hosts}
+        selectedHost={selectedHost}
+        activeSection={section}
+        sidebarCollapsed={sidebarCollapsed}
+        terminalFocus={activeTerminalFocus}
+        unifiedConnected={unifiedConnectedMode}
+        systemInfoOpen={systemInfoOpen}
+        onSelectHost={selectHost}
+        onSelectSection={selectSection}
+        onAddHost={() => setDialog({ type: 'add' })}
+        onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
+        onToggleTerminalFocus={() => setTerminalFocus((current) => !current)}
+        onToggleSystemInfo={() => setSystemInfoOpen((current) => !current)}
+      />
       {dialog && dialog.type !== 'delete' && (
         <HostForm
           key={dialog.type === 'edit' ? dialog.host.id : 'new'}

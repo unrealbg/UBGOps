@@ -193,15 +193,22 @@ describe('unified SSH workspace', () => {
     expect(separator).toHaveAttribute('aria-valuenow', prior);
   });
 
-  it('preserves a Files-first workspace when Terminal is first opened later', async () => {
-    renderApp();
+  it('preserves a Files-first workspace when host connects and Terminal opens later', async () => {
+    vi.mocked(hostApi.session).mockResolvedValue(disconnected);
+    const client = renderApp();
     await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    expect(terminalApi.list).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Files' }));
+    expect(terminalApi.list).not.toHaveBeenCalled();
+
+    vi.mocked(hostApi.session).mockResolvedValue(connected);
+    await client.invalidateQueries({ queryKey: ['sessions', host.id] });
     await screen.findByDisplayValue('/synthetic');
     const files = screen.getByRole('region', { name: `Files on ${host.displayName}` });
     const selection = screen.getByRole('checkbox', { name: 'Select synthetic-file' });
     await userEvent.click(selection);
     expect(terminalApi.list).not.toHaveBeenCalled();
+
     await userEvent.click(screen.getByRole('button', { name: 'Terminal' }));
     await screen.findByRole('button', { name: 'Open terminal' });
     await combine();
@@ -248,23 +255,49 @@ describe('unified SSH workspace', () => {
     expect(filesApi.open).toHaveBeenCalledOnce();
   });
 
-  it('starts only one compact sampler and keeps inactive host workspaces isolated', async () => {
+  it('runs a single monitoring poller in Unified mode across Combine split and keeps inactive host workspaces isolated', async () => {
     const other = { ...host, id: 'other-host', displayName: 'Other host' };
     vi.mocked(hostApi.list).mockResolvedValue([host, other]);
     vi.mocked(hostApi.session).mockImplementation(async (id) => ({ ...connected, hostId: id }));
     await openTerminal();
     await act(async () => { await Promise.resolve(); });
-    const before = vi.mocked(monitorApi.sample).mock.calls.length;
+    expect(screen.getAllByRole('region', { name: 'Live monitoring' })).toHaveLength(1);
+    const sampleCountBeforeCombine = vi.mocked(monitorApi.sample).mock.calls.length;
     await combine();
-    await waitFor(() => expect(monitorApi.sample).toHaveBeenCalledTimes(before + 1));
-    expect(screen.getAllByRole('region', { name: 'SSH workspace monitoring' })).toHaveLength(1);
-    await userEvent.selectOptions(screen.getByLabelText('Select a host'), other.id);
     expect(screen.queryByRole('region', { name: 'SSH workspace monitoring' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('region', { name: 'Live monitoring' })).toHaveLength(1);
+    expect(monitorApi.sample).toHaveBeenCalledTimes(sampleCountBeforeCombine);
+
+    await userEvent.selectOptions(screen.getByLabelText('Select a host'), other.id);
     expect(screen.queryByRole('region', { name: `Files on ${host.displayName}` })).not.toBeInTheDocument();
     await userEvent.selectOptions(screen.getByLabelText('Select a host'), host.id);
     expect(screen.getAllByRole('region', { name: `Files on ${host.displayName}` })).toHaveLength(1);
-    expect(screen.getAllByRole('region', { name: 'SSH workspace monitoring' })).toHaveLength(1);
+    expect(screen.getAllByRole('region', { name: 'Live monitoring' })).toHaveLength(1);
     expect(filesApi.open).toHaveBeenCalledOnce();
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+  });
+
+  it('renders Live monitoring above active Terminal on connected Overview and toggles System info without interrupting PTY scrollback', async () => {
+    renderApp();
+    await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    expect(await screen.findByRole('region', { name: 'Live monitoring' })).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('button', { name: 'Open terminal' }));
+    const terminalNode = await screen.findByTestId(`${host.id}-pty`);
+    const ptyInput = screen.getByRole('textbox', { name: 'Synthetic Shell' });
+    await userEvent.type(ptyInput, ' unified');
+
+    const sysInfoButton = screen.getByRole('button', { name: 'System info' });
+    await userEvent.click(sysInfoButton);
+    expect(screen.getByRole('region', { name: 'Host system details' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'System information' })).toBeInTheDocument();
+    expect(screen.getByTestId(`${host.id}-pty`)).toBe(terminalNode);
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback unified',
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Hide system info' }));
+    expect(screen.queryByRole('region', { name: 'Host system details' })).not.toBeInTheDocument();
+    expect(screen.getByTestId(`${host.id}-pty`)).toBe(terminalNode);
     expect(terminalApi.open).toHaveBeenCalledOnce();
   });
 });
@@ -641,5 +674,63 @@ describe('workspace flows', () => {
     expect(await screen.findByRole('heading', { name: 'Test worker' })).toBeInTheDocument();
     expect(screen.queryByText('Debian GNU/Linux')).not.toBeInTheDocument();
     expect(screen.getByText('Ready when you are')).toBeInTheDocument();
+  });
+
+  it('opens Command Palette with Ctrl+K, ignores Ctrl+Shift+K, and toggles Terminal focus without remounting active PTY/SFTP', async () => {
+    const other: Host = {
+      ...host,
+      id: 'test-host-2',
+      displayName: 'Test worker',
+      connection: { ...host.connection, hostname: 'worker.example.test' },
+    };
+    vi.mocked(hostApi.list).mockResolvedValue([host, other]);
+    vi.mocked(hostApi.session).mockResolvedValue(connected);
+    vi.mocked(terminalApi.open).mockImplementation(async (id, size) => ({
+      id: `${id}-pty`,
+      hostId: id,
+      hostSessionId: connected.hostSessionId!,
+      label: 'Shell',
+      size,
+      state: 'open',
+      error: null,
+    }));
+
+    const { container } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+          })
+        }
+      >
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    await userEvent.click(screen.getByRole('button', { name: 'Terminal' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Open terminal' }));
+    const ptyInput = await screen.findByRole('textbox', { name: 'Synthetic Shell' });
+    await userEvent.type(ptyInput, ' persisted');
+
+    fireEvent.keyDown(window, { key: 'K', ctrlKey: true, shiftKey: true });
+    expect(screen.queryByRole('dialog', { name: 'Command palette' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(container.querySelector('.app-shell')).toHaveClass('app-shell--terminal-focus');
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback persisted',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const palette = screen.getByRole('dialog', { name: 'Command palette' });
+    expect(palette).toBeInTheDocument();
+    await userEvent.click(within(palette).getByRole('option', { name: /Exit terminal focus mode/i }));
+    expect(container.querySelector('.app-shell')).not.toHaveClass('app-shell--terminal-focus');
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback persisted',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
   });
 });

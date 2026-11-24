@@ -20,6 +20,7 @@ export function useHostSession(hostId: string, interval = 1_000) {
     queryKey: hostKeys.session(hostId),
     queryFn: () => hostApi.session(hostId),
     refetchInterval: interval,
+    enabled: Boolean(hostId),
     retry: false,
   });
 }
