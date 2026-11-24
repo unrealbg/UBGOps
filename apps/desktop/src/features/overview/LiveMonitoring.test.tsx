@@ -201,6 +201,10 @@ describe('live monitoring lifecycle', () => {
       'aria-valuenow',
       '25',
     );
+    const labels = Array.from(document.querySelectorAll('.monitor-grid .metric-label')).map((el) =>
+      el.textContent?.trim(),
+    );
+    expect(labels).toEqual(['CPU', 'MEMORY', 'ROOT DISK', 'SWAP', 'NETWORK']);
     expect(screen.queryByText(/disk i\/o/i)).not.toBeInTheDocument();
   });
 });

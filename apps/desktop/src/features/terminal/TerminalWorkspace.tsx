@@ -22,6 +22,7 @@ export function TerminalWorkspace({
   onToggleFiles,
   focused = false,
   onToggleFocus,
+  embedded = false,
 }: {
   host: Host;
   visible: boolean;
@@ -30,6 +31,7 @@ export function TerminalWorkspace({
   onToggleFiles?: () => void;
   focused?: boolean;
   onToggleFocus?: () => void;
+  embedded?: boolean;
 }) {
   const hostSession = useHostSession(host.id);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
@@ -150,123 +152,160 @@ export function TerminalWorkspace({
     setActiveId(sessions[next]?.id ?? null);
   }
 
+  const tabsList = (
+    <div className="terminal-tabs" role="tablist" aria-label="Terminal sessions">
+      {sessions.map((session) =>
+        renamingId === session.id ? (
+          <form
+            key={session.id}
+            className="terminal-rename"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void commitRename(session);
+            }}
+          >
+            <label className="sr-only" htmlFor={`rename-${session.id}`}>
+              Terminal name
+            </label>
+            <input
+              id={`rename-${session.id}`}
+              value={renameValue}
+              maxLength={64}
+              autoFocus
+              onChange={(event) => setRenameValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setRenamingId(null);
+              }}
+              onBlur={() => setRenamingId(null)}
+            />
+          </form>
+        ) : (
+          <button
+            key={session.id}
+            role="tab"
+            aria-selected={session.id === activeId}
+            className={`terminal-tab ${session.id === activeId ? 'terminal-tab--active' : ''}`}
+            onClick={() => setActiveId(session.id)}
+            onDoubleClick={() => {
+              setRenameValue(session.label);
+              setRenamingId(session.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowLeft') selectRelative(-1);
+              if (event.key === 'ArrowRight') selectRelative(1);
+            }}
+          >
+            <span className={`terminal-state terminal-state--${session.state}`} aria-hidden="true" />
+            {session.label}
+          </button>
+        ),
+      )}
+    </div>
+  );
+
+  const activeSessionControls = activeSession && (
+    <div className="terminal-tab-actions">
+      <button
+        type="button"
+        aria-label="Rename active terminal"
+        title="Rename terminal"
+        onClick={() => {
+          setRenameValue(activeSession.label);
+          setRenamingId(activeSession.id);
+        }}
+      >
+        Rename
+      </button>
+      <button
+        type="button"
+        aria-label="Search terminal"
+        title="Search (Ctrl+Shift+F)"
+        onClick={() => setSearchOpen(true)}
+      >
+        Search
+      </button>
+      <button
+        type="button"
+        aria-label="Close active terminal"
+        title="Close terminal (Ctrl+Shift+W)"
+        onClick={() => void closeTerminal(activeSession)}
+      >
+        Close
+      </button>
+    </div>
+  );
+
+  const workspaceActionButtons = (
+    <div className="heading-actions terminal-workspace-actions">
+      {onToggleFiles && (
+        <Button aria-pressed={combined} onClick={onToggleFiles}>
+          {combined ? 'Hide files panel' : 'Combine Terminal + Files'}
+        </Button>
+      )}
+      {onToggleFocus && (
+        <Button
+          variant="ghost"
+          aria-pressed={focused}
+          title={focused ? 'Exit terminal focus mode' : 'Focus terminal workspace'}
+          onClick={onToggleFocus}
+        >
+          <Icon name={focused ? 'minimize' : 'maximize'} size={14} />
+          {focused ? 'Exit focus' : 'Focus'}
+        </Button>
+      )}
+      {!embedded && (
+        <Button variant="ghost" onClick={onShowOverview}>
+          Overview
+        </Button>
+      )}
+      <Button variant="primary" disabled={!connected || opening} onClick={() => void openTerminal()}>
+        <Icon name="plus" size={14} />
+        {opening ? 'Opening…' : 'New terminal'}
+      </Button>
+    </div>
+  );
+
   return (
     <section
-      className={`terminal-workspace ${focused ? 'terminal-workspace--focused' : ''}`}
+      className={`terminal-workspace ${embedded ? 'terminal-workspace--embedded' : ''} ${focused ? 'terminal-workspace--focused' : ''}`}
       aria-label={`${host.displayName} terminal workspace`}
     >
-      <header className="terminal-heading">
-        <div className="terminal-heading-identity">
-          <div className="eyebrow">REMOTE TERMINAL</div>
-          <div className="terminal-title-line">
-            <h1>{host.displayName}</h1>
-            <ConnectionBadge state={hostSession.data?.state ?? 'disconnected'} />
-            <span className="terminal-endpoint mono">
-              {host.connection.username}@{host.connection.hostname}:{host.connection.port}
-            </span>
+      {embedded ? (
+        <div className="terminal-bar-unified">
+          {focused && (
+            <div className="terminal-focus-identity">
+              <strong>{host.displayName}</strong>
+              <ConnectionBadge state={hostSession.data?.state ?? 'disconnected'} />
+            </div>
+          )}
+          <div className="terminal-bar-tabs-scroll">{tabsList}</div>
+          <div className="terminal-bar-controls">
+            {activeSessionControls}
+            {workspaceActionButtons}
           </div>
         </div>
-        <div className="heading-actions">
-          {onToggleFiles && (
-            <Button aria-pressed={combined} onClick={onToggleFiles}>
-              {combined ? 'Hide files panel' : 'Combine Terminal + Files'}
-            </Button>
-          )}
-          {onToggleFocus && (
-            <Button
-              variant="ghost"
-              aria-pressed={focused}
-              title={focused ? 'Exit terminal focus mode' : 'Focus terminal workspace'}
-              onClick={onToggleFocus}
-            >
-              <Icon name={focused ? 'minimize' : 'maximize'} size={14} />
-              {focused ? 'Exit focus' : 'Focus'}
-            </Button>
-          )}
-          <Button variant="ghost" onClick={onShowOverview}>
-            Overview
-          </Button>
-          <Button variant="primary" disabled={!connected || opening} onClick={() => void openTerminal()}>
-            <Icon name="plus" size={15} />
-            {opening ? 'Opening…' : 'New terminal'}
-          </Button>
-        </div>
-      </header>
+      ) : (
+        <>
+          <header className="terminal-heading">
+            <div className="terminal-heading-identity">
+              <div className="eyebrow">REMOTE TERMINAL</div>
+              <div className="terminal-title-line">
+                <h1>{host.displayName}</h1>
+                <ConnectionBadge state={hostSession.data?.state ?? 'disconnected'} />
+                <span className="terminal-endpoint mono">
+                  {host.connection.username}@{host.connection.hostname}:{host.connection.port}
+                </span>
+              </div>
+            </div>
+            {workspaceActionButtons}
+          </header>
 
-      <div className="terminal-tabs-row">
-        <div className="terminal-tabs" role="tablist" aria-label="Terminal sessions">
-          {sessions.map((session) =>
-            renamingId === session.id ? (
-              <form
-                key={session.id}
-                className="terminal-rename"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void commitRename(session);
-                }}
-              >
-                <label className="sr-only" htmlFor={`rename-${session.id}`}>
-                  Terminal name
-                </label>
-                <input
-                  id={`rename-${session.id}`}
-                  value={renameValue}
-                  maxLength={64}
-                  autoFocus
-                  onChange={(event) => setRenameValue(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape') setRenamingId(null);
-                  }}
-                  onBlur={() => setRenamingId(null)}
-                />
-              </form>
-            ) : (
-              <button
-                key={session.id}
-                role="tab"
-                aria-selected={session.id === activeId}
-                className={`terminal-tab ${session.id === activeId ? 'terminal-tab--active' : ''}`}
-                onClick={() => setActiveId(session.id)}
-                onDoubleClick={() => {
-                  setRenameValue(session.label);
-                  setRenamingId(session.id);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === 'ArrowLeft') selectRelative(-1);
-                  if (event.key === 'ArrowRight') selectRelative(1);
-                }}
-              >
-                <span className={`terminal-state terminal-state--${session.state}`} aria-hidden="true" />
-                {session.label}
-              </button>
-            ),
-          )}
-        </div>
-        {activeSession && (
-          <div className="terminal-tab-actions">
-            <button
-              aria-label="Rename active terminal"
-              title="Rename terminal"
-              onClick={() => {
-                setRenameValue(activeSession.label);
-                setRenamingId(activeSession.id);
-              }}
-            >
-              Rename
-            </button>
-            <button aria-label="Search terminal" title="Search (Ctrl+Shift+F)" onClick={() => setSearchOpen(true)}>
-              Search
-            </button>
-            <button
-              aria-label="Close active terminal"
-              title="Close terminal (Ctrl+Shift+W)"
-              onClick={() => void closeTerminal(activeSession)}
-            >
-              Close
-            </button>
+          <div className="terminal-tabs-row">
+            {tabsList}
+            {activeSessionControls}
           </div>
-        )}
-      </div>
+        </>
+      )}
 
       {searchOpen && activeSession && (
         <form
@@ -324,7 +363,7 @@ export function TerminalWorkspace({
         </div>
       ) : sessions.length === 0 ? (
         <div className="terminal-empty">
-          <span className="large-icon"><Icon name="terminal" size={30} /></span>
+          <span className="large-icon"><Icon name="terminal" size={28} /></span>
           <h2>{connected ? 'Open a remote shell' : 'Connect this host first'}</h2>
           <p>
             {connected
@@ -361,6 +400,7 @@ export function TerminalWorkspace({
         <span>Ctrl+Shift+F Search</span>
         <span>Ctrl+Shift+T New</span>
         <span>Ctrl+Shift+W Close</span>
+        <span>Ctrl+K Palette</span>
       </div>
     </section>
   );

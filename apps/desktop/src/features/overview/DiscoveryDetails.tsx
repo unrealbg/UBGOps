@@ -1,52 +1,16 @@
 import type { DiscoverySnapshot, HostSession } from '@ubgops/protocol';
 import { Badge, Notice } from '@ubgops/ui';
-import { bytes, observedTime, percentage, uptime } from './format';
+import { observedTime, uptime } from './format';
 import { Icon } from '../../components/Icon';
-
-function ResourceMetric({
-  title,
-  used,
-  total,
-}: {
-  title: string;
-  used: number | null;
-  total: number | null;
-}) {
-  const percent = percentage(used, total);
-  return (
-    <div className="metric">
-      <span className="metric-label">{title}</span>
-      <div className="metric-value">
-        {used === null ? 'Unavailable' : bytes(used)}
-        <span className="metric-total">{total === null ? '' : ` / ${bytes(total)}`}</span>
-      </div>
-      {percent === null ? (
-        <div className="metric-unavailable">Usage data unavailable</div>
-      ) : (
-        <>
-          <div
-            className="resource-track"
-            role="meter"
-            aria-label={`${title} usage`}
-            aria-valuenow={Math.round(percent)}
-            aria-valuemin={0}
-            aria-valuemax={100}
-          >
-            <span style={{ width: `${percent}%` }} />
-          </div>
-          <div className="metric-caption">{Math.round(percent)}% utilized</div>
-        </>
-      )}
-    </div>
-  );
-}
 
 export function DiscoveryDetails({
   discovery,
   session,
+  compactDrawer = false,
 }: {
   discovery: DiscoverySnapshot;
   session: HostSession;
+  compactDrawer?: boolean;
 }) {
   const details = [
     ['Hostname', discovery.hostname],
@@ -54,38 +18,20 @@ export function DiscoveryDetails({
     ['OS version', discovery.osVersion],
     ['Kernel', discovery.kernel],
     ['Architecture', discovery.architecture],
+    ['Uptime', uptime(discovery.uptimeSeconds)],
+    [
+      'System load (1m)',
+      discovery.loadOne === null ? 'Unavailable' : discovery.loadOne.toFixed(2),
+    ],
   ];
+
   return (
-    <>
-      <section className="metrics-grid" aria-label="Host resources">
-        <div className="metric">
-          <span className="metric-label">UPTIME</span>
-          <div className="metric-value">{uptime(discovery.uptimeSeconds)}</div>
-          <div className="metric-caption">Since last system boot</div>
-        </div>
-        <div className="metric">
-          <span className="metric-label">SYSTEM LOAD</span>
-          <div className="metric-value">
-            {discovery.loadOne === null ? 'Unavailable' : discovery.loadOne.toFixed(2)}
-          </div>
-          <div className="metric-caption">1-minute load average</div>
-        </div>
-        <ResourceMetric
-          title="MEMORY"
-          used={discovery.memoryUsedBytes}
-          total={discovery.memoryTotalBytes}
-        />
-        <ResourceMetric
-          title="ROOT FILESYSTEM"
-          used={discovery.rootUsedBytes}
-          total={discovery.rootTotalBytes}
-        />
-      </section>
+    <div className={`discovery-details ${compactDrawer ? 'discovery-details--drawer' : ''}`}>
       <div className="overview-columns">
         <section className="panel">
           <div className="panel-heading">
             <h2>System information</h2>
-            <span className="panel-caption">Linux host</span>
+            <span className="panel-caption">Linux host snapshot</span>
           </div>
           <dl className="detail-list">
             {details.map(([label, value]) => (
@@ -103,7 +49,7 @@ export function DiscoveryDetails({
           </div>
           <div className="security-summary">
             <span className="security-icon">
-              <Icon name="security" size={22} />
+              <Icon name="security" size={20} />
             </span>
             <div>
               <strong>Trusted host identity</strong>
@@ -163,6 +109,6 @@ export function DiscoveryDetails({
         </span>
         <span>Observed {observedTime(discovery.observedAt)}</span>
       </div>
-    </>
+    </div>
   );
 }

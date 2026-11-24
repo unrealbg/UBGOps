@@ -1,1 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#56c8b2"/><path d="M9 24V8l14 16V8" stroke="#0d211f" stroke-width="3" fill="none" stroke-linejoin="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="ubgops-bg" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f233b" />
+      <stop offset="100%" stop-color="#060f1d" />
+    </linearGradient>
+    <linearGradient id="ubgops-u" x1="20" y1="20" x2="44" y2="45" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67e8f9" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#ubgops-bg)" stroke="#1e4b68" stroke-width="2" />
+  <path
+    d="M32 10.5L50.5 21.2V42.8L32 53.5L13.5 42.8V21.2L32 10.5Z"
+    fill="#22d3ee"
+    fill-opacity="0.09"
+    stroke="#22d3ee"
+    stroke-opacity="0.78"
+    stroke-width="2.4"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M22.5 22.5V34C22.5 39.2 26.75 43 32 43C37.25 43 41.5 39.2 41.5 34V22.5"
+    stroke="url(#ubgops-u)"
+    stroke-width="5.6"
+    stroke-linecap="round"
+  />
+</svg>

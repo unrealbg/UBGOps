@@ -22,11 +22,14 @@ export function CommandPalette({
   activeSection,
   sidebarCollapsed,
   terminalFocus,
+  unifiedConnected = false,
+  systemInfoOpen = false,
   onSelectHost,
   onSelectSection,
   onAddHost,
   onToggleSidebar,
   onToggleTerminalFocus,
+  onToggleSystemInfo,
 }: {
   open: boolean;
   onClose: () => void;
@@ -35,11 +38,14 @@ export function CommandPalette({
   activeSection: WorkspaceSection;
   sidebarCollapsed: boolean;
   terminalFocus: boolean;
+  unifiedConnected?: boolean;
+  systemInfoOpen?: boolean;
   onSelectHost: (id: string | null) => void;
   onSelectSection: (section: WorkspaceSection) => void;
   onAddHost: () => void;
   onToggleSidebar: () => void;
   onToggleTerminalFocus: () => void;
+  onToggleSystemInfo?: () => void;
 }) {
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
@@ -137,7 +143,7 @@ export function CommandPalette({
       run: onToggleSidebar,
     });
 
-    if (selectedHost && activeSection === 'terminal') {
+    if (selectedHost && (activeSection === 'terminal' || unifiedConnected)) {
       items.push({
         id: 'action:terminal-focus',
         category: 'Terminal',
@@ -146,6 +152,18 @@ export function CommandPalette({
         icon: terminalFocus ? 'minimize' : 'maximize',
         keywords: 'focus maximize terminal fullscreen',
         run: onToggleTerminalFocus,
+      });
+    }
+
+    if (selectedHost && unifiedConnected && onToggleSystemInfo) {
+      items.push({
+        id: 'action:system-info',
+        category: 'Host',
+        label: systemInfoOpen ? 'Hide system info panel' : 'Show system info panel',
+        detail: 'Inspect SSH trust fingerprint, capabilities, and OS snapshot',
+        icon: 'overview',
+        keywords: 'system info discovery fingerprint capabilities snapshot',
+        run: onToggleSystemInfo,
       });
     }
 
@@ -169,10 +187,13 @@ export function CommandPalette({
     onSelectHost,
     onSelectSection,
     onToggleSidebar,
+    onToggleSystemInfo,
     onToggleTerminalFocus,
     selectedHost,
     sidebarCollapsed,
+    systemInfoOpen,
     terminalFocus,
+    unifiedConnected,
   ]);
 
   const filtered = useMemo(() => {

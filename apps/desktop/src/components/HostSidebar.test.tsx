@@ -4,6 +4,7 @@ import type { Host } from '@ubgops/protocol';
 import { describe, expect, it, vi } from 'vitest';
 import { applicationVersion } from '../applicationVersion';
 import hostSidebarSource from './HostSidebar.tsx?raw';
+import ubgopsSvgSource from '../../public/ubgops.svg?raw';
 import { HostSidebar } from './HostSidebar';
 
 vi.mock('../api/queries', () => ({ useHostSession: vi.fn(() => ({ data: undefined })) }));
@@ -67,6 +68,8 @@ describe('application version label', () => {
   it('does not contain a hard-coded abbreviated product version or obsolete NexusOps mark', () => {
     expect(hostSidebarSource).not.toContain('v0.1');
     expect(hostSidebarSource).not.toMatch(/>\s*N\s*</);
+    expect(ubgopsSvgSource).not.toContain('#56c8b2');
+    expect(ubgopsSvgSource).not.toContain('M9 24V8l14 16V8');
   });
 });
 

@@ -18,25 +18,29 @@ function Sparkline({
   const rawId = useId();
   const gradientId = `spark-${rawId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
 
-  const segments = useMemo(() => {
+  const { segments, lastPoint } = useMemo(() => {
     const finite = values.filter(
       (value): value is number => value !== null && Number.isFinite(value),
     );
-    if (finite.length < 2) return [];
+    if (finite.length < 2) {
+      return { segments: [] as Array<{ line: string; area: string }>, lastPoint: null as { x: number; y: number } | null };
+    }
     const min = Math.min(...finite);
     const max = Math.max(...finite);
     const range = Math.max(max - min, 1);
     const width = Math.max(values.length - 1, 1);
     const built: Array<{ line: string; area: string }> = [];
     let coords: Array<{ x: number; y: number }> = [];
+    let tail: { x: number; y: number } | null = null;
 
     const flush = () => {
       if (coords.length > 1) {
         const line = coords.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
         const firstX = coords[0]!.x.toFixed(2);
         const lastX = coords[coords.length - 1]!.x.toFixed(2);
-        const area = `${firstX},31 ${line} ${lastX},31`;
+        const area = `${firstX},29 ${line} ${lastX},29`;
         built.push({ line, area });
+        tail = coords[coords.length - 1] ?? tail;
       }
       coords = [];
     };
@@ -47,33 +51,43 @@ function Sparkline({
         return;
       }
       const x = (index / width) * 100;
-      const y = 27 - ((value - min) / range) * 23;
+      const y = 25 - ((value - min) / range) * 20;
       coords.push({ x, y });
     });
     flush();
-    return built;
+    return { segments: built, lastPoint: tail };
   }, [values]);
 
   return (
     <svg
       className={`monitor-chart monitor-chart--${tone}`}
-      viewBox="0 0 100 32"
+      viewBox="0 0 100 30"
       preserveAspectRatio="none"
       aria-hidden="true"
       data-point-count={values.length}
     >
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="currentColor" stopOpacity="0.28" />
+          <stop offset="0%" stopColor="currentColor" stopOpacity="0.34" />
+          <stop offset="70%" stopColor="currentColor" stopOpacity="0.09" />
           <stop offset="100%" stopColor="currentColor" stopOpacity="0.01" />
         </linearGradient>
       </defs>
+      <line x1="0" y1="15" x2="100" y2="15" className="monitor-chart-midline" />
       {segments.map((segment, index) => (
         <g key={`${index}:${segment.line}`}>
           <polygon points={segment.area} fill={`url(#${gradientId})`} />
-          <polyline points={segment.line} />
+          <polyline points={segment.line} vectorEffect="non-scaling-stroke" />
         </g>
       ))}
+      {lastPoint && (
+        <circle
+          cx={lastPoint.x}
+          cy={lastPoint.y}
+          r="2.1"
+          className="monitor-chart-dot"
+        />
+      )}
     </svg>
   );
 }
@@ -139,7 +153,7 @@ function ResourceValue({
   );
 }
 
-export function LiveMonitoring(props: MonitoringProps) {
+export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
   const {
     visibleHistory,
     error,
@@ -165,12 +179,16 @@ export function LiveMonitoring(props: MonitoringProps) {
   const netReady =
     !networkUnavailable && sample != null && sample.networkRxBytesPerSecond !== null;
   const netTone = networkUnavailable ? 'muted' : netReady ? 'ok' : 'muted';
+  const compact = props.compact ?? true;
 
   return (
-    <section className="monitoring-section" aria-labelledby="live-monitoring-title">
+    <section
+      className={`monitoring-section ${compact ? 'monitoring-section--compact' : ''}`}
+      aria-labelledby="live-monitoring-title"
+    >
       <div className="monitoring-heading">
-        <div>
-          <div className="eyebrow">SESSION TELEMETRY</div>
+        <div className="monitoring-heading-title">
+          <span className="eyebrow">SESSION TELEMETRY</span>
           <h2 id="live-monitoring-title">Live monitoring</h2>
         </div>
         <span
@@ -189,21 +207,23 @@ export function LiveMonitoring(props: MonitoringProps) {
         <article className="monitor-card monitor-card--cpu">
           <div className="monitor-card-header">
             <span className="metric-label">
-              <Icon name="cpu" size={13} />
+              <Icon name="cpu" size={12} />
               CPU
             </span>
             <span className={`metric-status-dot metric-status-dot--${cpuTone}`} aria-hidden="true" />
           </div>
-          <strong className="monitor-card-value">
-            {cpuUnavailable
-              ? 'Unavailable'
-              : sample?.cpuUsagePercent === null || !sample
-                ? 'Warming up'
-                : formatPercent(sample.cpuUsagePercent)}
-          </strong>
-          <span className="monitor-card-sub">
-            {cpuUnavailable ? 'Host CPU probe disabled' : 'Aggregate compute load'}
-          </span>
+          <div className="monitor-card-metric">
+            <strong className="monitor-card-value">
+              {cpuUnavailable
+                ? 'Unavailable'
+                : sample?.cpuUsagePercent === null || !sample
+                  ? 'Warming up'
+                  : formatPercent(sample.cpuUsagePercent)}
+            </strong>
+            <span className="monitor-card-sub">
+              {cpuUnavailable ? 'Probe disabled' : 'Compute load'}
+            </span>
+          </div>
           <MonitorBar label="CPU" percent={cpuValue} />
           <Sparkline values={visibleHistory.map((item) => item.cpuUsagePercent)} tone="cyan" />
         </article>
@@ -211,19 +231,21 @@ export function LiveMonitoring(props: MonitoringProps) {
         <article className="monitor-card monitor-card--memory">
           <div className="monitor-card-header">
             <span className="metric-label">
-              <Icon name="memory" size={13} />
+              <Icon name="memory" size={12} />
               MEMORY
             </span>
             <span className={`metric-status-dot metric-status-dot--${memTone}`} aria-hidden="true" />
           </div>
-          <strong className="monitor-card-value">
-            <ResourceValue
-              used={sample?.memoryUsedBytes ?? null}
-              total={sample?.memoryTotalBytes ?? null}
-              unavailable={memoryUnavailable}
-            />
-          </strong>
-          <span className="monitor-card-sub">{formatPercent(memoryPercent)}</span>
+          <div className="monitor-card-metric">
+            <strong className="monitor-card-value">
+              <ResourceValue
+                used={sample?.memoryUsedBytes ?? null}
+                total={sample?.memoryTotalBytes ?? null}
+                unavailable={memoryUnavailable}
+              />
+            </strong>
+            <span className="monitor-card-sub">{formatPercent(memoryPercent)}</span>
+          </div>
           <MonitorBar
             label="Memory"
             percent={memoryUnavailable ? null : memoryPercent}
@@ -237,50 +259,10 @@ export function LiveMonitoring(props: MonitoringProps) {
           />
         </article>
 
-        <article className="monitor-card monitor-card--swap">
-          <div className="monitor-card-header">
-            <span className="metric-label">
-              <Icon name="activity" size={13} />
-              SWAP
-            </span>
-            <span
-              className={`metric-status-dot metric-status-dot--${swapTone}`}
-              aria-hidden="true"
-            />
-          </div>
-          <strong className="monitor-card-value">
-            {sample?.swapTotalBytes === 0 && !swapUnavailable ? (
-              'Not configured'
-            ) : (
-              <ResourceValue
-                used={sample?.swapUsedBytes ?? null}
-                total={sample?.swapTotalBytes ?? null}
-                unavailable={swapUnavailable}
-              />
-            )}
-          </strong>
-          {sample?.swapTotalBytes !== 0 ? (
-            <span className="monitor-card-sub">{formatPercent(swapPercent)}</span>
-          ) : (
-            <span className="monitor-card-sub">Zero swap partition active</span>
-          )}
-          <MonitorBar
-            label="Swap"
-            percent={!swapConfigured || swapUnavailable ? null : swapPercent}
-            accentClass="monitor-bar-fill--purple"
-          />
-          <Sparkline
-            values={visibleHistory.map((item) =>
-              percentage(item.swapUsedBytes, item.swapTotalBytes),
-            )}
-            tone="purple"
-          />
-        </article>
-
         <article className="monitor-card monitor-card--disk">
           <div className="monitor-card-header">
             <span className="metric-label">
-              <Icon name="disk" size={13} />
+              <Icon name="disk" size={12} />
               ROOT DISK
             </span>
             <span
@@ -288,14 +270,16 @@ export function LiveMonitoring(props: MonitoringProps) {
               aria-hidden="true"
             />
           </div>
-          <strong className="monitor-card-value">
-            <ResourceValue
-              used={sample?.rootUsedBytes ?? null}
-              total={sample?.rootTotalBytes ?? null}
-              unavailable={diskUnavailable}
-            />
-          </strong>
-          <span className="monitor-card-sub">{formatPercent(diskPercent)}</span>
+          <div className="monitor-card-metric">
+            <strong className="monitor-card-value">
+              <ResourceValue
+                used={sample?.rootUsedBytes ?? null}
+                total={sample?.rootTotalBytes ?? null}
+                unavailable={diskUnavailable}
+              />
+            </strong>
+            <span className="monitor-card-sub">{formatPercent(diskPercent)}</span>
+          </div>
           <MonitorBar
             label="Root disk"
             percent={diskUnavailable ? null : diskPercent}
@@ -309,15 +293,55 @@ export function LiveMonitoring(props: MonitoringProps) {
           />
         </article>
 
+        <article className="monitor-card monitor-card--swap">
+          <div className="monitor-card-header">
+            <span className="metric-label">
+              <Icon name="activity" size={12} />
+              SWAP
+            </span>
+            <span
+              className={`metric-status-dot metric-status-dot--${swapTone}`}
+              aria-hidden="true"
+            />
+          </div>
+          <div className="monitor-card-metric">
+            <strong className="monitor-card-value">
+              {sample?.swapTotalBytes === 0 && !swapUnavailable ? (
+                'Not configured'
+              ) : (
+                <ResourceValue
+                  used={sample?.swapUsedBytes ?? null}
+                  total={sample?.swapTotalBytes ?? null}
+                  unavailable={swapUnavailable}
+                />
+              )}
+            </strong>
+            <span className="monitor-card-sub">
+              {sample?.swapTotalBytes !== 0 ? formatPercent(swapPercent) : 'Zero swap'}
+            </span>
+          </div>
+          <MonitorBar
+            label="Swap"
+            percent={!swapConfigured || swapUnavailable ? null : swapPercent}
+            accentClass="monitor-bar-fill--purple"
+          />
+          <Sparkline
+            values={visibleHistory.map((item) =>
+              percentage(item.swapUsedBytes, item.swapTotalBytes),
+            )}
+            tone="purple"
+          />
+        </article>
+
         <article className="monitor-card monitor-card--network">
           <div className="monitor-card-header">
             <span className="metric-label">
-              <Icon name="network" size={13} />
+              <Icon name="network" size={12} />
               NETWORK
             </span>
             <span className={`metric-status-dot metric-status-dot--${netTone}`} aria-hidden="true" />
           </div>
-          <div className="monitor-network-rates">
+          <div className="monitor-card-metric monitor-network-rates">
             <strong className="monitor-card-value">
               {networkUnavailable
                 ? 'Unavailable'
@@ -329,9 +353,15 @@ export function LiveMonitoring(props: MonitoringProps) {
               {networkUnavailable
                 ? ''
                 : sample?.networkTxBytesPerSecond === null || !sample
-                  ? 'Waiting for the next sample'
+                  ? 'Awaiting sample'
                   : `↑ ${bytesPerSecond(sample.networkTxBytesPerSecond)}`}
             </span>
+          </div>
+          <div className="monitor-bar monitor-bar--network-divider" aria-hidden="true">
+            <span
+              className={`monitor-bar-fill ${netReady ? 'monitor-bar-fill--network' : ''}`}
+              style={{ width: netReady ? '100%' : '0%' }}
+            />
           </div>
           <Sparkline
             values={visibleHistory.map((item) => item.networkRxBytesPerSecond)}
