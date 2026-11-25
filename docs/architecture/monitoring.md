@@ -1,6 +1,6 @@
 # Live host monitoring
 
-Goal 03A samples a connected Linux host through the existing verified SSH transport. It installs no agent and exposes no generic command API. The operation allowlist contains fixed reads for `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, and the existing `LC_ALL=C df -Pk /` root-filesystem probe. Remote output is bounded to 64 KiB per command, parsed as untrusted data, and never written to application or audit logs.
+Goal 03A samples a connected Linux host through the existing verified SSH transport. It installs no agent and exposes no generic command API. The operation allowlist contains fixed reads for `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, `/proc/diskstats`, bounded `/sys/class/block/*` device metadata, and the existing `LC_ALL=C df -Pk /` root-filesystem probe. Remote output is bounded to 64 KiB per command, parsed as untrusted data, and never written to application or audit logs.
 
 ## Sampling and derivation
 
@@ -12,7 +12,9 @@ The aggregate `cpu ` row from `/proc/stat` supplies CPU counters. UBGOps sums `u
 
 RAM continues to use `MemAvailable`, with the documented older-kernel approximation from free, buffers, cache, reclaimable slab, and shared memory. Swap requires distinct `SwapTotal` and `SwapFree` fields; a real zero total means “Not configured.” Root-disk values reuse the bounded POSIX `df` parser.
 
-Network sampling parses at most 128 unique interface rows from `/proc/net/dev`. Names are at most 64 bytes and cannot contain whitespace or control characters. Each row must contain exactly the 16 Linux counters. Aggregate RX/TX excludes `lo` and uses checked sums. Rates divide checked byte deltas by monotonic elapsed time. A first observation, changed interface set, decreased counter, invalid elapsed interval, or overflow resets the aggregate network baseline instead of producing a negative or invented rate.
+Network sampling parses at most 128 unique interface rows from `/proc/net/dev`. Names are at most 64 bytes and cannot contain whitespace or control characters. Each row must contain exactly the 16 Linux counters. Aggregate RX/TX excludes `lo` and uses checked sums. Rates divide checked byte deltas by monotonic probe-to-probe elapsed time. A first observation, changed interface set, decreased counter, invalid elapsed interval, or overflow resets the aggregate network baseline instead of producing a negative or invented rate.
+
+Disk I/O sampling pairs fixed reads of `/proc/diskstats` (accepting standard kernel 14-, 18-, or 20-field rows where read/written sector fields are measured in 512-byte sectors) with a bounded `/sys/class/block/*` sysfs metadata probe (`dev`, `size`, `partition`, `dm/name`, `md`, `holders`, symlink target, vendor, and model, excluding `loop*`/`ram*`/`zram*`/`sr*`/`fd*`). It requires matching `(major, minor)` identities across procfs and sysfs, distinguishes `PhysicalDisk`, `VirtualDisk`, `Partition`, `DeviceMapper`, `MdRaid`, and `Unknown` layers without claiming virtualized disks are bare-metal hardware, and selects one unambiguous root-backing primary device (via `df -Pk /` or a single leaf non-partition device when `/` is non-block) rather than summing physical disks, partitions, and device-mapper layers together. Missing metadata, `(major, minor)` mismatch, ambiguous multi-disk mappings, primary device changes, zero intervals, or counter decreases fail closed to an unavailable or reset state without affecting CPU, memory, swap, root disk, or network observations.
 
 Individual parser or command failures become metric-specific warnings. A failed network read does not hide valid memory data. A transport/session failure rejects the observation. Missing values remain unavailable; valid zero rates remain zero.
 

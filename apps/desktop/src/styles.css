@@ -1240,7 +1240,7 @@ h1 {
 
 .monitor-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 9px;
 }
 
@@ -1372,6 +1372,11 @@ h1 {
   opacity: 0.72;
 }
 
+.monitor-bar-fill--diskio {
+  background: linear-gradient(90deg, var(--success) 0%, var(--warning) 100%);
+  opacity: 0.72;
+}
+
 .monitor-bar-fill--warn {
   background: linear-gradient(90deg, #d97706 0%, var(--warning) 100%);
 }
@@ -1384,12 +1389,48 @@ h1 {
   grid-column: auto;
 }
 
+.monitor-card-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.monitor-device-badge {
+  max-width: 96px;
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .monitor-network-rates {
   gap: 1px;
 }
 
+.monitor-network-rx {
+  color: var(--accent);
+}
+
 .monitor-network-tx {
   color: var(--accent-secondary);
+  font-size: 10.5px;
+  line-height: 1.2;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.monitor-diskio-read {
+  color: var(--success);
+}
+
+.monitor-diskio-write {
+  color: var(--warning);
   font-size: 10.5px;
   line-height: 1.2;
   font-weight: 600;
@@ -1407,7 +1448,8 @@ h1 {
   color: var(--accent);
 }
 
-.monitor-chart--blue {
+.monitor-chart--blue,
+.monitor-chart-series--blue {
   color: var(--accent-secondary);
 }
 
@@ -1415,8 +1457,17 @@ h1 {
   color: var(--accent-purple);
 }
 
-.monitor-chart--emerald {
+.monitor-chart--emerald,
+.monitor-chart-series--emerald {
   color: var(--success);
+}
+
+.monitor-chart-series--cyan {
+  color: var(--accent);
+}
+
+.monitor-chart-series--amber {
+  color: var(--warning);
 }
 
 .monitor-chart-midline {
@@ -3158,6 +3209,12 @@ input[type='checkbox'] {
     grid-template-columns: minmax(0, 1fr) minmax(265px, 340px) minmax(0, 1fr);
     padding: 6px 16px;
     gap: 10px;
+  }
+}
+
+@media (max-width: 1400px) {
+  .monitor-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 

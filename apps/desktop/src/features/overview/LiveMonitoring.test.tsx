@@ -30,6 +30,7 @@ function sample(overrides: Partial<HostMonitorSample> = {}): HostMonitorSample {
     rootUsedBytes: 25 * 1024 ** 3,
     networkRxBytesPerSecond: null,
     networkTxBytesPerSecond: null,
+    diskIo: null,
     warnings: [],
     ...overrides,
   };
@@ -70,7 +71,7 @@ describe('live monitoring lifecycle', () => {
       first.resolve(sample());
       await Promise.resolve();
     });
-    expect(screen.getAllByText('Warming up')).toHaveLength(2);
+    expect(screen.getAllByText('Warming up')).toHaveLength(3);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(MONITOR_INTERVAL_MS);
     });
@@ -107,7 +108,7 @@ describe('live monitoring lifecycle', () => {
       await Promise.resolve();
     });
     expect(screen.getByText('Not configured')).toBeInTheDocument();
-    expect(screen.getAllByText('Warming up')).toHaveLength(2);
+    expect(screen.getAllByText('Warming up')).toHaveLength(3);
     expect(mocks.sample).toHaveBeenLastCalledWith('host-a', SESSION_B);
     view.rerender(<LiveMonitoring hostId="host-b" hostSessionId={SESSION_B} connected visible />);
     await act(async () => {
@@ -171,16 +172,41 @@ describe('live monitoring lifecycle', () => {
     expect(mocks.sample).toHaveBeenCalledTimes(1);
   });
 
-  it('renders resource progress bars only for supported metrics without fabricating Disk I/O', async () => {
-    mocks.sample.mockResolvedValue(
-      sample({
-        cpuUsagePercent: 42.5,
-        swapTotalBytes: 2 * 1024 ** 3,
-        swapUsedBytes: 512 * 1024 ** 2,
-        networkRxBytesPerSecond: 1024,
-        networkTxBytesPerSecond: 2048,
-      }),
-    );
+  it('renders six live monitoring cards with dual-series network and real disk I/O states', async () => {
+    const firstSample = sample({
+      cpuUsagePercent: 42.5,
+      swapTotalBytes: 2 * 1024 ** 3,
+      swapUsedBytes: 512 * 1024 ** 2,
+      networkRxBytesPerSecond: 1024,
+      networkTxBytesPerSecond: 2048,
+      diskIo: {
+        primaryDevice: 'sda',
+        primaryKind: 'virtualDisk',
+        readBytesPerSecond: 4096,
+        writeBytesPerSecond: 0,
+        devices: [
+          {
+            name: 'sda',
+            major: 8,
+            minor: 0,
+            kind: 'virtualDisk',
+            isRootBacking: true,
+            readBytesPerSecond: 4096,
+            writeBytesPerSecond: 0,
+          },
+        ],
+      },
+    });
+    const gapSample = sample({
+      cpuUsagePercent: 45,
+      swapTotalBytes: 2 * 1024 ** 3,
+      swapUsedBytes: 512 * 1024 ** 2,
+      networkRxBytesPerSecond: null,
+      networkTxBytesPerSecond: null,
+      diskIo: null,
+      warnings: [{ code: 'discovery', message: 'disk I/O monitoring is unavailable.', hostKey: null }],
+    });
+    mocks.sample.mockResolvedValueOnce(firstSample).mockResolvedValueOnce(gapSample);
     render(<LiveMonitoring hostId="host-a" hostSessionId={SESSION_A} connected visible />);
     await act(async () => {
       await Promise.resolve();
@@ -204,7 +230,15 @@ describe('live monitoring lifecycle', () => {
     const labels = Array.from(document.querySelectorAll('.monitor-grid .metric-label')).map((el) =>
       el.textContent?.trim(),
     );
-    expect(labels).toEqual(['CPU', 'MEMORY', 'ROOT DISK', 'SWAP', 'NETWORK']);
-    expect(screen.queryByText(/disk i\/o/i)).not.toBeInTheDocument();
+    expect(labels).toEqual(['CPU', 'MEMORY', 'ROOT DISK', 'SWAP', 'NETWORK', 'DISK I/O']);
+    expect(screen.getByText('sda · Virtual')).toBeInTheDocument();
+    expect(screen.getByText('R 4 KiB/s')).toBeInTheDocument();
+    expect(screen.getByText('W 0 B/s')).toBeInTheDocument();
+    expect(document.querySelectorAll('[data-series-count="2"]')).toHaveLength(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(MONITOR_INTERVAL_MS);
+    });
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
   });
 });

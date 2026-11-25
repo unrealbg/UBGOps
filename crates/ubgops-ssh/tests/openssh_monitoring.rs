@@ -59,6 +59,7 @@ async fn openssh_monitoring_interoperability() {
         ubgops_discovery::derive_sample(host.id, host_session_id, first, None, None);
     assert!(first.cpu_usage_percent.is_none());
     assert!(first.network_rx_bytes_per_second.is_none());
+    assert!(first.disk_io.is_none());
     assert!(first.memory_total_bytes.is_some() && first.swap_total_bytes.is_some());
     assert!(first.root_total_bytes.is_some());
 
@@ -85,7 +86,16 @@ async fn openssh_monitoring_interoperability() {
             .network_tx_bytes_per_second
             .is_some_and(|value| value >= 0.0)
     );
-    assert!(second.warnings.is_empty(), "fixture monitoring warnings");
+    let disk_io = second.disk_io.as_ref().expect("Disk I/O sample");
+    assert!(disk_io.primary_device.is_some());
+    assert!(disk_io.read_bytes_per_second.is_finite() && disk_io.read_bytes_per_second >= 0.0);
+    assert!(disk_io.write_bytes_per_second.is_finite() && disk_io.write_bytes_per_second >= 0.0);
+    assert!(!disk_io.devices.is_empty());
+    assert!(
+        second.warnings.is_empty(),
+        "fixture monitoring warnings: {:?}",
+        second.warnings
+    );
 
     session.disconnect().await.expect("disconnect");
     let error = ubgops_discovery::observe_monitor(session.as_ref(), CancellationToken::new())

@@ -143,24 +143,51 @@ const cpuCurve = [34.2, 41.8, 38.5, 49.4, 53.1, 46.7, 58.2, 44.6];
 const memCurve = [4.1, 4.3, 4.6, 4.5, 4.9, 5.1, 4.8, 5.0];
 const rxCurve = [420_000, 780_000, 610_000, 1_240_000, 950_000, 1_480_000, 890_000, 1_120_000];
 const txCurve = [190_000, 310_000, 275_000, 540_000, 480_000, 620_000, 410_000, 490_000];
+const diskReadCurve = [2_400_000, 6_800_000, 4_200_000, 12_400_000, 5_600_000, 9_100_000, 3_800_000, 7_400_000];
+const diskWriteCurve = [950_000, 2_100_000, 1_650_000, 4_800_000, 2_900_000, 5_300_000, 1_900_000, 3_400_000];
 
 monitorApi.sample = async (hostId, hostSessionId): Promise<HostMonitorSample> => {
   const idx = sampleStep % cpuCurve.length;
   sampleStep += 1;
+  const warnings =
+    mode === 'diskio-unavailable'
+      ? [{ code: 'discovery' as const, message: 'disk I/O monitoring is unavailable.', hostKey: null }]
+      : [];
+  const diskIo =
+    mode === 'diskio-unavailable' || mode === 'diskio-warming'
+      ? null
+      : {
+          primaryDevice: 'sdd',
+          primaryKind: 'virtualDisk' as const,
+          readBytesPerSecond: diskReadCurve[idx]!,
+          writeBytesPerSecond: diskWriteCurve[idx]!,
+          devices: [
+            {
+              name: 'sdd',
+              major: 8,
+              minor: 48,
+              kind: 'virtualDisk' as const,
+              isRootBacking: true,
+              readBytesPerSecond: diskReadCurve[idx]!,
+              writeBytesPerSecond: diskWriteCurve[idx]!,
+            },
+          ],
+        };
   return {
     hostId,
     hostSessionId,
     observedAt: new Date().toISOString(),
-    cpuUsagePercent: cpuCurve[idx]!,
+    cpuUsagePercent: mode === 'diskio-warming' ? null : cpuCurve[idx]!,
     memoryTotalBytes: 8 * 1024 ** 3,
     memoryUsedBytes: Math.round(memCurve[idx]! * 1024 ** 3),
     swapTotalBytes: 2 * 1024 ** 3,
     swapUsedBytes: Math.round((0.18 + (idx % 3) * 0.04) * 1024 ** 3),
     rootTotalBytes: 100 * 1024 ** 3,
     rootUsedBytes: Math.round((32.4 + (idx % 4) * 0.3) * 1024 ** 3),
-    networkRxBytesPerSecond: rxCurve[idx]!,
-    networkTxBytesPerSecond: txCurve[idx]!,
-    warnings: [],
+    networkRxBytesPerSecond: mode === 'diskio-warming' ? null : rxCurve[idx]!,
+    networkTxBytesPerSecond: mode === 'diskio-warming' ? null : txCurve[idx]!,
+    diskIo,
+    warnings,
   };
 };
 

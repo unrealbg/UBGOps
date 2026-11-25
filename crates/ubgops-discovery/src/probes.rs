@@ -48,6 +48,8 @@ impl HostProbe for LinuxProbe {
             }
             ReadOnlyCommand::CpuStat
             | ReadOnlyCommand::NetworkDevices
+            | ReadOnlyCommand::DiskStats
+            | ReadOnlyCommand::BlockDeviceMetadata
             | ReadOnlyCommand::ListeningPorts
             | ReadOnlyCommand::DnsConfiguration
             | ReadOnlyCommand::NetworkRoutesV4

@@ -110,6 +110,7 @@ export function useHostMonitoring({ hostId, hostSessionId, connected, visible }:
   const memoryUnavailable = metricWarning(sample, 'memory');
   const swapUnavailable = metricWarning(sample, 'swap');
   const diskUnavailable = metricWarning(sample, 'root filesystem');
+  const diskIoUnavailable = metricWarning(sample, 'disk i/o');
   const memoryPercent = percentage(
     sample?.memoryUsedBytes ?? null,
     sample?.memoryTotalBytes ?? null,
@@ -118,5 +119,5 @@ export function useHostMonitoring({ hostId, hostSessionId, connected, visible }:
   const diskPercent = percentage(sample?.rootUsedBytes ?? null, sample?.rootTotalBytes ?? null);
 
   return { visibleHistory, error, sample, age, freshness, cpuUnavailable, networkUnavailable,
-    memoryUnavailable, swapUnavailable, diskUnavailable, memoryPercent, swapPercent, diskPercent };
+    memoryUnavailable, swapUnavailable, diskUnavailable, diskIoUnavailable, memoryPercent, swapPercent, diskPercent };
 }

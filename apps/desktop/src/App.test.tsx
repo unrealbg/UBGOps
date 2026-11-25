@@ -62,7 +62,7 @@ beforeEach(() => {
   vi.mocked(monitorApi.sample).mockReset().mockImplementation(async (hostId, hostSessionId) => ({
     hostId, hostSessionId, observedAt: new Date().toISOString(), cpuUsagePercent: null,
     memoryUsedBytes: null, memoryTotalBytes: null, rootUsedBytes: null, rootTotalBytes: null,
-    swapUsedBytes: null, swapTotalBytes: null, networkRxBytesPerSecond: null, networkTxBytesPerSecond: null, warnings: [],
+    swapUsedBytes: null, swapTotalBytes: null, networkRxBytesPerSecond: null, networkTxBytesPerSecond: null, diskIo: null, warnings: [],
   }));
   vi.mocked(securityApi.get).mockResolvedValue({
     hostId: host.id,

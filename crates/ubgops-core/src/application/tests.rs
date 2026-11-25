@@ -134,6 +134,13 @@ impl RemoteSession for TestSession {
                 let sample = self.monitor_counter.load(Ordering::SeqCst).saturating_sub(1) as u64;
                 return Ok(format!("Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n lo: 10 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0\n eth0: {} 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0\n", 1000 + sample * 500, 2000 + sample * 1000));
             }
+            ReadOnlyCommand::DiskStats => {
+                let sample = self.monitor_counter.load(Ordering::SeqCst).saturating_sub(1) as u64;
+                return Ok(format!("   8       0 sda 10 0 {} 0 20 0 {} 0 0 0 0 0 0 0 0 0 0\n", 1000 + sample * 20, 2000 + sample * 40));
+            }
+            ReadOnlyCommand::BlockDeviceMetadata => {
+                "sda\t8:0\t16777216\t0\t0\t\t0\t0\t../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sda\tMsft\tVirtual Disk\n"
+            }
             ReadOnlyCommand::SystemJournal => {
                 if self.logs.stall.load(Ordering::SeqCst) {
                     self.logs.entered.add_permits(1);
@@ -2259,6 +2266,17 @@ async fn disconnect_cancels_delayed_monitoring_and_reconnect_resets_baseline() {
             .cpu_usage_percent
             .is_none()
     );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second_sample = app
+        .sample_host_monitor(host.id, new_session)
+        .await
+        .expect("second sample after reconnect");
+    let disk_io = second_sample.disk_io.expect("disk I/O rate after baseline");
+    assert_eq!(disk_io.primary_device.as_deref(), Some("sda"));
+    assert_eq!(disk_io.primary_kind, DiskDeviceKind::VirtualDisk);
+    assert!(disk_io.read_bytes_per_second > 0.0);
+    assert!(disk_io.write_bytes_per_second > 0.0);
+    assert!(second_sample.warnings.is_empty());
     app.delete_host(host.id).await.expect("delete");
     assert!(!app.monitor_baselines.lock().await.contains_key(&host.id));
     assert!(!app.monitor_gates.lock().await.contains_key(&host.id));

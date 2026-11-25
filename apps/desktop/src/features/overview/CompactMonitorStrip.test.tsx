@@ -16,7 +16,7 @@ function sample(overrides: Partial<HostMonitorSample> = {}): HostMonitorSample {
   return { hostId: 'host-a', hostSessionId: 'session-a', observedAt: new Date().toISOString(),
     cpuUsagePercent: 0, memoryUsedBytes: 0, memoryTotalBytes: 100,
     rootUsedBytes: 0, rootTotalBytes: 100, swapUsedBytes: 0, swapTotalBytes: 0,
-    networkRxBytesPerSecond: 0, networkTxBytesPerSecond: 0, warnings: [], ...overrides };
+    networkRxBytesPerSecond: 0, networkTxBytesPerSecond: 0, diskIo: null, warnings: [], ...overrides };
 }
 async function flush() { await act(async () => { await Promise.resolve(); }); }
 async function advance(ms: number) { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); }
