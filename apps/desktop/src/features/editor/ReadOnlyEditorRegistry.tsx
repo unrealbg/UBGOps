@@ -10,7 +10,7 @@ import {
 } from 'react';
 import type { SftpSessionInfo, TextNewline } from '@ubgops/protocol';
 import { applicationError, filesApi } from '../../api/client';
-import { detectRemoteFileLanguage } from './languageDetection';
+import { detectRemoteFileLanguage, getLanguageById } from './languageDetection';
 
 export const MAX_READONLY_DOCUMENTS = 8;
 export const MAX_READONLY_BYTES = 1_048_576;
@@ -70,6 +70,7 @@ interface RegistryApi {
   ) => Promise<ReadOnlyDocumentTab | null>;
   readonly cancelOpen: (hostId: string, requestId: string) => Promise<void>;
   readonly selectDocument: (hostId: string, documentId: string) => void;
+  readonly setDocumentLanguage: (documentId: string, languageId: string) => void;
   readonly closeDocument: (documentId: string) => void;
   readonly closeHostDocuments: (hostId: string) => void;
   readonly clearHostError: (hostId: string) => void;
@@ -154,6 +155,21 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
 
   const selectDocument = useCallback((hostId: string, documentId: string) => {
     setActiveByHost((current) => ({ ...current, [hostId]: documentId }));
+  }, []);
+
+  const setDocumentLanguage = useCallback((documentId: string, languageId: string) => {
+    const resolved = getLanguageById(languageId);
+    let changed = false;
+    const nextDocs = documentsRef.current.map((doc) => {
+      if (doc.id !== documentId) return doc;
+      if (doc.languageId === resolved.id && doc.languageLabel === resolved.label) return doc;
+      changed = true;
+      return { ...doc, languageId: resolved.id, languageLabel: resolved.label };
+    });
+    if (changed) {
+      documentsRef.current = nextDocs;
+      setDocuments(nextDocs);
+    }
   }, []);
 
   const closeDocument = useCallback((documentId: string) => {
@@ -394,6 +410,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       openDocument,
       cancelOpen,
       selectDocument,
+      setDocumentLanguage,
       closeDocument,
       closeHostDocuments,
       clearHostError,
@@ -408,6 +425,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       openDocument,
       cancelOpen,
       selectDocument,
+      setDocumentLanguage,
       closeDocument,
       closeHostDocuments,
       clearHostError,

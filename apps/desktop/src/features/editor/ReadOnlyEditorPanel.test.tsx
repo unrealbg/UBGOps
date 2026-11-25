@@ -9,7 +9,7 @@ import {
   registerReadOnlyModelDisposer,
   useReadOnlyEditor,
 } from './ReadOnlyEditorRegistry';
-import { ReadOnlyEditorPanel } from './ReadOnlyEditorPanel';
+import { ReadOnlyEditorPanel, type QuickOpenRemoteFile } from './ReadOnlyEditorPanel';
 
 vi.mock('./MonacoViewerSurface', () => ({
   default: ({
@@ -67,7 +67,17 @@ function makeSession(hostId: string, hostSessionId: string, sftpId: string): Sft
   };
 }
 
-function Harness({ hostId }: { hostId: string }) {
+function Harness({
+  hostId,
+  availableFiles,
+  focused = false,
+  onToggleFocus,
+}: {
+  hostId: string;
+  availableFiles?: readonly QuickOpenRemoteFile[];
+  focused?: boolean;
+  onToggleFocus?: () => void;
+}) {
   const registry = useReadOnlyEditor();
   const hostTabs = registry.documents.filter((doc) => doc.hostId === hostId);
   const activeTab =
@@ -80,6 +90,12 @@ function Harness({ hostId }: { hostId: string }) {
         onClick={() => void registry.openDocument(makeSession(hostId, `sess-${hostId}`, `sftp-${hostId}`), '/etc/shared.conf')}
       >
         Open shared on {hostId}
+      </button>
+      <button
+        type="button"
+        onClick={() => void registry.openDocument(makeSession(hostId, `sess-${hostId}`, `sftp-${hostId}`), '/srv/app/Program.cs')}
+      >
+        Open Program.cs on {hostId}
       </button>
       <button
         type="button"
@@ -111,11 +127,19 @@ function Harness({ hostId }: { hostId: string }) {
         pendingOpens={registry.pendingOpens.filter((item) => item.hostId === hostId)}
         error={registry.errorsByHost[hostId] ?? null}
         onSelectTab={(id) => registry.selectDocument(hostId, id)}
+        onChangeLanguage={registry.setDocumentLanguage}
         onCloseTab={(id) => registry.closeDocument(id)}
         onCloseAllHostTabs={() => registry.closeHostDocuments(hostId)}
         onCancelPending={(id) => void registry.cancelOpen(hostId, id)}
         onDismissError={() => registry.clearHostError(hostId)}
         onBrowseFiles={vi.fn()}
+        focused={focused}
+        onToggleFocus={onToggleFocus}
+        availableFiles={availableFiles}
+        currentDirectoryPath="/srv/app"
+        onOpenFile={(path) => {
+          void registry.openDocument(makeSession(hostId, `sess-${hostId}`, `sftp-${hostId}`), path);
+        }}
       />
     </div>
   );
@@ -260,5 +284,58 @@ describe('ReadOnlyEditorRegistry and ReadOnlyEditorPanel', () => {
     });
 
     expect(screen.queryByTestId('mock-monaco-surface')).not.toBeInTheDocument();
+  });
+
+  it('auto-detects Program.cs as C#, allows manual Plain Text override, opens additional files via + without duplicating models, and toggles Focus', async () => {
+    const toggleFocus = vi.fn();
+    const files: QuickOpenRemoteFile[] = [
+      {
+        name: 'Program.cs',
+        displayName: 'Program.cs',
+        path: '/srv/app/Program.cs',
+        sizeBytes: '42',
+      },
+      {
+        name: 'very-long-configuration-filename-for-overflow-verification.nginx',
+        displayName: 'very-long-configuration-filename-for-overflow-verification.nginx',
+        path: '/srv/app/very-long-configuration-filename-for-overflow-verification.nginx',
+        sizeBytes: '42',
+      },
+    ];
+
+    render(
+      <ReadOnlyEditorProvider>
+        <Harness hostId="host-a" availableFiles={files} focused={false} onToggleFocus={toggleFocus} />
+      </ReadOnlyEditorProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open Program.cs on host-a' }));
+    const surface = await screen.findByTestId('mock-monaco-surface');
+    expect(surface).toHaveAttribute('data-language', 'csharp');
+
+    const selector = screen.getByRole('combobox', { name: 'Language mode' });
+    expect(selector).toHaveValue('csharp');
+    await userEvent.selectOptions(selector, 'plaintext');
+    expect(screen.getByTestId('mock-monaco-surface')).toHaveAttribute('data-language', 'plaintext');
+    expect(filesApi.openReadOnly).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open another remote file' }));
+    await userEvent.click(screen.getByRole('button', { name: /very-long-configuration-filename-for-overflow-verification\.nginx/ }));
+    await waitFor(() => expect(filesApi.openReadOnly).toHaveBeenCalledTimes(2));
+
+    const longTab = screen.getByRole('tab', { name: /very-long-configuration-filename/ });
+    expect(longTab).toHaveAttribute('aria-selected', 'true');
+    expect(longTab).toHaveAttribute('title', '/srv/app/very-long-configuration-filename-for-overflow-verification.nginx');
+    const csharpTab = screen.getByRole('tab', { name: /Program\.cs/ });
+    expect(csharpTab).toHaveAttribute('aria-selected', 'false');
+
+    // Opening an already open file selects its existing tab instead of fetching/duplicating the model.
+    await userEvent.click(screen.getByRole('button', { name: 'Open another remote file' }));
+    await userEvent.click(screen.getByRole('button', { name: /Program\.cs.*Already open/ }));
+    expect(filesApi.openReadOnly).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('tab', { name: /Program\.cs/ })).toHaveAttribute('aria-selected', 'true');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(toggleFocus).toHaveBeenCalledOnce();
   });
 });

@@ -53,12 +53,15 @@ function SshWorkspace({
   terminalVisited,
   filesVisited,
   focused,
+  editorFocused = false,
   embedded = false,
   showCompactMonitor = false,
   monitoringOpen = false,
   monitoringSlot,
   onToggleMonitoring,
   onToggleFocus,
+  onToggleEditorFocus,
+  onExitEditorFocus,
   onShowOverview,
   onShowFiles,
 }: {
@@ -67,12 +70,15 @@ function SshWorkspace({
   terminalVisited: boolean;
   filesVisited: boolean;
   focused: boolean;
+  editorFocused?: boolean;
   embedded?: boolean;
   showCompactMonitor?: boolean;
   monitoringOpen?: boolean;
   monitoringSlot?: ReactNode;
   onToggleMonitoring?: () => void;
   onToggleFocus: () => void;
+  onToggleEditorFocus?: () => void;
+  onExitEditorFocus?: () => void;
   onShowOverview: () => void;
   onShowFiles: () => void;
 }) {
@@ -198,6 +204,9 @@ function SshWorkspace({
               host={host}
               visible={filesVisible}
               presentation={mode === 'files' ? 'full' : 'compact'}
+              editorFocused={mode === 'files' && editorFocused}
+              onToggleEditorFocus={onToggleEditorFocus}
+              onExitEditorFocus={onExitEditorFocus}
               onShowFull={onShowFiles}
               onShowOverview={onShowOverview}
             />
@@ -327,6 +336,7 @@ function AppShellContent({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [terminalFocus, setTerminalFocus] = useState(false);
+  const [editorFocus, setEditorFocus] = useState(false);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
   const [terminalMonitoringOpen, setTerminalMonitoringOpen] = useState(initialTerminalMonitoring);
 
@@ -340,8 +350,9 @@ function AppShellContent({
   const activeTerminalFocus = Boolean(
     terminalFocus && selectedHost && (section === 'terminal' || overviewUnifiedMode),
   );
+  const activeEditorFocus = Boolean(editorFocus && selectedHost && section === 'files');
   const terminalViewportLocked = Boolean(
-    selectedHost && (section === 'terminal' || overviewUnifiedMode),
+    selectedHost && (section === 'terminal' || section === 'files' || overviewUnifiedMode),
   );
 
   useEffect(() => {
@@ -368,6 +379,7 @@ function AppShellContent({
     if (overviewUnifiedMode && selectedHost) visitTerminal(selectedHost);
     select(id);
     setSystemInfoOpen(false);
+    setEditorFocus(false);
     const host = hosts.find((candidate) => candidate.id === id);
     if (!host) {
       setTerminalFocus(false);
@@ -383,6 +395,7 @@ function AppShellContent({
     if (overviewUnifiedMode && selectedHost) visitTerminal(selectedHost);
     setSection(next);
     if (next !== 'overview') setSystemInfoOpen(false);
+    if (next !== 'files') setEditorFocus(false);
     if (next !== 'terminal' && !(next === 'overview' && isSelectedConnected)) {
       setTerminalFocus(false);
     }
@@ -430,7 +443,7 @@ function AppShellContent({
 
   return (
     <div
-      className={`app-shell ${terminalViewportLocked ? 'app-shell--viewport-locked' : ''} ${activeTerminalFocus ? 'app-shell--terminal-focus' : ''}`}
+      className={`app-shell ${terminalViewportLocked ? 'app-shell--viewport-locked' : ''} ${activeTerminalFocus ? 'app-shell--terminal-focus' : ''} ${activeEditorFocus ? 'app-shell--editor-focus' : ''}`}
     >
       <a className="skip-link" href="#main-content">
         Skip to main content
@@ -568,6 +581,7 @@ function AppShellContent({
                 terminalVisited={terminalHosts.includes(id) || hostUnified}
                 filesVisited={fileHosts.includes(id)}
                 focused={activeTerminalFocus && isSelected}
+                editorFocused={activeEditorFocus && isSelected}
                 embedded={hostUnified}
                 showCompactMonitor={false}
                 monitoringOpen={terminalMonitoringOpen}
@@ -585,6 +599,8 @@ function AppShellContent({
                 }
                 onToggleMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
                 onToggleFocus={() => setTerminalFocus((current) => !current)}
+                onToggleEditorFocus={() => setEditorFocus((current) => !current)}
+                onExitEditorFocus={() => setEditorFocus(false)}
                 onShowOverview={() => selectSection('overview')}
                 onShowFiles={() => selectSection('files')}
               />
@@ -649,6 +665,7 @@ function AppShellContent({
         activeSection={section}
         sidebarCollapsed={sidebarCollapsed}
         terminalFocus={activeTerminalFocus}
+        editorFocus={activeEditorFocus}
         unifiedConnected={overviewUnifiedMode}
         systemInfoOpen={systemInfoOpen}
         terminalMonitoringOpen={terminalMonitoringOpen}
@@ -657,6 +674,7 @@ function AppShellContent({
         onAddHost={() => setDialog({ type: 'add' })}
         onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
         onToggleTerminalFocus={() => setTerminalFocus((current) => !current)}
+        onToggleEditorFocus={() => setEditorFocus((current) => !current)}
         onToggleSystemInfo={() => setSystemInfoOpen((current) => !current)}
         onToggleTerminalMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
       />

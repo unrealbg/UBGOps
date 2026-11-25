@@ -930,4 +930,107 @@ describe('workspace flows', () => {
     expect(screen.queryByTestId('mock-monaco-surface')).not.toBeInTheDocument();
     expect(client.getQueryCache().getAll().some((q) => JSON.stringify(q.state).includes('app-ro-1'))).toBe(false);
   });
+
+  it('toggles Editor Focus from viewer and Command Palette cleanly while keeping active PTY intact', async () => {
+    vi.mocked(hostApi.list).mockResolvedValue([host]);
+    vi.mocked(hostApi.session).mockResolvedValue(connected);
+    vi.mocked(terminalApi.open).mockImplementation(async (id, size) => ({
+      id: `${id}-pty`,
+      hostId: id,
+      hostSessionId: connected.hostSessionId!,
+      label: 'Shell',
+      size,
+      state: 'open',
+      error: null,
+    }));
+    vi.mocked(filesApi.open).mockImplementation(async (id) => ({
+      id: `${id}-sftp`,
+      hostId: id,
+      hostSessionId: connected.hostSessionId!,
+      protocolVersion: 3,
+      rootPath: '/synthetic',
+      extensions: [],
+      limits: {
+        maxPacketBytes: '262144',
+        maxReadBytes: '65536',
+        maxWriteBytes: '65536',
+        maxOpenHandles: '64',
+        clientChunkBytes: '65536',
+        listingEntryCap: 5000,
+      },
+    }));
+    vi.mocked(filesApi.list).mockImplementation(async (session, path) => ({
+      hostId: session.hostId,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path,
+      partial: false,
+      entryCap: 5000,
+      entries: [
+        {
+          name: 'Program.cs',
+          displayName: 'Program.cs',
+          path: `${path}/Program.cs`,
+          kind: 'file',
+          sizeBytes: '24',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+      ],
+    }));
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'app-focus-ro-1',
+      hostId: host.id,
+      hostSessionId: connected.hostSessionId!,
+      sftpSessionId: `${host.id}-sftp`,
+      path: '/synthetic/Program.cs',
+      displayName: '/synthetic/Program.cs',
+      text: 'class Program {}\n',
+      originalBytes: 17,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+
+    const view = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+          })
+        }
+      >
+        <App />
+      </QueryClientProvider>,
+    );
+    const shellRoot = view.container.querySelector('.app-shell')!;
+    await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    await userEvent.click(screen.getByRole('button', { name: 'Terminal' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Open terminal' }));
+    const ptyInput = await screen.findByRole('textbox', { name: 'Synthetic Shell' });
+    await userEvent.type(ptyInput, ' focus-ok');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Files' }));
+    await screen.findByDisplayValue('/synthetic');
+    await userEvent.click(screen.getByRole('button', { name: 'View' }));
+    await screen.findByTestId('mock-monaco-surface');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(shellRoot).toHaveClass('app-shell--editor-focus');
+
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const palette = screen.getByRole('dialog', { name: 'Command palette' });
+    await userEvent.click(within(palette).getByRole('option', { name: /Exit editor focus mode/i }));
+    expect(shellRoot).not.toHaveClass('app-shell--editor-focus');
+
+    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: 'Terminal' }));
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback focus-ok',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+  });
 });

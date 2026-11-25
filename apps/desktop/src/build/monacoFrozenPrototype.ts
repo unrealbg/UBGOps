@@ -38,6 +38,12 @@ export const MONACO_PROTOTYPE_PATCHES: readonly MonacoPrototypePatch[] = [
     replacement:
       'Object.defineProperty(InlineSuggestAlternativeAction, "toString", { value: toString, writable: true, configurable: true });',
   },
+  {
+    suffix: '/monaco-editor/esm/vs/editor/standalone/common/monarch/monarchCompile.js',
+    target: 'result[e] = true;',
+    replacement:
+      'Object.defineProperty(result, e, { value: true, enumerable: true, writable: true, configurable: true });',
+  },
 ];
 
 export function verifyInstalledMonacoVersion(
@@ -81,7 +87,7 @@ export function applyPinnedMonacoPrototypePatch(source: string, id: string): str
   const occurrences = source.split(patch.target).length - 1;
   if (occurrences !== 1) {
     throw new Error(
-      `Expected one pinned Monaco toString assignment in ${patch.suffix}, found ${occurrences}.`,
+      `Expected one pinned Monaco frozen-prototype assignment in ${patch.suffix}, found ${occurrences}.`,
     );
   }
   // Tauri freezes Object.prototype. Define own namespace toString without

@@ -791,4 +791,73 @@ describe('Files workspace boundaries', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Browse files' }));
     await screen.findByRole('button', { name: 'Open viewer (1)' });
   });
+
+  it('omits empty Transfer queue chrome, supports opening additional files via +, and shows active transfers when queued', async () => {
+    vi.mocked(filesApi.openReadOnly).mockImplementation(async (ownerSession, _reqId, path) => ({
+      id: `doc-${path}`,
+      hostId: host.id,
+      hostSessionId: ownerSession.hostSessionId,
+      sftpSessionId: ownerSession.id,
+      path,
+      displayName: path,
+      text: path.endsWith('.cs') ? 'Console.WriteLine("ok");\n' : 'worker_processes auto;\n',
+      originalBytes: 24,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    }));
+
+    vi.mocked(filesApi.list).mockResolvedValueOnce({
+      hostId: host.id,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path: '/home/test',
+      partial: false,
+      entryCap: 5000,
+      entries: [
+        {
+          name: 'Program.cs',
+          displayName: 'Program.cs',
+          path: '/home/test/Program.cs',
+          kind: 'file',
+          sizeBytes: '24',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+        {
+          name: 'nginx.conf',
+          displayName: 'nginx.conf',
+          path: '/home/test/nginx.conf',
+          kind: 'file',
+          sizeBytes: '23',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+      ],
+    });
+
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+    expect(screen.queryByRole('region', { name: 'Transfer queue' })).not.toBeInTheDocument();
+
+    const rowProgram = (await screen.findByText(/Program\.cs/)).closest('tr')!;
+    await userEvent.click(within(rowProgram).getByRole('button', { name: 'View' }));
+    await screen.findByTestId('mock-monaco-surface');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open another remote file' }));
+    await userEvent.click(screen.getByRole('button', { name: /nginx\.conf/ }));
+    await waitFor(() => expect(filesApi.openReadOnly).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('2 / 8 open')).toBeInTheDocument();
+
+    // Browse directories… preserves all opened tabs.
+    await userEvent.click(screen.getByRole('button', { name: 'Open another remote file' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Browse directories…' }));
+    await screen.findByRole('button', { name: 'Open viewer (2)' });
+  });
 });

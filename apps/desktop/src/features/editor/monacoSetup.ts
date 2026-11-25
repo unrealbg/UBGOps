@@ -26,11 +26,17 @@ import 'monaco-editor/editor/contrib/wordOperations/browser/wordOperations';
 
 // Curated infrastructure & systems Monarch grammars (no TS/CSS/HTML language-server workers)
 import 'monaco-editor/languages/definitions/cpp/register';
+import 'monaco-editor/languages/definitions/csharp/register';
+import 'monaco-editor/languages/definitions/css/register';
 import 'monaco-editor/languages/definitions/dockerfile/register';
+import 'monaco-editor/languages/definitions/go/register';
 import 'monaco-editor/languages/definitions/hcl/register';
+import 'monaco-editor/languages/definitions/html/register';
 import 'monaco-editor/languages/definitions/ini/register';
+import 'monaco-editor/languages/definitions/java/register';
 import 'monaco-editor/languages/definitions/javascript/register';
 import 'monaco-editor/languages/definitions/markdown/register';
+import 'monaco-editor/languages/definitions/php/register';
 import 'monaco-editor/languages/definitions/powershell/register';
 import 'monaco-editor/languages/definitions/python/register';
 import 'monaco-editor/languages/definitions/rust/register';
@@ -44,6 +50,7 @@ import * as jsonFeature from 'monaco-editor/languages/features/json/register';
 import * as monaco from 'monaco-editor/editor/editor.api';
 import EditorWorker from 'monaco-editor/editor/editor.worker?worker';
 import JsonWorker from 'monaco-editor/languages/features/json/json.worker?worker';
+import { registerCustomInfraLanguages } from './customGrammars';
 import { registerTomlLanguage } from './tomlGrammar';
 
 export const UBGOPS_MONACO_THEME = 'ubgops-neon-cyan';
@@ -72,6 +79,7 @@ export function ensureMonacoConfigured(): void {
   };
 
   registerTomlLanguage(monaco);
+  registerCustomInfraLanguages(monaco);
 
   // Strictly offline JSON worker: allow local syntax diagnostics/folding/selection only;
   // disable external schema fetches and Markdown hover/completion UI.
@@ -101,9 +109,16 @@ export function ensureMonacoConfigured(): void {
       { token: 'comment', foreground: '829AB5', fontStyle: 'italic' },
       { token: 'keyword', foreground: '22D3EE' },
       { token: 'string', foreground: '35D994' },
+      { token: 'string.value.json', foreground: '35D994' },
+      { token: 'string.key.json', foreground: 'E9F1FB' },
       { token: 'number', foreground: 'FCD34D' },
       { token: 'type', foreground: '249CF3' },
       { token: 'type.identifier', foreground: '249CF3' },
+      { token: 'tag', foreground: '22D3EE' },
+      { token: 'metatag', foreground: '22D3EE' },
+      { token: 'attribute.name', foreground: '93C5FD' },
+      { token: 'attribute.value', foreground: '35D994' },
+      { token: 'variable', foreground: 'F59E0B' },
       { token: 'key', foreground: 'E9F1FB' },
       { token: 'delimiter', foreground: 'A1B6CE' },
     ],

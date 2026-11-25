@@ -31,6 +31,9 @@ export function FilesWorkspace(props: {
   visible: boolean;
   onShowOverview: () => void;
   presentation?: 'full' | 'compact';
+  editorFocused?: boolean;
+  onToggleEditorFocus?: () => void;
+  onExitEditorFocus?: () => void;
   onShowFull?: () => void;
 }) {
   const outerRegistry = useOptionalReadOnlyEditor();
@@ -44,9 +47,24 @@ export function FilesWorkspace(props: {
   );
 }
 
-function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'full', onShowFull }: {
-  host: Host; visible: boolean; onShowOverview: () => void;
-  presentation?: 'full' | 'compact'; onShowFull?: () => void;
+function FilesWorkspaceInner({
+  host,
+  visible,
+  onShowOverview,
+  presentation = 'full',
+  editorFocused = false,
+  onToggleEditorFocus,
+  onExitEditorFocus,
+  onShowFull,
+}: {
+  host: Host;
+  visible: boolean;
+  onShowOverview: () => void;
+  presentation?: 'full' | 'compact';
+  editorFocused?: boolean;
+  onToggleEditorFocus?: () => void;
+  onExitEditorFocus?: () => void;
+  onShowFull?: () => void;
 }) {
   const registry = useReadOnlyEditor();
   const connection = useHostSession(host.id);
@@ -58,6 +76,7 @@ function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'fu
   const historyRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [focusTransfersExpanded, setFocusTransfersExpanded] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState('');
   const [showHidden, setShowHidden] = useState(false);
@@ -443,8 +462,22 @@ function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'fu
   const hostViewerError = registry.errorsByHost[host.id] ?? null;
   const activeHostTab =
     hostTabs.find((doc) => doc.id === registry.activeByHost[host.id]) ?? hostTabs[0] ?? null;
+  const availableViewerFiles = useMemo(
+    () =>
+      (listing?.entries ?? [])
+        .filter((entry) => entry.kind === 'file')
+        .map((entry) => ({
+          name: entry.name,
+          displayName: entry.displayName,
+          path: entry.path,
+          sizeBytes: entry.sizeBytes,
+        })),
+    [listing],
+  );
   const showReadOnlyViewer =
     !compact && !editor && viewerOpen && (hostTabs.length > 0 || hostPending.length > 0 || hostViewerError !== null);
+  const viewerFocusedNow = showReadOnlyViewer && editorFocused;
+  const showTransfersQueue = transfers.length > 0 && (!viewerFocusedNow || focusTransfersExpanded);
 
   const maxVisibleCrumbs = compact ? 4 : 6;
   const shouldCollapseCrumbs = breadcrumbs.length > maxVisibleCrumbs;
@@ -454,20 +487,28 @@ function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'fu
 
   return (
     <section
-      className={`files-workspace ${compact ? 'files-workspace--compact' : ''}`}
+      className={`files-workspace ${compact ? 'files-workspace--compact' : ''} ${showReadOnlyViewer ? 'files-workspace--viewer' : ''}`}
       aria-label={`Files on ${host.displayName}`}
       hidden={!visible}
       onKeyDown={handleWorkspaceKeyDown}
     >
-      <div className="files-controls">
+      {!viewerFocusedNow && (
+      <div className={`files-controls ${showReadOnlyViewer ? 'files-controls--viewer' : ''}`}>
       <header className="files-heading">
         <div><div className="eyebrow">SFTP WORKSPACE</div><h1>{host.displayName} files</h1></div>
+        {showReadOnlyViewer && currentPath && (
+          <span className="files-viewer-path mono" title={currentPath}>
+            {currentPath}
+          </span>
+        )}
         <div className="files-session">{sftp ? `SFTP v${sftp.protocolVersion}` : connected ? 'Opening SFTP…' : 'Disconnected'}</div>
         {compact && <Button onClick={onShowFull}>Open full Files view</Button>}
       </header>
       {!connected && <Notice>Connect this host to browse files. {listing && 'The visible listing is stale and mutations are disabled.'}<div className="notice-action"><Button onClick={onShowOverview}>Open overview</Button></div></Notice>}
       {(stale || (!!listing && !ownsConnection)) && connected && <Notice>This listing belongs to an old connection and is read-only until refresh completes.</Notice>}
       {error && <Notice>{error}</Notice>}
+      {!showReadOnlyViewer && (
+        <>
       <div className="files-toolbar" aria-label="File navigation">
         <div className="files-nav-group" role="group" aria-label="Directory navigation">
           <button
@@ -629,7 +670,10 @@ function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'fu
           </Button>
         )}
       </div>
+        </>
+      )}
       </div>
+      )}
       {editor ? <RemoteTextEditor initial={editor} host={host} session={sftp} connected={connected} visible={visible} transfers={transfers} onClose={() => setEditor(null)} /> : showReadOnlyViewer ? (
         <ReadOnlyEditorPanel
           hostDisplayName={host.displayName}
@@ -639,23 +683,47 @@ function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'fu
           pendingOpens={hostPending}
           error={hostViewerError}
           onSelectTab={(documentId) => registry.selectDocument(host.id, documentId)}
+          onChangeLanguage={registry.setDocumentLanguage}
           onCloseTab={(documentId) => {
             registry.closeDocument(documentId);
             if (hostTabs.length <= 1 && hostPending.length === 0 && !hostViewerError) {
+              onExitEditorFocus?.();
               setViewerOpen(false);
             }
           }}
           onCloseAllHostTabs={() => {
             registry.closeHostDocuments(host.id);
             registry.clearHostError(host.id);
-            if (hostPending.length === 0) setViewerOpen(false);
+            if (hostPending.length === 0) {
+              onExitEditorFocus?.();
+              setViewerOpen(false);
+            }
           }}
           onCancelPending={(requestId) => { void registry.cancelOpen(host.id, requestId); }}
           onDismissError={() => {
             registry.clearHostError(host.id);
-            if (hostTabs.length === 0 && hostPending.length === 0) setViewerOpen(false);
+            if (hostTabs.length === 0 && hostPending.length === 0) {
+              onExitEditorFocus?.();
+              setViewerOpen(false);
+            }
           }}
-          onBrowseFiles={() => setViewerOpen(false)}
+          onBrowseFiles={() => {
+            onExitEditorFocus?.();
+            setViewerOpen(false);
+          }}
+          focused={viewerFocusedNow}
+          onToggleFocus={onToggleEditorFocus}
+          availableFiles={availableViewerFiles}
+          currentDirectoryPath={currentPath}
+          canOpenFiles={canMutate && !editor}
+          onOpenFile={(path) => {
+            if (sftp && canMutate) {
+              void registry.openDocument(sftp, path);
+            }
+          }}
+          activeTransferCount={transfers.length}
+          transfersExpanded={focusTransfersExpanded}
+          onToggleTransfers={() => setFocusTransfersExpanded((current) => !current)}
         />
       ) : <div className="files-table-wrap">
         {loading && !listing ? <Spinner label="Loading remote directory…" /> : (
@@ -708,7 +776,7 @@ function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'fu
         )}
         {listing?.partial && <Notice>Partial listing: the safety cap of {listing.entryCap} entries was reached. Sorting and filtering apply only to loaded entries.</Notice>}
       </div>}
-      <section className="transfer-queue" aria-label="Transfer queue" hidden={compact}><h2>Transfers</h2>{transfers.length === 0 ? <p>No transfers in this session.</p> : transfers.map((job) => <div className="transfer-row" key={job.id}><div><strong>{job.direction === 'upload' ? '↑' : '↓'} {job.sourceDisplay}</strong><span> → {job.destinationDisplay}</span></div><div><span className={`transfer-state transfer-state--${job.state}`}>{job.state}</span> <span>{formatProgress(job)}</span>{['queued','preparing','transferring'].includes(job.state) && <button onClick={() => { if (sftp) void filesApi.cancel(sftp, job.id); }}>Cancel</button>}{job.retryable && <button onClick={() => void retry(job)}>Prepare retry</button>}</div>{job.error && <span className="transfer-error">{job.error.message}</span>}</div>)}</section>
+      <section className="transfer-queue" aria-label="Transfer queue" hidden={compact || !showTransfersQueue}><h2>Transfers</h2>{transfers.length === 0 ? <p>No transfers in this session.</p> : transfers.map((job) => <div className="transfer-row" key={job.id}><div><strong>{job.direction === 'upload' ? '↑' : '↓'} {job.sourceDisplay}</strong><span> → {job.destinationDisplay}</span></div><div><span className={`transfer-state transfer-state--${job.state}`}>{job.state}</span> <span>{formatProgress(job)}</span>{['queued','preparing','transferring'].includes(job.state) && <button onClick={() => { if (sftp) void filesApi.cancel(sftp, job.id); }}>Cancel</button>}{job.retryable && <button onClick={() => void retry(job)}>Prepare retry</button>}</div>{job.error && <span className="transfer-error">{job.error.message}</span>}</div>)}</section>
       {visible && dialog && <Modal title={dialog.type === 'mkdir' ? 'Create remote directory' : 'Rename remote entry'} onClose={() => setDialog(null)}><label className="field"><span>Name</span><input autoFocus value={dialog.value} onChange={(event) => setDialog({ ...dialog, value: event.target.value })} /></label><p className="dialog-description">The operation will be prepared as an immutable plan. Rename never overwrites an existing destination.</p><div className="modal-actions"><Button onClick={() => setDialog(null)}>Cancel</Button><Button disabled={!dialog.value} onClick={() => void prepareEntryDialog()}>Review plan</Button></div></Modal>}
       {visible && liveApproval && <Modal title="Approve file operation" onClose={() => { void discardPlans(); }}><p className="dialog-description">Host: <strong>{host.displayName}</strong>. This one-time approval expires at {new Date(liveApproval.plans[0]!.expiresAt).toLocaleTimeString()}.</p>{liveApproval.plans.map((plan) => <div className="file-plan" key={plan.id}><strong>{plan.kind} · {plan.risk}{plan.conflictPolicy ? ` · Conflict: ${plan.conflictPolicy}` : ''}</strong>{plan.items.map((item, index) => <div key={index}><code>{item.sourceDisplay}</code> → <code>{item.destinationDisplay}</code>{item.sizeBytes && ` · ${item.sizeBytes} bytes`}</div>)}</div>)}{liveApproval.plans.some((plan) => plan.kind === 'delete') && <Notice>Delete is permanent. Directories must be empty; symbolic links are removed without following their target.</Notice>}<div className="modal-actions"><Button onClick={() => { void discardPlans(); }}>Cancel</Button><Button variant={liveApproval.plans.some((plan) => plan.kind === 'delete') ? 'danger' : 'primary'} onClick={() => void executePlans()}>Approve and execute</Button></div></Modal>}
       {visible && properties && <Modal title="Remote properties" onClose={() => setProperties(null)}><dl className="properties"><dt>Name</dt><dd>{properties.displayName}</dd><dt>Type</dt><dd>{properties.kind}</dd><dt>Size</dt><dd>{properties.sizeBytes ?? 'Unknown'}</dd><dt>Modified</dt><dd>{properties.modifiedAt ?? 'Unknown'}</dd><dt>Permissions</dt><dd>{properties.permissions ?? 'Unknown'}</dd><dt>UID / GID</dt><dd>{properties.uid ?? 'Unknown'} / {properties.gid ?? 'Unknown'}</dd></dl><div className="modal-actions"><Button onClick={() => setProperties(null)}>Close</Button></div></Modal>}
