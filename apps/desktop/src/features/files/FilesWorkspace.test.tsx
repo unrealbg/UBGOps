@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { StrictMode } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DirectoryListing, FileOperationPlan, RemoteTextDocument, SftpSessionInfo } from '@ubgops/protocol';
@@ -602,5 +602,89 @@ describe('Files workspace boundaries', () => {
     await waitFor(() => expect(filesApi.discardPlan).toHaveBeenCalledWith(session, 'plan-download'));
     expect(filesApi.discardPlan).toHaveBeenCalledTimes(1);
     expect(filesApi.execute).not.toHaveBeenCalled();
+  });
+
+  it('provides accessible navigation tooltips, keyboard shortcuts, and a non-selectable parent (..) row', async () => {
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+
+    const back = screen.getByRole('button', { name: 'Back' });
+    const forward = screen.getByRole('button', { name: 'Forward' });
+    const parent = screen.getByRole('button', { name: 'Parent directory' });
+    const refresh = screen.getByRole('button', { name: 'Refresh' });
+
+    expect(back).toBeDisabled();
+    expect(back).toHaveAttribute('title', expect.stringContaining('Alt+Left'));
+    expect(forward).toBeDisabled();
+    expect(forward).toHaveAttribute('title', expect.stringContaining('Alt+Right'));
+    expect(parent).toBeEnabled();
+    expect(parent).toHaveAttribute('title', expect.stringContaining('/home'));
+    expect(refresh).toBeEnabled();
+    expect(refresh).toHaveAttribute('title', 'Refresh current directory');
+
+    // Non-selectable '..' row exists in non-root directory and navigates cleanly via parent directory.
+    const parentRowBtn = screen.getByRole('button', { name: 'Parent directory (..)' });
+    expect(parentRowBtn).toBeInTheDocument();
+    const parentTr = parentRowBtn.closest('tr')!;
+    expect(parentTr.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Rename' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled();
+
+    // Alt+Up inside Remote path input must NOT trigger navigation.
+    const pathInput = screen.getByLabelText('Remote path');
+    fireEvent.keyDown(pathInput, { key: 'ArrowUp', altKey: true });
+    expect(filesApi.list).toHaveBeenCalledTimes(1);
+
+    // Clicking '..' row navigates up to /home; then Alt+Up navigates to '/', where '..' hides.
+    await userEvent.click(parentRowBtn);
+    await screen.findByDisplayValue('/home');
+    expect(screen.getByRole('button', { name: 'Back' })).toBeEnabled();
+
+    const workspace = screen.getByRole('region', { name: `Files on ${host.displayName}` });
+    fireEvent.keyDown(workspace, { key: 'ArrowUp', altKey: true });
+    await screen.findByDisplayValue('/');
+    expect(screen.getByRole('button', { name: 'Parent directory' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Parent directory (..)' })).not.toBeInTheDocument();
+
+    // Alt+Left and Alt+Right traverse folder history cleanly.
+    fireEvent.keyDown(workspace, { key: 'ArrowLeft', altKey: true });
+    await screen.findByDisplayValue('/home');
+    fireEvent.keyDown(workspace, { key: 'ArrowRight', altKey: true });
+    await screen.findByDisplayValue('/');
+    expect(filesApi.open).toHaveBeenCalledOnce();
+  });
+
+  it('supports interactive ancestor breadcrumbs, collapsed long-path expansion, and literal special segments', async () => {
+    const longPath = '/var/www/ubgops services/café#1?v=%20/releases/2026-11/configs';
+    vi.mocked(filesApi.list).mockImplementation(async (owner, path) =>
+      listing(path === '/home/test' ? longPath : path, owner),
+    );
+    renderFiles();
+    await screen.findByDisplayValue(longPath);
+
+    const nav = screen.getByRole('navigation', { name: 'Remote path breadcrumbs' });
+    expect(within(nav).getByRole('button', { name: 'configs' })).toHaveAttribute('aria-current', 'location');
+    const expand = within(nav).getByRole('button', { name: /Show \d+ parent directories/ });
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+
+    await userEvent.click(expand);
+    expect(expand).toHaveAttribute('aria-expanded', 'true');
+    const literalItem = within(nav).getByRole('menuitem', { name: 'café#1?v=%20' });
+    await userEvent.click(literalItem);
+    await screen.findByDisplayValue('/var/www/ubgops services/café#1?v=%20');
+    expect(filesApi.list).toHaveBeenLastCalledWith(session, '/var/www/ubgops services/café#1?v=%20');
+
+    // Escape closes overflow menu if opened again.
+    const pathInput = screen.getByLabelText('Remote path');
+    await userEvent.clear(pathInput);
+    await userEvent.type(pathInput, `${longPath}{Enter}`);
+    await screen.findByDisplayValue(longPath);
+    const expandAgain = within(nav).getByRole('button', { name: /Show \d+ parent directories/ });
+    await userEvent.click(expandAgain);
+    expect(within(nav).getByRole('menu', { name: 'Ancestor directories' })).toBeInTheDocument();
+    fireEvent.keyDown(nav, { key: 'Escape' });
+    expect(within(nav).queryByRole('menu', { name: 'Ancestor directories' })).not.toBeInTheDocument();
+    expect(filesApi.open).toHaveBeenCalledOnce();
   });
 });

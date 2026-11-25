@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import type { Host, TerminalSession } from '@ubgops/protocol';
 import { Button, Notice, Spinner } from '@ubgops/ui';
 import { applicationError, terminalApi } from '../../api/client';
@@ -7,6 +7,10 @@ import { ConnectionBadge } from '../../components/ConnectionBadge';
 import { Icon } from '../../components/Icon';
 import { TerminalPane } from './TerminalPane';
 import { mergeTerminalSession, type SessionUpdateSource } from './terminalFlow';
+
+export type TerminalWorkspaceHandle = {
+  openTerminal: () => void;
+};
 
 type SearchRequest = {
   text: string;
@@ -23,6 +27,11 @@ export function TerminalWorkspace({
   focused = false,
   onToggleFocus,
   embedded = false,
+  hideHeading = false,
+  monitoringOpen = false,
+  onToggleMonitoring,
+  actionsRef,
+  onOpeningChange,
 }: {
   host: Host;
   visible: boolean;
@@ -32,6 +41,11 @@ export function TerminalWorkspace({
   focused?: boolean;
   onToggleFocus?: () => void;
   embedded?: boolean;
+  hideHeading?: boolean;
+  monitoringOpen?: boolean;
+  onToggleMonitoring?: () => void;
+  actionsRef?: MutableRefObject<TerminalWorkspaceHandle | null>;
+  onOpeningChange?: (opening: boolean) => void;
 }) {
   const hostSession = useHostSession(host.id);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
@@ -93,7 +107,7 @@ export function TerminalWorkspace({
   );
   const connected = hostSession.data?.state === 'connected';
 
-  async function openTerminal() {
+  const openTerminal = useCallback(async () => {
     if (!connected || opening) return;
     setOpening(true);
     setError(null);
@@ -111,7 +125,19 @@ export function TerminalWorkspace({
     } finally {
       setOpening(false);
     }
-  }
+  }, [connected, host.id, opening]);
+
+  useEffect(() => {
+    if (!actionsRef) return;
+    actionsRef.current = { openTerminal: () => void openTerminal() };
+    return () => {
+      if (actionsRef.current) actionsRef.current = null;
+    };
+  }, [actionsRef, openTerminal]);
+
+  useEffect(() => {
+    onOpeningChange?.(opening);
+  }, [opening, onOpeningChange]);
 
   async function closeTerminal(session: TerminalSession) {
     mutationRevisions.current.set(session.id, (mutationRevisions.current.get(session.id) ?? 0) + 1);
@@ -237,6 +263,17 @@ export function TerminalWorkspace({
 
   const workspaceActionButtons = (
     <div className="heading-actions terminal-workspace-actions">
+      {!embedded && onToggleMonitoring && (
+        <Button
+          variant="ghost"
+          aria-pressed={monitoringOpen}
+          disabled={!connected}
+          onClick={onToggleMonitoring}
+        >
+          <Icon name="activity" size={14} />
+          {monitoringOpen ? 'Hide monitoring' : 'Show monitoring'}
+        </Button>
+      )}
       {onToggleFiles && (
         <Button aria-pressed={combined} onClick={onToggleFiles}>
           {combined ? 'Hide files panel' : 'Combine Terminal + Files'}
@@ -286,19 +323,21 @@ export function TerminalWorkspace({
         </div>
       ) : (
         <>
-          <header className="terminal-heading">
-            <div className="terminal-heading-identity">
-              <div className="eyebrow">REMOTE TERMINAL</div>
-              <div className="terminal-title-line">
-                <h1>{host.displayName}</h1>
-                <ConnectionBadge state={hostSession.data?.state ?? 'disconnected'} />
-                <span className="terminal-endpoint mono">
-                  {host.connection.username}@{host.connection.hostname}:{host.connection.port}
-                </span>
+          {!hideHeading && (
+            <header className="terminal-heading">
+              <div className="terminal-heading-identity">
+                <div className="eyebrow">REMOTE TERMINAL</div>
+                <div className="terminal-title-line">
+                  <h1>{host.displayName}</h1>
+                  <ConnectionBadge state={hostSession.data?.state ?? 'disconnected'} />
+                  <span className="terminal-endpoint mono">
+                    {host.connection.username}@{host.connection.hostname}:{host.connection.port}
+                  </span>
+                </div>
               </div>
-            </div>
-            {workspaceActionButtons}
-          </header>
+              {workspaceActionButtons}
+            </header>
+          )}
 
           <div className="terminal-tabs-row">
             {tabsList}

@@ -166,13 +166,19 @@ pub(crate) fn memory(output: &str) -> Result<(u64, u64), AppError> {
 }
 
 pub(crate) fn root_filesystem(output: &str) -> Result<(u64, u64), AppError> {
+    let (total, used, _) = root_filesystem_with_source(output)?;
+    Ok((total, used))
+}
+
+pub(crate) fn root_filesystem_with_source(output: &str) -> Result<(u64, u64, String), AppError> {
     // POSIX df -P keeps each filesystem on one line. Parse from the mount point
     // backwards so spaces in the filesystem identifier do not shift columns.
     let row = output
         .lines()
         .find(|line| line.split_whitespace().next_back() == Some("/"))
         .ok_or_else(invalid)?;
-    let mut parts = row.split_whitespace().rev();
+    let trimmed = row.trim_end();
+    let mut parts = trimmed.split_whitespace().rev();
     parts.next(); // root mount point
     let capacity = parts.next().ok_or_else(invalid)?;
     if !capacity.ends_with('%') {
@@ -185,7 +191,17 @@ pub(crate) fn root_filesystem(output: &str) -> Result<(u64, u64), AppError> {
     if parts.next().is_none() || total == 0 || used > total {
         return Err(invalid());
     }
-    Ok((total, used))
+    let mut remainder = trimmed;
+    for _ in 0..5 {
+        remainder = remainder.trim_end();
+        let idx = remainder.rfind(char::is_whitespace).ok_or_else(invalid)?;
+        remainder = &remainder[..idx];
+    }
+    let source = remainder.trim();
+    if source.is_empty() || source.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    Ok((total, used, source.to_owned()))
 }
 
 #[cfg(test)]

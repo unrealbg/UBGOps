@@ -1,95 +1,49 @@
-import { useId, useMemo } from 'react';
+import { useMemo } from 'react';
+import type { DiskDeviceKind, DiskIoSample } from '@ubgops/protocol';
 import { Icon } from '../../components/Icon';
 import { bytes, bytesPerSecond, percentage } from './format';
+import { computeRollingWindow, MonitoringChart } from './MonitoringChart';
 
 import { useHostMonitoring, formatPercent, type MonitoringProps } from './useHostMonitoring';
 export { MONITOR_INTERVAL_MS, MONITOR_HISTORY_LIMIT } from './useHostMonitoring';
 const STALE_AFTER_MS = 15_000;
+const ROLLING_WINDOW_MS = 120 * 5_000;
 
-type SparkTone = 'cyan' | 'blue' | 'purple' | 'emerald';
+function timestampOf(observedAt: string): number | null {
+  const ms = Date.parse(observedAt);
+  return Number.isFinite(ms) ? ms : null;
+}
 
-function Sparkline({
-  values,
-  tone = 'cyan',
-}: {
-  values: Array<number | null>;
-  tone?: SparkTone;
-}) {
-  const rawId = useId();
-  const gradientId = `spark-${rawId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+function formatDeviceKind(kind: DiskDeviceKind): string {
+  switch (kind) {
+    case 'physicalDisk':
+      return 'Physical';
+    case 'virtualDisk':
+      return 'Virtual';
+    case 'partition':
+      return 'Partition';
+    case 'deviceMapper':
+      return 'LVM/DM';
+    case 'mdRaid':
+      return 'RAID';
+    case 'unknown':
+      return 'Block';
+  }
+}
 
-  const { segments, lastPoint } = useMemo(() => {
-    const finite = values.filter(
-      (value): value is number => value !== null && Number.isFinite(value),
-    );
-    if (finite.length < 2) {
-      return { segments: [] as Array<{ line: string; area: string }>, lastPoint: null as { x: number; y: number } | null };
-    }
-    const min = Math.min(...finite);
-    const max = Math.max(...finite);
-    const range = Math.max(max - min, 1);
-    const width = Math.max(values.length - 1, 1);
-    const built: Array<{ line: string; area: string }> = [];
-    let coords: Array<{ x: number; y: number }> = [];
-    let tail: { x: number; y: number } | null = null;
-
-    const flush = () => {
-      if (coords.length > 1) {
-        const line = coords.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
-        const firstX = coords[0]!.x.toFixed(2);
-        const lastX = coords[coords.length - 1]!.x.toFixed(2);
-        const area = `${firstX},29 ${line} ${lastX},29`;
-        built.push({ line, area });
-        tail = coords[coords.length - 1] ?? tail;
-      }
-      coords = [];
-    };
-
-    values.forEach((value, index) => {
-      if (value === null || !Number.isFinite(value)) {
-        flush();
-        return;
-      }
-      const x = (index / width) * 100;
-      const y = 25 - ((value - min) / range) * 20;
-      coords.push({ x, y });
-    });
-    flush();
-    return { segments: built, lastPoint: tail };
-  }, [values]);
-
-  return (
-    <svg
-      className={`monitor-chart monitor-chart--${tone}`}
-      viewBox="0 0 100 30"
-      preserveAspectRatio="none"
-      aria-hidden="true"
-      data-point-count={values.length}
-    >
-      <defs>
-        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="currentColor" stopOpacity="0.34" />
-          <stop offset="70%" stopColor="currentColor" stopOpacity="0.09" />
-          <stop offset="100%" stopColor="currentColor" stopOpacity="0.01" />
-        </linearGradient>
-      </defs>
-      <line x1="0" y1="15" x2="100" y2="15" className="monitor-chart-midline" />
-      {segments.map((segment, index) => (
-        <g key={`${index}:${segment.line}`}>
-          <polygon points={segment.area} fill={`url(#${gradientId})`} />
-          <polyline points={segment.line} vectorEffect="non-scaling-stroke" />
-        </g>
-      ))}
-      {lastPoint && (
-        <circle
-          cx={lastPoint.x}
-          cy={lastPoint.y}
-          r="2.1"
-          className="monitor-chart-dot"
-        />
-      )}
-    </svg>
-  );
+function diskIdentityKey(diskIo: DiskIoSample | null | undefined): string | null {
+  if (!diskIo?.primaryDevice) return null;
+  return JSON.stringify([
+    diskIo.primaryDevice,
+    diskIo.primaryMajor,
+    diskIo.primaryMinor,
+    diskIo.primaryKind,
+    diskIo.primarySizeSectors,
+    diskIo.isRootBacking,
+    diskIo.primaryDiskSeq ?? null,
+    diskIo.primaryDeviceId ?? null,
+    diskIo.primarySysfsPath,
+  ]);
 }
 
 function usageTone(percent: number | null | undefined): 'ok' | 'warn' | 'danger' | 'muted' {
@@ -165,6 +119,7 @@ export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
     memoryUnavailable,
     swapUnavailable,
     diskUnavailable,
+    diskIoUnavailable,
     memoryPercent,
     swapPercent,
     diskPercent,
@@ -177,8 +132,50 @@ export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
   const swapTone = swapUnavailable || !swapConfigured ? 'muted' : usageTone(swapPercent);
   const diskTone = diskUnavailable ? 'muted' : usageTone(diskPercent);
   const netReady =
-    !networkUnavailable && sample != null && sample.networkRxBytesPerSecond !== null;
+    !networkUnavailable &&
+    sample != null &&
+    sample.networkRxBytesPerSecond !== null &&
+    sample.networkTxBytesPerSecond !== null;
   const netTone = networkUnavailable ? 'muted' : netReady ? 'ok' : 'muted';
+  const diskIo = sample?.diskIo ?? null;
+  const diskIoReady = !diskIoUnavailable && diskIo !== null;
+  const diskIoTone = diskIoUnavailable ? 'muted' : diskIoReady ? 'ok' : 'muted';
+  const activeDiskKey = useMemo(() => {
+    for (let i = visibleHistory.length - 1; i >= 0; i -= 1) {
+      const key = diskIdentityKey(visibleHistory[i]?.diskIo);
+      if (key) return key;
+    }
+    return null;
+  }, [visibleHistory]);
+  const diskHistory = useMemo(() => {
+    if (!activeDiskKey) return visibleHistory;
+    let cutoff = 0;
+    for (let i = 0; i < visibleHistory.length; i += 1) {
+      const key = diskIdentityKey(visibleHistory[i]?.diskIo);
+      if (key && key !== activeDiskKey) {
+        cutoff = i + 1;
+      }
+    }
+    return visibleHistory.slice(cutoff);
+  }, [activeDiskKey, visibleHistory]);
+  const timeWindow = useMemo(
+    () =>
+      computeRollingWindow(
+        visibleHistory.map((item) => item.observedAt),
+        ROLLING_WINDOW_MS,
+      ),
+    [visibleHistory],
+  );
+  const windowStartMs = timeWindow?.startMs ?? 0;
+  const windowEndMs = timeWindow?.endMs ?? 0;
+  const windowLabel = timeWindow?.label ?? '—';
+  const endLabel = !props.connected
+    ? 'offline'
+    : age > STALE_AFTER_MS && sample
+      ? 'stale'
+      : timeWindow
+        ? 'now'
+        : '—';
   const compact = props.compact ?? true;
 
   return (
@@ -205,167 +202,277 @@ export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
       )}
       <div className="monitor-grid">
         <article className="monitor-card monitor-card--cpu">
-          <div className="monitor-card-header">
-            <span className="metric-label">
-              <Icon name="cpu" size={12} />
-              CPU
-            </span>
-            <span className={`metric-status-dot metric-status-dot--${cpuTone}`} aria-hidden="true" />
+          <div className="monitor-card-top">
+            <div className="monitor-card-header">
+              <span className="metric-label">
+                <Icon name="cpu" size={12} />
+                CPU
+              </span>
+              <span className={`metric-status-dot metric-status-dot--${cpuTone}`} aria-hidden="true" />
+            </div>
+            <div className="monitor-card-metric">
+              <strong className="monitor-card-value">
+                {cpuUnavailable
+                  ? 'Unavailable'
+                  : sample?.cpuUsagePercent === null || !sample
+                    ? 'Warming up'
+                    : formatPercent(sample.cpuUsagePercent)}
+              </strong>
+              <span className="monitor-card-sub">
+                {cpuUnavailable ? 'Probe disabled' : 'Compute load'}
+              </span>
+            </div>
+            <MonitorBar label="CPU" percent={cpuValue} />
           </div>
-          <div className="monitor-card-metric">
-            <strong className="monitor-card-value">
-              {cpuUnavailable
-                ? 'Unavailable'
-                : sample?.cpuUsagePercent === null || !sample
-                  ? 'Warming up'
-                  : formatPercent(sample.cpuUsagePercent)}
-            </strong>
-            <span className="monitor-card-sub">
-              {cpuUnavailable ? 'Probe disabled' : 'Compute load'}
-            </span>
-          </div>
-          <MonitorBar label="CPU" percent={cpuValue} />
-          <Sparkline values={visibleHistory.map((item) => item.cpuUsagePercent)} tone="cyan" />
+          <MonitoringChart
+            points={visibleHistory.map((item) => ({
+              timestampMs: timestampOf(item.observedAt),
+              primary: item.cpuUsagePercent,
+            }))}
+            domain="percent"
+            primaryTone="cyan"
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
+            windowLabel={windowLabel}
+            endLabel={endLabel}
+          />
         </article>
 
         <article className="monitor-card monitor-card--memory">
-          <div className="monitor-card-header">
-            <span className="metric-label">
-              <Icon name="memory" size={12} />
-              MEMORY
-            </span>
-            <span className={`metric-status-dot metric-status-dot--${memTone}`} aria-hidden="true" />
+          <div className="monitor-card-top">
+            <div className="monitor-card-header">
+              <span className="metric-label">
+                <Icon name="memory" size={12} />
+                MEMORY
+              </span>
+              <span className={`metric-status-dot metric-status-dot--${memTone}`} aria-hidden="true" />
+            </div>
+            <div className="monitor-card-metric">
+              <strong className="monitor-card-value">
+                <ResourceValue
+                  used={sample?.memoryUsedBytes ?? null}
+                  total={sample?.memoryTotalBytes ?? null}
+                  unavailable={memoryUnavailable}
+                />
+              </strong>
+              <span className="monitor-card-sub">{formatPercent(memoryPercent)}</span>
+            </div>
+            <MonitorBar
+              label="Memory"
+              percent={memoryUnavailable ? null : memoryPercent}
+              accentClass="monitor-bar-fill--blue"
+            />
           </div>
-          <div className="monitor-card-metric">
-            <strong className="monitor-card-value">
-              <ResourceValue
-                used={sample?.memoryUsedBytes ?? null}
-                total={sample?.memoryTotalBytes ?? null}
-                unavailable={memoryUnavailable}
-              />
-            </strong>
-            <span className="monitor-card-sub">{formatPercent(memoryPercent)}</span>
-          </div>
-          <MonitorBar
-            label="Memory"
-            percent={memoryUnavailable ? null : memoryPercent}
-            accentClass="monitor-bar-fill--blue"
-          />
-          <Sparkline
-            values={visibleHistory.map((item) =>
-              percentage(item.memoryUsedBytes, item.memoryTotalBytes),
-            )}
-            tone="blue"
+          <MonitoringChart
+            points={visibleHistory.map((item) => ({
+              timestampMs: timestampOf(item.observedAt),
+              primary: percentage(item.memoryUsedBytes, item.memoryTotalBytes),
+            }))}
+            domain="percent"
+            primaryTone="blue"
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
+            windowLabel={windowLabel}
+            endLabel={endLabel}
           />
         </article>
 
         <article className="monitor-card monitor-card--disk">
-          <div className="monitor-card-header">
-            <span className="metric-label">
-              <Icon name="disk" size={12} />
-              ROOT DISK
-            </span>
-            <span
-              className={`metric-status-dot metric-status-dot--${diskTone}`}
-              aria-hidden="true"
+          <div className="monitor-card-top">
+            <div className="monitor-card-header">
+              <span className="metric-label">
+                <Icon name="disk" size={12} />
+                ROOT DISK
+              </span>
+              <span
+                className={`metric-status-dot metric-status-dot--${diskTone}`}
+                aria-hidden="true"
+              />
+            </div>
+            <div className="monitor-card-metric">
+              <strong className="monitor-card-value">
+                <ResourceValue
+                  used={sample?.rootUsedBytes ?? null}
+                  total={sample?.rootTotalBytes ?? null}
+                  unavailable={diskUnavailable}
+                />
+              </strong>
+              <span className="monitor-card-sub">{formatPercent(diskPercent)}</span>
+            </div>
+            <MonitorBar
+              label="Root disk"
+              percent={diskUnavailable ? null : diskPercent}
+              accentClass="monitor-bar-fill--emerald"
             />
           </div>
-          <div className="monitor-card-metric">
-            <strong className="monitor-card-value">
-              <ResourceValue
-                used={sample?.rootUsedBytes ?? null}
-                total={sample?.rootTotalBytes ?? null}
-                unavailable={diskUnavailable}
-              />
-            </strong>
-            <span className="monitor-card-sub">{formatPercent(diskPercent)}</span>
-          </div>
-          <MonitorBar
-            label="Root disk"
-            percent={diskUnavailable ? null : diskPercent}
-            accentClass="monitor-bar-fill--emerald"
-          />
-          <Sparkline
-            values={visibleHistory.map((item) =>
-              percentage(item.rootUsedBytes, item.rootTotalBytes),
-            )}
-            tone="emerald"
+          <MonitoringChart
+            points={visibleHistory.map((item) => ({
+              timestampMs: timestampOf(item.observedAt),
+              primary: percentage(item.rootUsedBytes, item.rootTotalBytes),
+            }))}
+            domain="percent"
+            primaryTone="emerald"
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
+            windowLabel={windowLabel}
+            endLabel={endLabel}
           />
         </article>
 
         <article className="monitor-card monitor-card--swap">
-          <div className="monitor-card-header">
-            <span className="metric-label">
-              <Icon name="activity" size={12} />
-              SWAP
-            </span>
-            <span
-              className={`metric-status-dot metric-status-dot--${swapTone}`}
-              aria-hidden="true"
+          <div className="monitor-card-top">
+            <div className="monitor-card-header">
+              <span className="metric-label">
+                <Icon name="activity" size={12} />
+                SWAP
+              </span>
+              <span
+                className={`metric-status-dot metric-status-dot--${swapTone}`}
+                aria-hidden="true"
+              />
+            </div>
+            <div className="monitor-card-metric">
+              <strong className="monitor-card-value">
+                {sample?.swapTotalBytes === 0 && !swapUnavailable ? (
+                  'Not configured'
+                ) : (
+                  <ResourceValue
+                    used={sample?.swapUsedBytes ?? null}
+                    total={sample?.swapTotalBytes ?? null}
+                    unavailable={swapUnavailable}
+                  />
+                )}
+              </strong>
+              <span className="monitor-card-sub">
+                {sample?.swapTotalBytes !== 0 ? formatPercent(swapPercent) : 'Zero swap'}
+              </span>
+            </div>
+            <MonitorBar
+              label="Swap"
+              percent={!swapConfigured || swapUnavailable ? null : swapPercent}
+              accentClass="monitor-bar-fill--purple"
             />
           </div>
-          <div className="monitor-card-metric">
-            <strong className="monitor-card-value">
-              {sample?.swapTotalBytes === 0 && !swapUnavailable ? (
-                'Not configured'
-              ) : (
-                <ResourceValue
-                  used={sample?.swapUsedBytes ?? null}
-                  total={sample?.swapTotalBytes ?? null}
-                  unavailable={swapUnavailable}
-                />
-              )}
-            </strong>
-            <span className="monitor-card-sub">
-              {sample?.swapTotalBytes !== 0 ? formatPercent(swapPercent) : 'Zero swap'}
-            </span>
-          </div>
-          <MonitorBar
-            label="Swap"
-            percent={!swapConfigured || swapUnavailable ? null : swapPercent}
-            accentClass="monitor-bar-fill--purple"
-          />
-          <Sparkline
-            values={visibleHistory.map((item) =>
-              percentage(item.swapUsedBytes, item.swapTotalBytes),
-            )}
-            tone="purple"
+          <MonitoringChart
+            points={visibleHistory.map((item) => ({
+              timestampMs: timestampOf(item.observedAt),
+              primary: percentage(item.swapUsedBytes, item.swapTotalBytes),
+            }))}
+            domain="percent"
+            primaryTone="purple"
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
+            windowLabel={windowLabel}
+            endLabel={endLabel}
           />
         </article>
 
         <article className="monitor-card monitor-card--network">
-          <div className="monitor-card-header">
-            <span className="metric-label">
-              <Icon name="network" size={12} />
-              NETWORK
-            </span>
-            <span className={`metric-status-dot metric-status-dot--${netTone}`} aria-hidden="true" />
+          <div className="monitor-card-top">
+            <div className="monitor-card-header">
+              <span className="metric-label">
+                <Icon name="network" size={12} />
+                NETWORK
+              </span>
+              <span className={`metric-status-dot metric-status-dot--${netTone}`} aria-hidden="true" />
+            </div>
+            <div className="monitor-card-metric monitor-network-rates">
+              <strong className="monitor-card-value monitor-network-rx">
+                {networkUnavailable
+                  ? 'Unavailable'
+                  : sample?.networkRxBytesPerSecond === null || !sample
+                    ? 'Warming up'
+                    : `↓ ${bytesPerSecond(sample.networkRxBytesPerSecond)}`}
+              </strong>
+              <span className="monitor-network-tx">
+                {networkUnavailable
+                  ? ''
+                  : sample?.networkTxBytesPerSecond === null || !sample
+                    ? 'Awaiting sample'
+                    : `↑ ${bytesPerSecond(sample.networkTxBytesPerSecond)}`}
+              </span>
+            </div>
           </div>
-          <div className="monitor-card-metric monitor-network-rates">
-            <strong className="monitor-card-value">
-              {networkUnavailable
-                ? 'Unavailable'
-                : sample?.networkRxBytesPerSecond === null || !sample
-                  ? 'Warming up'
-                  : `↓ ${bytesPerSecond(sample.networkRxBytesPerSecond)}`}
-            </strong>
-            <span className="monitor-network-tx">
-              {networkUnavailable
-                ? ''
-                : sample?.networkTxBytesPerSecond === null || !sample
-                  ? 'Awaiting sample'
-                  : `↑ ${bytesPerSecond(sample.networkTxBytesPerSecond)}`}
-            </span>
+          <MonitoringChart
+            points={visibleHistory.map((item) => ({
+              timestampMs: timestampOf(item.observedAt),
+              primary: item.networkRxBytesPerSecond,
+              secondary: item.networkTxBytesPerSecond,
+            }))}
+            domain="rate"
+            primaryTone="cyan"
+            secondaryTone="blue"
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
+            windowLabel={windowLabel}
+            endLabel={endLabel}
+          />
+        </article>
+
+        <article className="monitor-card monitor-card--diskio">
+          <div className="monitor-card-top">
+            <div className="monitor-card-header">
+              <span className="metric-label">
+                <Icon name="disk" size={12} />
+                DISK I/O
+              </span>
+              <span className="monitor-card-header-right">
+                {diskIoReady && diskIo.primaryDevice && (
+                  <span
+                    className="monitor-device-badge"
+                    title={
+                      diskIo.isRootBacking
+                        ? `Root backing block device: ${diskIo.primaryDevice} (${formatDeviceKind(diskIo.primaryKind)})`
+                        : `Single-device fallback (root mount unmatched): ${diskIo.primaryDevice} (${formatDeviceKind(diskIo.primaryKind)})`
+                    }
+                  >
+                    {diskIo.primaryDevice} ·{' '}
+                    {diskIo.isRootBacking ? formatDeviceKind(diskIo.primaryKind) : 'Fallback'}
+                  </span>
+                )}
+                <span
+                  className={`metric-status-dot metric-status-dot--${diskIoTone}`}
+                  aria-hidden="true"
+                />
+              </span>
+            </div>
+            <div className="monitor-card-metric monitor-network-rates">
+              <strong className="monitor-card-value monitor-diskio-read">
+                {diskIoUnavailable
+                  ? 'Unavailable'
+                  : !diskIo
+                    ? 'Warming up'
+                    : `R ${bytesPerSecond(diskIo.readBytesPerSecond)}`}
+              </strong>
+              <span className="monitor-diskio-write">
+                {diskIoUnavailable
+                  ? ''
+                  : !diskIo
+                    ? 'Awaiting sample'
+                    : `W ${bytesPerSecond(diskIo.writeBytesPerSecond)}`}
+              </span>
+            </div>
           </div>
-          <div className="monitor-bar monitor-bar--network-divider" aria-hidden="true">
-            <span
-              className={`monitor-bar-fill ${netReady ? 'monitor-bar-fill--network' : ''}`}
-              style={{ width: netReady ? '100%' : '0%' }}
-            />
-          </div>
-          <Sparkline
-            values={visibleHistory.map((item) => item.networkRxBytesPerSecond)}
-            tone="cyan"
+          <MonitoringChart
+            points={diskHistory.map((item) => ({
+              timestampMs: timestampOf(item.observedAt),
+              primary:
+                diskIdentityKey(item.diskIo) === activeDiskKey
+                  ? (item.diskIo?.readBytesPerSecond ?? null)
+                  : null,
+              secondary:
+                diskIdentityKey(item.diskIo) === activeDiskKey
+                  ? (item.diskIo?.writeBytesPerSecond ?? null)
+                  : null,
+            }))}
+            domain="rate"
+            primaryTone="emerald"
+            secondaryTone="amber"
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
+            windowLabel={windowLabel}
+            endLabel={endLabel}
+            deviceKey={activeDiskKey}
           />
         </article>
       </div>

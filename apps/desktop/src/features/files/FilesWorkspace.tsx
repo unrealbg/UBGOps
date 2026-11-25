@@ -1,10 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import type {
   ConflictPolicy, FileOperationPlan, Host, RemoteEntry, RemoteTextDocument, SftpSessionInfo, TransferJob,
 } from '@ubgops/protocol';
 import { Button, Modal, Notice, Spinner } from '@ubgops/ui';
 import { applicationError, filesApi } from '../../api/client';
 import { useHostSession } from '../../api/queries';
+import { Icon } from '../../components/Icon';
+import { buildRemoteBreadcrumbs, parentRemotePath } from './remotePath';
 import { RemoteTextEditor } from './RemoteTextEditor';
 
 type EntryDialog = { type: 'mkdir'; value: string } | { type: 'rename'; entry: RemoteEntry; value: string } | null;
@@ -36,6 +38,7 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
+  const [breadcrumbMenuOpen, setBreadcrumbMenuOpen] = useState(false);
   const [conflictPolicy, setConflictPolicy] = useState<ConflictPolicy>('skip');
   const [approval, setApproval] = useState<Approval | null>(null);
   const [dialog, setDialog] = useState<EntryDialog>(null);
@@ -112,6 +115,7 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
       setAddress(result.path);
       setSelected(new Set());
       setStale(false);
+      setBreadcrumbMenuOpen(false);
       if (mode === 'push') {
         setHistory((current) => [...current.slice(0, historyIndex + 1), result.path]);
         setHistoryIndex((current) => current + 1);
@@ -311,11 +315,73 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
       publishPlans(session, generation, [await filesApi.planRetry(session, job.id)]);
     } catch (reason) { if (session && isCurrent(session, generation)) setError(applicationError(reason).message); }
   }
-  function visitHistory(index: number) { const target = history[index]; if (!sftp || !target) return; setHistoryIndex(index); void loadDirectory(sftp, target, 'history'); }
-  function up() { if (!listing || !sftp || listing.path === '/') return; const target = listing.path.replace(/\/+$/, '').replace(/\/[^/]*$/, '') || '/'; void loadDirectory(sftp, target); }
+  const currentPath = listing?.path ?? null;
+  const parentPath = currentPath ? parentRemotePath(currentPath) : null;
+  const breadcrumbs = useMemo(
+    () => (currentPath ? buildRemoteBreadcrumbs(currentPath) : []),
+    [currentPath],
+  );
+  const canGoBack = historyIndex > 0 && !loading;
+  const canGoForward = historyIndex >= 0 && historyIndex < history.length - 1 && !loading;
+  const canGoParent = !!sftp && !!parentPath && !loading;
+  const canRefresh = !!sftp && !!listing && !loading;
+
+  function visitHistory(index: number) {
+    const target = history[index];
+    if (!sftp || !target) return;
+    setHistoryIndex(index);
+    void loadDirectory(sftp, target, 'history');
+  }
+
+  function up() {
+    if (!listing || !sftp || loading) return;
+    const target = parentRemotePath(listing.path);
+    if (!target) return;
+    void loadDirectory(sftp, target);
+  }
+
+  function handleWorkspaceKeyDown(event: KeyboardEvent<HTMLElement>) {
+    if (editor || !sftp) return;
+    const target = event.target;
+    if (
+      target instanceof HTMLElement &&
+      target.closest('input, textarea, select, [contenteditable="true"]')
+    ) {
+      return;
+    }
+    if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+      if (event.key === 'ArrowLeft') {
+        if (canGoBack) {
+          event.preventDefault();
+          visitHistory(historyIndex - 1);
+        }
+      } else if (event.key === 'ArrowRight') {
+        if (canGoForward) {
+          event.preventDefault();
+          visitHistory(historyIndex + 1);
+        }
+      } else if (event.key === 'ArrowUp') {
+        if (canGoParent) {
+          event.preventDefault();
+          up();
+        }
+      }
+    }
+  }
+
+  const maxVisibleCrumbs = compact ? 4 : 6;
+  const shouldCollapseCrumbs = breadcrumbs.length > maxVisibleCrumbs;
+  const tailCount = compact ? 2 : 3;
+  const collapsedCrumbs = shouldCollapseCrumbs ? breadcrumbs.slice(1, breadcrumbs.length - tailCount) : [];
+  const visibleTailCrumbs = shouldCollapseCrumbs ? breadcrumbs.slice(breadcrumbs.length - tailCount) : breadcrumbs;
 
   return (
-    <section className={`files-workspace ${compact ? 'files-workspace--compact' : ''}`} aria-label={`Files on ${host.displayName}`} hidden={!visible}>
+    <section
+      className={`files-workspace ${compact ? 'files-workspace--compact' : ''}`}
+      aria-label={`Files on ${host.displayName}`}
+      hidden={!visible}
+      onKeyDown={handleWorkspaceKeyDown}
+    >
       <div className="files-controls">
       <header className="files-heading">
         <div><div className="eyebrow">SFTP WORKSPACE</div><h1>{host.displayName} files</h1></div>
@@ -326,16 +392,146 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
       {(stale || (!!listing && !ownsConnection)) && connected && <Notice>This listing belongs to an old connection and is read-only until refresh completes.</Notice>}
       {error && <Notice>{error}</Notice>}
       <div className="files-toolbar" aria-label="File navigation">
-        <Button variant="ghost" disabled={historyIndex <= 0 || loading} aria-label="Back" onClick={() => visitHistory(historyIndex - 1)}>←</Button>
-        <Button variant="ghost" disabled={historyIndex < 0 || historyIndex >= history.length - 1 || loading} aria-label="Forward" onClick={() => visitHistory(historyIndex + 1)}>→</Button>
-        <Button variant="ghost" disabled={!listing || listing.path === '/' || loading} aria-label="Up" onClick={up}>↑</Button>
-        <Button variant="ghost" disabled={!sftp || !listing || loading} aria-label="Refresh" onClick={() => { if (sftp && listing) void loadDirectory(sftp, listing.path, 'history'); }}>↻</Button>
+        <div className="files-nav-group" role="group" aria-label="Directory navigation">
+          <button
+            type="button"
+            className="files-nav-btn"
+            disabled={!canGoBack}
+            aria-label="Back"
+            title={canGoBack ? 'Back to previous directory (Alt+Left)' : 'No previous directory in history (Alt+Left)'}
+            onClick={() => visitHistory(historyIndex - 1)}
+          >
+            <Icon name="arrowLeft" size={16} />
+          </button>
+          <button
+            type="button"
+            className="files-nav-btn"
+            disabled={!canGoForward}
+            aria-label="Forward"
+            title={canGoForward ? 'Forward in directory history (Alt+Right)' : 'No forward directory in history (Alt+Right)'}
+            onClick={() => visitHistory(historyIndex + 1)}
+          >
+            <Icon name="arrowRight" size={16} />
+          </button>
+          <button
+            type="button"
+            className="files-nav-btn"
+            disabled={!canGoParent}
+            aria-label="Parent directory"
+            title={parentPath ? `Open parent directory ${parentPath} (Alt+Up)` : 'Already at root directory (/)'}
+            onClick={up}
+          >
+            <Icon name="arrowUp" size={16} />
+          </button>
+          <button
+            type="button"
+            className="files-nav-btn"
+            disabled={!canRefresh}
+            aria-label="Refresh"
+            title={canRefresh ? 'Refresh current directory' : 'Directory unavailable to refresh'}
+            onClick={() => { if (sftp && listing) void loadDirectory(sftp, listing.path, 'history'); }}
+          >
+            <Icon name="refresh" size={15} />
+          </button>
+        </div>
         <form className="files-address" onSubmit={(event) => { event.preventDefault(); if (sftp) void loadDirectory(sftp, address); }}>
           <label className="sr-only" htmlFor={`files-address-${host.id}`}>Remote path</label>
-          <input id={`files-address-${host.id}`} value={address} onChange={(event) => setAddress(event.target.value)} spellCheck={false} />
+          <input
+            id={`files-address-${host.id}`}
+            value={address}
+            title={address || 'Enter remote path'}
+            onChange={(event) => setAddress(event.target.value)}
+            spellCheck={false}
+          />
           <Button type="submit" disabled={!sftp || loading}>Go</Button>
         </form>
       </div>
+      {listing && breadcrumbs.length > 0 && (
+        <nav
+          className="files-breadcrumbs"
+          aria-label="Remote path breadcrumbs"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && breadcrumbMenuOpen) {
+              event.stopPropagation();
+              setBreadcrumbMenuOpen(false);
+            }
+          }}
+        >
+          {shouldCollapseCrumbs && breadcrumbs[0] && (
+            <>
+              <button
+                type="button"
+                className="files-breadcrumb files-breadcrumb--root"
+                title={breadcrumbs[0].path}
+                disabled={!sftp || loading}
+                onClick={() => { if (sftp) void loadDirectory(sftp, breadcrumbs[0]!.path); }}
+              >
+                {breadcrumbs[0].label}
+              </button>
+              <span className="files-breadcrumb-sep" aria-hidden="true">
+                <Icon name="chevronRight" size={12} />
+              </span>
+              <div className="files-breadcrumb-overflow">
+                <button
+                  type="button"
+                  className="files-breadcrumb files-breadcrumb--more"
+                  aria-expanded={breadcrumbMenuOpen}
+                  aria-label={`Show ${collapsedCrumbs.length} parent directories`}
+                  title="Show hidden ancestor directories"
+                  onClick={() => setBreadcrumbMenuOpen((current) => !current)}
+                >
+                  …
+                </button>
+                {breadcrumbMenuOpen && (
+                  <div className="files-breadcrumb-menu" role="menu" aria-label="Ancestor directories">
+                    {collapsedCrumbs.map((crumb) => (
+                      <button
+                        key={crumb.path}
+                        type="button"
+                        role="menuitem"
+                        title={crumb.path}
+                        disabled={!sftp || loading}
+                        onClick={() => {
+                          if (!sftp) return;
+                          setBreadcrumbMenuOpen(false);
+                          void loadDirectory(sftp, crumb.path);
+                        }}
+                      >
+                        {crumb.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <span className="files-breadcrumb-sep" aria-hidden="true">
+                <Icon name="chevronRight" size={12} />
+              </span>
+            </>
+          )}
+          {visibleTailCrumbs.map((crumb, index) => {
+            const isCurrent = index === visibleTailCrumbs.length - 1;
+            return (
+              <Fragment key={crumb.path}>
+                {index > 0 && (
+                  <span className="files-breadcrumb-sep" aria-hidden="true">
+                    <Icon name="chevronRight" size={12} />
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className={`files-breadcrumb ${crumb.path === '/' ? 'files-breadcrumb--root' : ''} ${isCurrent ? 'files-breadcrumb--current' : ''}`}
+                  title={crumb.path}
+                  aria-current={isCurrent ? 'location' : undefined}
+                  disabled={!sftp || loading}
+                  onClick={() => { if (sftp && !isCurrent) void loadDirectory(sftp, crumb.path); }}
+                >
+                  {crumb.label}
+                </button>
+              </Fragment>
+            );
+          })}
+        </nav>
+      )}
       <div className="files-actions" hidden={compact}>
         <Button disabled={!canMutate} onClick={() => void upload()}>Upload files…</Button>
         <Button disabled={!canMutate || !selectedEntries.some((entry) => entry.kind === 'file')} onClick={() => void download()}>Download selected…</Button>
@@ -355,7 +551,33 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
         {loading && !listing ? <Spinner label="Loading remote directory…" /> : (
           <table className="files-table">
             <thead><tr><th><span className="sr-only">Select</span></th><th><button onClick={() => { if (sort === 'name') setDescending(!descending); else { setSort('name'); setDescending(false); } }}>Name</button></th><th>Type</th><th><button onClick={() => { if (sort === 'size') setDescending(!descending); else { setSort('size'); setDescending(false); } }}>Size</button></th><th><button onClick={() => { if (sort === 'modified') setDescending(!descending); else { setSort('modified'); setDescending(false); } }}>Modified</button></th><th>Mode</th><th><span className="sr-only">Actions</span></th></tr></thead>
-            <tbody>{entries.map((entry) => <tr key={entry.path} className={selected.has(entry.path) ? 'is-selected' : ''} onDoubleClick={() => { if (entry.kind === 'directory' && sftp) void loadDirectory(sftp, entry.path); }}>
+            <tbody>
+              {listing && parentPath && sftp && !stale && (
+                <tr
+                  className="files-parent-row"
+                  onDoubleClick={() => { if (!loading) up(); }}
+                >
+                  <td aria-hidden="true" />
+                  <td>
+                    <button
+                      type="button"
+                      className="file-name file-name--parent"
+                      disabled={loading}
+                      aria-label="Parent directory (..)"
+                      title={`Open parent directory (${parentPath})`}
+                      onClick={up}
+                    >
+                      <Icon name="arrowUp" size={13} /> ..
+                    </button>
+                  </td>
+                  <td>parent</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td />
+                </tr>
+              )}
+              {entries.map((entry) => <tr key={entry.path} className={selected.has(entry.path) ? 'is-selected' : ''} onDoubleClick={() => { if (entry.kind === 'directory' && sftp) void loadDirectory(sftp, entry.path); }}>
               <td><input aria-label={`Select ${entry.displayName}`} type="checkbox" checked={selected.has(entry.path)} onChange={(event) => toggle(entry.path, event.target.checked)} /></td>
               <td><button className="file-name" onClick={() => toggle(entry.path, !selected.has(entry.path))} onKeyDown={(event) => { if (event.key === 'Enter' && entry.kind === 'directory' && sftp) void loadDirectory(sftp, entry.path); }}>{entry.kind === 'directory' ? '📁' : entry.kind === 'symlink' ? '↗' : '▧'} {entry.displayName}</button></td>
               <td>{entry.kind}</td><td>{entry.sizeBytes ?? 'Unknown'}</td><td>{entry.modifiedAt ? new Date(entry.modifiedAt).toLocaleString() : 'Unknown'}</td><td>{entry.permissions ?? 'Unknown'}</td>

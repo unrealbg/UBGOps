@@ -13,6 +13,8 @@ pub enum ReadOnlyCommand {
     RootFilesystem,
     CpuStat,
     NetworkDevices,
+    DiskStats,
+    BlockDeviceMetadata,
     NetworkAddresses,
     NetworkRoutesV4,
     NetworkRoutesV6,
@@ -37,6 +39,10 @@ impl ReadOnlyCommand {
             Self::RootFilesystem => "LC_ALL=C df -Pk /",
             Self::CpuStat => "cat /proc/stat",
             Self::NetworkDevices => "cat /proc/net/dev",
+            Self::DiskStats => "cat /proc/diskstats",
+            Self::BlockDeviceMetadata => {
+                r#"LC_ALL=C sh -c 'i=0; for d in /sys/class/block/*; do [ -e "$d" ] || continue; n=${d##*/}; case "$n" in loop*|ram*|zram*|sr*|fd*) continue;; esac; i=$((i+1)); [ "$i" -le 64 ] || break; dv=$(cat "$d/dev" 2>/dev/null || true); sz=$(cat "$d/size" 2>/dev/null || true); pt=0; [ -e "$d/partition" ] && pt=1; dm=0; [ -d "$d/dm" ] && dm=1; dmn=$([ -r "$d/dm/name" ] && tr -d "\t\r\n" <"$d/dm/name" 2>/dev/null || true); md=0; [ -d "$d/md" ] && md=1; hl=0; for x in "$d"/holders/*; do [ -e "$x" ] && { hl=1; break; }; done; tg=$(readlink "$d" 2>/dev/null | tr -d "\t\r\n" || true); vr=$([ -r "$d/device/vendor" ] && tr -d "\t\r\n" <"$d/device/vendor" 2>/dev/null || true); ml=$([ -r "$d/device/model" ] && tr -d "\t\r\n" <"$d/device/model" 2>/dev/null || true); ds=$(if [ -r "$d/diskseq" ]; then tr -d "\t\r\n" <"$d/diskseq" 2>/dev/null || true; elif [ -r "$d/../diskseq" ]; then tr -d "\t\r\n" <"$d/../diskseq" 2>/dev/null || true; fi); id=$(if [ -r "$d/dm/uuid" ]; then tr -d "\t\r\n" <"$d/dm/uuid" 2>/dev/null || true; elif [ -r "$d/device/wwid" ]; then tr -d "\t\r\n" <"$d/device/wwid" 2>/dev/null || true; elif [ -r "$d/device/serial" ]; then tr -d "\t\r\n" <"$d/device/serial" 2>/dev/null || true; fi); printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$n" "$dv" "$sz" "$pt" "$dm" "$dmn" "$md" "$hl" "$tg" "$vr" "$ml" "$ds" "$id"; done'"#
+            }
             Self::NetworkAddresses => "LC_ALL=C ip -j address show",
             Self::NetworkRoutesV4 => "LC_ALL=C ip -j -4 route show table main",
             Self::NetworkRoutesV6 => "LC_ALL=C ip -j -6 route show table main",
@@ -66,6 +72,8 @@ impl ReadOnlyCommand {
             Self::RootFilesystem => "discovery.root_filesystem",
             Self::CpuStat => "monitor.cpu",
             Self::NetworkDevices => "monitor.network",
+            Self::DiskStats => "monitor.disk_io",
+            Self::BlockDeviceMetadata => "monitor.block_devices",
             Self::NetworkAddresses => "network.list",
             Self::NetworkRoutesV4 => "network.routes_v4",
             Self::NetworkRoutesV6 => "network.routes_v6",
@@ -159,6 +167,29 @@ mod tests {
         plan.operation.kind = command.kind().into();
         plan.operation.risk = OperationRisk::Low;
         assert_eq!(engine.validate(&plan).unwrap_err().code, ErrorCode::Policy);
+    }
+
+    #[test]
+    fn disk_io_monitoring_commands_are_fixed_readonly_operations() {
+        let engine = OperationEngine::default();
+        for (command, kind) in [
+            (ReadOnlyCommand::DiskStats, "monitor.disk_io"),
+            (
+                ReadOnlyCommand::BlockDeviceMetadata,
+                "monitor.block_devices",
+            ),
+        ] {
+            assert_eq!(command.kind(), kind);
+            assert_eq!(command.operation().risk, OperationRisk::ReadOnly);
+            let mut plan = engine.plan(command);
+            assert!(engine.validate(&plan).is_ok());
+            plan.operation.kind = "monitor.cpu".into();
+            assert_eq!(engine.validate(&plan).unwrap_err().code, ErrorCode::Policy);
+            plan.operation.kind = kind.into();
+            plan.operation.risk = OperationRisk::Low;
+            assert_eq!(engine.validate(&plan).unwrap_err().code, ErrorCode::Policy);
+        }
+        assert_eq!(ReadOnlyCommand::DiskStats.command(), "cat /proc/diskstats");
     }
 }
 
