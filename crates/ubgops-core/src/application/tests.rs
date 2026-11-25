@@ -2275,6 +2275,11 @@ async fn disconnect_cancels_delayed_monitoring_and_reconnect_resets_baseline() {
     assert_eq!(disk_io.primary_device.as_deref(), Some("sda"));
     assert_eq!((disk_io.primary_major, disk_io.primary_minor), (8, 0));
     assert_eq!(disk_io.primary_kind, DiskDeviceKind::VirtualDisk);
+    assert_eq!(disk_io.primary_size_sectors, 16_777_216);
+    assert_eq!(
+        disk_io.primary_sysfs_path,
+        "../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sda"
+    );
     assert_eq!(disk_io.primary_disk_seq.as_deref(), Some("10"));
     assert_eq!(disk_io.primary_device_id.as_deref(), Some("naa.0001"));
     assert!(!disk_io.is_root_backing);

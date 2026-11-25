@@ -142,6 +142,7 @@ updateApi.check = updateApi.state;
 
 let sampleStep = 0;
 const cpuCurve = [34.2, 41.8, 38.5, 49.4, 53.1, 46.7, 58.2, 44.6];
+const idleCpuCurve = [1.4, 1.8, 1.2, 2.3, 1.9, 1.5, 2.1, 1.6];
 const memCurve = [4.1, 4.3, 4.6, 4.5, 4.9, 5.1, 4.8, 5.0];
 const rxCurve = [420_000, 780_000, 610_000, 1_240_000, 950_000, 1_480_000, 890_000, 1_120_000];
 const txCurve = [190_000, 310_000, 275_000, 540_000, 480_000, 620_000, 410_000, 490_000];
@@ -149,52 +150,182 @@ const diskReadCurve = [2_400_000, 6_800_000, 4_200_000, 12_400_000, 5_600_000, 9
 const diskWriteCurve = [950_000, 2_100_000, 1_650_000, 4_800_000, 2_900_000, 5_300_000, 1_900_000, 3_400_000];
 
 monitorApi.sample = async (hostId, hostSessionId): Promise<HostMonitorSample> => {
-  const idx = sampleStep % cpuCurve.length;
+  const step = sampleStep;
+  const idx = step % cpuCurve.length;
   sampleStep += 1;
+
+  if (mode === 'zero') {
+    return {
+      hostId,
+      hostSessionId,
+      observedAt: new Date().toISOString(),
+      cpuUsagePercent: 0,
+      memoryTotalBytes: 8 * 1024 ** 3,
+      memoryUsedBytes: Math.round(1.6 * 1024 ** 3),
+      swapTotalBytes: 2 * 1024 ** 3,
+      swapUsedBytes: 0,
+      rootTotalBytes: 100 * 1024 ** 3,
+      rootUsedBytes: Math.round(24.0 * 1024 ** 3),
+      networkRxBytesPerSecond: 0,
+      networkTxBytesPerSecond: 0,
+      diskIo: {
+        primaryDevice: 'sdd',
+        primaryMajor: 8,
+        primaryMinor: 48,
+        primaryKind: 'virtualDisk' as const,
+        primaryDiskSeq: '28',
+        primaryDeviceId: 'naa.60022480',
+        primarySizeSectors: 16_777_216,
+        primarySysfsPath: '../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sdd',
+        isRootBacking: true,
+        readBytesPerSecond: 0,
+        writeBytesPerSecond: 0,
+        devices: [
+          {
+            name: 'sdd',
+            major: 8,
+            minor: 48,
+            kind: 'virtualDisk' as const,
+            diskSeq: '28',
+            deviceId: 'naa.60022480',
+            sizeSectors: 16_777_216,
+            sysfsPath: '../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sdd',
+            isRootBacking: true,
+            readBytesPerSecond: 0,
+            writeBytesPerSecond: 0,
+          },
+        ],
+      },
+      warnings: [],
+    };
+  }
+
+  if (mode === 'idle') {
+    return {
+      hostId,
+      hostSessionId,
+      observedAt: new Date().toISOString(),
+      cpuUsagePercent: idleCpuCurve[idx]!,
+      memoryTotalBytes: 8 * 1024 ** 3,
+      memoryUsedBytes: Math.round((1.2 + (idx % 2) * 0.05) * 1024 ** 3),
+      swapTotalBytes: 2 * 1024 ** 3,
+      swapUsedBytes: Math.round(0.08 * 1024 ** 3),
+      rootTotalBytes: 100 * 1024 ** 3,
+      rootUsedBytes: Math.round(18.5 * 1024 ** 3),
+      networkRxBytesPerSecond: 1_800 + idx * 450,
+      networkTxBytesPerSecond: 900 + idx * 220,
+      diskIo: {
+        primaryDevice: 'sdd',
+        primaryMajor: 8,
+        primaryMinor: 48,
+        primaryKind: 'virtualDisk' as const,
+        primaryDiskSeq: '28',
+        primaryDeviceId: 'naa.60022480',
+        primarySizeSectors: 16_777_216,
+        primarySysfsPath: '../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sdd',
+        isRootBacking: true,
+        readBytesPerSecond: (idx % 3) * 4_096,
+        writeBytesPerSecond: idx % 2 === 0 ? 8_192 : 4_096,
+        devices: [
+          {
+            name: 'sdd',
+            major: 8,
+            minor: 48,
+            kind: 'virtualDisk' as const,
+            diskSeq: '28',
+            deviceId: 'naa.60022480',
+            sizeSectors: 16_777_216,
+            sysfsPath: '../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sdd',
+            isRootBacking: true,
+            readBytesPerSecond: (idx % 3) * 4_096,
+            writeBytesPerSecond: idx % 2 === 0 ? 8_192 : 4_096,
+          },
+        ],
+      },
+      warnings: [],
+    };
+  }
+
+  const recoveryGap = mode === 'recovery' && step === 2;
+  const deviceSwapped = mode === 'device-change' && step >= 3;
+  const deviceGap = mode === 'device-change' && step === 2;
   const warnings =
-    mode === 'diskio-unavailable'
+    mode === 'diskio-unavailable' || recoveryGap
       ? [{ code: 'discovery' as const, message: 'disk I/O monitoring is unavailable.', hostKey: null }]
       : [];
   const diskIo =
-    mode === 'diskio-unavailable' || mode === 'diskio-warming'
+    mode === 'diskio-unavailable' || mode === 'diskio-warming' || recoveryGap || deviceGap
       ? null
-      : {
-          primaryDevice: 'sdd',
-          primaryMajor: 8,
-          primaryMinor: 48,
-          primaryKind: 'virtualDisk' as const,
-          primaryDiskSeq: '28',
-          primaryDeviceId: 'naa.60022480',
-          isRootBacking: true,
-          readBytesPerSecond: diskReadCurve[idx]!,
-          writeBytesPerSecond: diskWriteCurve[idx]!,
-          devices: [
-            {
-              name: 'sdd',
-              major: 8,
-              minor: 48,
-              kind: 'virtualDisk' as const,
-              diskSeq: '28',
-              deviceId: 'naa.60022480',
-              isRootBacking: true,
-              readBytesPerSecond: diskReadCurve[idx]!,
-              writeBytesPerSecond: diskWriteCurve[idx]!,
-            },
-          ],
-        };
+      : deviceSwapped
+        ? {
+            primaryDevice: 'nvme0n1',
+            primaryMajor: 259,
+            primaryMinor: 0,
+            primaryKind: 'physicalDisk' as const,
+            primaryDiskSeq: '99',
+            primaryDeviceId: 'eui.001b448b4',
+            primarySizeSectors: 41_943_040,
+            primarySysfsPath: '../../devices/pci0000:00/nvme/nvme0/nvme0n1',
+            isRootBacking: false,
+            readBytesPerSecond: diskReadCurve[idx]! * 2,
+            writeBytesPerSecond: diskWriteCurve[idx]! * 2,
+            devices: [
+              {
+                name: 'nvme0n1',
+                major: 259,
+                minor: 0,
+                kind: 'physicalDisk' as const,
+                diskSeq: '99',
+                deviceId: 'eui.001b448b4',
+                sizeSectors: 41_943_040,
+                sysfsPath: '../../devices/pci0000:00/nvme/nvme0/nvme0n1',
+                isRootBacking: false,
+                readBytesPerSecond: diskReadCurve[idx]! * 2,
+                writeBytesPerSecond: diskWriteCurve[idx]! * 2,
+              },
+            ],
+          }
+        : {
+            primaryDevice: 'sdd',
+            primaryMajor: 8,
+            primaryMinor: 48,
+            primaryKind: 'virtualDisk' as const,
+            primaryDiskSeq: '28',
+            primaryDeviceId: 'naa.60022480',
+            primarySizeSectors: 16_777_216,
+            primarySysfsPath: '../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sdd',
+            isRootBacking: true,
+            readBytesPerSecond: diskReadCurve[idx]!,
+            writeBytesPerSecond: diskWriteCurve[idx]!,
+            devices: [
+              {
+                name: 'sdd',
+                major: 8,
+                minor: 48,
+                kind: 'virtualDisk' as const,
+                diskSeq: '28',
+                deviceId: 'naa.60022480',
+                sizeSectors: 16_777_216,
+                sysfsPath: '../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sdd',
+                isRootBacking: true,
+                readBytesPerSecond: diskReadCurve[idx]!,
+                writeBytesPerSecond: diskWriteCurve[idx]!,
+              },
+            ],
+          };
   return {
     hostId,
     hostSessionId,
     observedAt: new Date().toISOString(),
-    cpuUsagePercent: mode === 'diskio-warming' ? null : cpuCurve[idx]!,
+    cpuUsagePercent: mode === 'diskio-warming' || recoveryGap ? null : cpuCurve[idx]!,
     memoryTotalBytes: 8 * 1024 ** 3,
     memoryUsedBytes: Math.round(memCurve[idx]! * 1024 ** 3),
     swapTotalBytes: 2 * 1024 ** 3,
     swapUsedBytes: Math.round((0.18 + (idx % 3) * 0.04) * 1024 ** 3),
     rootTotalBytes: 100 * 1024 ** 3,
     rootUsedBytes: Math.round((32.4 + (idx % 4) * 0.3) * 1024 ** 3),
-    networkRxBytesPerSecond: mode === 'diskio-warming' ? null : rxCurve[idx]!,
-    networkTxBytesPerSecond: mode === 'diskio-warming' ? null : txCurve[idx]!,
+    networkRxBytesPerSecond: mode === 'diskio-warming' || recoveryGap ? null : rxCurve[idx]!,
+    networkTxBytesPerSecond: mode === 'diskio-warming' || recoveryGap ? null : txCurve[idx]!,
     diskIo,
     warnings,
   };

@@ -22,6 +22,9 @@ pub struct DiskIoDeviceSample {
     pub major: u32,
     pub minor: u32,
     pub kind: DiskDeviceKind,
+    #[ts(as = "f64")]
+    pub size_sectors: u64,
+    pub sysfs_path: String,
     pub disk_seq: Option<String>,
     pub device_id: Option<String>,
     pub is_root_backing: bool,
@@ -37,6 +40,9 @@ pub struct DiskIoSample {
     pub primary_major: u32,
     pub primary_minor: u32,
     pub primary_kind: DiskDeviceKind,
+    #[ts(as = "f64")]
+    pub primary_size_sectors: u64,
+    pub primary_sysfs_path: String,
     pub primary_disk_seq: Option<String>,
     pub primary_device_id: Option<String>,
     pub is_root_backing: bool,

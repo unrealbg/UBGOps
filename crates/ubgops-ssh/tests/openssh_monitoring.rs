@@ -147,6 +147,8 @@ async fn openssh_monitoring_interoperability() {
         .expect("primary device name");
     assert!(disk_io.read_bytes_per_second.is_finite() && disk_io.read_bytes_per_second >= 0.0);
     assert!(disk_io.write_bytes_per_second.is_finite() && disk_io.write_bytes_per_second >= 0.0);
+    assert!(disk_io.primary_size_sectors > 0);
+    assert!(!disk_io.primary_sysfs_path.is_empty());
     assert!(!disk_io.devices.is_empty());
     assert!(
         second.warnings.is_empty(),
