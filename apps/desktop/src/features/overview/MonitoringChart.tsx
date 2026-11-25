@@ -10,11 +10,39 @@ export type ChartPoint = {
 };
 
 const DEFAULT_WIDTH = 200;
-const HEIGHT = 40;
+const DEFAULT_HEIGHT = 40;
 const PAD_X = 4;
-const PLOT_TOP = 5.5;
-const PLOT_BOTTOM = 35.5;
-const PLOT_HEIGHT = PLOT_BOTTOM - PLOT_TOP;
+
+type PlotMetrics = {
+  plotTop: number;
+  plotBottom: number;
+  midY: number;
+  primaryDotR: number;
+  secondaryDotR: number;
+};
+
+function getPlotMetrics(svgHeight: number): PlotMetrics {
+  if (Math.abs(svgHeight - 40) < 0.5) {
+    return {
+      plotTop: 5.5,
+      plotBottom: 35.5,
+      midY: 20.5,
+      primaryDotR: 2.25,
+      secondaryDotR: 2,
+    };
+  }
+  const plotTop = Number((svgHeight * 0.13).toFixed(1));
+  const plotBottom = Number(Math.max(plotTop + 8, svgHeight - 3.5).toFixed(1));
+  const midY = Number(((plotTop + plotBottom) / 2).toFixed(1));
+  const compact = svgHeight <= 30;
+  return {
+    plotTop,
+    plotBottom,
+    midY,
+    primaryDotR: compact ? 2 : 2.25,
+    secondaryDotR: compact ? 1.75 : 2,
+  };
+}
 
 type SeriesGeometry = {
   segments: Array<{ line: string; area: string }>;
@@ -39,8 +67,11 @@ function buildGeometry(
   windowStartMs: number,
   windowEndMs: number,
   plotWidth: number,
+  plotTop: number,
+  plotBottom: number,
 ): SeriesGeometry {
   const innerWidth = Math.max(plotWidth - PAD_X * 2, 1);
+  const plotHeight = Math.max(plotBottom - plotTop, 1);
   const spanMs = windowEndMs - windowStartMs;
   const valueRange = Math.max(domainMax - domainMin, 1e-6);
   const indexDenominator = Math.max(points.length - 1, 1);
@@ -56,7 +87,7 @@ function buildGeometry(
       const lastX = coords[coords.length - 1]!.x.toFixed(1);
       segments.push({
         line,
-        area: `${firstX},${PLOT_BOTTOM.toFixed(1)} ${line} ${lastX},${PLOT_BOTTOM.toFixed(1)}`,
+        area: `${firstX},${plotBottom.toFixed(1)} ${line} ${lastX},${plotBottom.toFixed(1)}`,
       });
     }
     coords = [];
@@ -78,7 +109,7 @@ function buildGeometry(
     const ratioY = (clamped - domainMin) / valueRange;
     const coord = {
       x: PAD_X + ratioX * innerWidth,
-      y: PLOT_BOTTOM - ratioY * PLOT_HEIGHT,
+      y: plotBottom - ratioY * plotHeight,
     };
     coords.push(coord);
     lastPoint = coord;
@@ -130,14 +161,23 @@ export function MonitoringChart({
   const rawId = useId();
   const gradientId = `mchart-${rawId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
   const wrapRef = useRef<HTMLDivElement>(null);
-  const [measuredWidth, setMeasuredWidth] = useState(DEFAULT_WIDTH);
+  const [measuredSize, setMeasuredSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
 
   useLayoutEffect(() => {
     const el = wrapRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
     const update = () => {
-      const next = Math.round(el.getBoundingClientRect().width);
-      if (next > 0) setMeasuredWidth(next);
+      const rect = el.getBoundingClientRect();
+      const nextWidth = Math.round(rect.width);
+      const rawHeight = Math.round(rect.height);
+      if (nextWidth > 0 || rawHeight > 0) {
+        setMeasuredSize((current) => {
+          const width = nextWidth > 0 ? nextWidth : current.width;
+          const height = rawHeight > 0 ? Math.min(44, Math.max(22, rawHeight)) : current.height;
+          if (width === current.width && height === current.height) return current;
+          return { width, height };
+        });
+      }
     };
     const observer = new ResizeObserver(update);
     observer.observe(el);
@@ -145,6 +185,9 @@ export function MonitoringChart({
     return () => observer.disconnect();
   }, []);
 
+  const measuredWidth = measuredSize.width;
+  const measuredHeight = measuredSize.height;
+  const { plotTop, plotBottom, midY, primaryDotR, secondaryDotR } = getPlotMetrics(measuredHeight);
   const hasSecondary = secondaryTone !== undefined;
 
   const { primaryGeom, secondaryGeom } = useMemo(() => {
@@ -183,6 +226,8 @@ export function MonitoringChart({
         windowStartMs,
         windowEndMs,
         measuredWidth,
+        plotTop,
+        plotBottom,
       ),
       secondaryGeom: hasSecondary
         ? buildGeometry(
@@ -193,98 +238,102 @@ export function MonitoringChart({
             windowStartMs,
             windowEndMs,
             measuredWidth,
+            plotTop,
+            plotBottom,
           )
         : null,
     };
-  }, [domain, hasSecondary, measuredWidth, points, windowEndMs, windowStartMs]);
+  }, [domain, hasSecondary, measuredWidth, plotBottom, plotTop, points, windowEndMs, windowStartMs]);
 
   return (
-    <div className="monitor-chart-frame" ref={wrapRef}>
-      <svg
-        className={`monitor-chart monitor-chart--${primaryTone}`}
-        width={measuredWidth}
-        height={HEIGHT}
-        viewBox={`0 0 ${measuredWidth} ${HEIGHT}`}
-        aria-hidden="true"
-        data-point-count={points.length}
-        data-series-count={hasSecondary ? 2 : 1}
-        data-segment-count={primaryGeom.segments.length}
-        data-disk-device-key={deviceKey ?? undefined}
-        data-window-label={windowLabel}
-      >
-        <defs>
-          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="currentColor" stopOpacity="0.16" />
-            <stop offset="75%" stopColor="currentColor" stopOpacity="0.03" />
-            <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
-          </linearGradient>
-        </defs>
+    <div className="monitor-chart-frame">
+      <div className="monitor-chart-svg-wrap" ref={wrapRef}>
+        <svg
+          className={`monitor-chart monitor-chart--${primaryTone}`}
+          width={measuredWidth}
+          height={measuredHeight}
+          viewBox={`0 0 ${measuredWidth} ${measuredHeight}`}
+          aria-hidden="true"
+          data-point-count={points.length}
+          data-series-count={hasSecondary ? 2 : 1}
+          data-segment-count={primaryGeom.segments.length}
+          data-disk-device-key={deviceKey ?? undefined}
+          data-window-label={windowLabel}
+        >
+          <defs>
+            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="currentColor" stopOpacity="0.16" />
+              <stop offset="75%" stopColor="currentColor" stopOpacity="0.03" />
+              <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+            </linearGradient>
+          </defs>
 
-        <line
-          x1={PAD_X}
-          y1={PLOT_TOP}
-          x2={measuredWidth - PAD_X}
-          y2={PLOT_TOP}
-          className="monitor-chart-grid"
-          shapeRendering="crispEdges"
-        />
-        <line
-          x1={PAD_X}
-          y1={20.5}
-          x2={measuredWidth - PAD_X}
-          y2={20.5}
-          className="monitor-chart-midline"
-          shapeRendering="crispEdges"
-        />
-        <line
-          x1={PAD_X}
-          y1={PLOT_BOTTOM}
-          x2={measuredWidth - PAD_X}
-          y2={PLOT_BOTTOM}
-          className="monitor-chart-baseline"
-          shapeRendering="crispEdges"
-        />
-
-        {primaryGeom.segments.map((segment, index) => (
-          <g key={`p:${index}:${segment.line}`} className={`monitor-chart-series--${primaryTone}`}>
-            <polygon points={segment.area} fill={`url(#${gradientId})`} />
-            <polyline
-              points={segment.line}
-              className="monitor-chart-line monitor-chart-line--primary"
-            />
-          </g>
-        ))}
-
-        {secondaryGeom?.segments.map((segment, index) => (
-          <g
-            key={`s:${index}:${segment.line}`}
-            className={`monitor-chart-series--${secondaryTone}`}
-          >
-            <polyline
-              points={segment.line}
-              className="monitor-chart-line monitor-chart-line--secondary"
-            />
-          </g>
-        ))}
-
-        {secondaryGeom?.lastPoint && (
-          <circle
-            cx={secondaryGeom.lastPoint.x}
-            cy={secondaryGeom.lastPoint.y}
-            r={2}
-            className={`monitor-chart-dot monitor-chart-series--${secondaryTone}`}
+          <line
+            x1={PAD_X}
+            y1={plotTop}
+            x2={measuredWidth - PAD_X}
+            y2={plotTop}
+            className="monitor-chart-grid"
+            shapeRendering="crispEdges"
           />
-        )}
-
-        {primaryGeom.lastPoint && (
-          <circle
-            cx={primaryGeom.lastPoint.x}
-            cy={primaryGeom.lastPoint.y}
-            r={2.25}
-            className={`monitor-chart-dot monitor-chart-series--${primaryTone}`}
+          <line
+            x1={PAD_X}
+            y1={midY}
+            x2={measuredWidth - PAD_X}
+            y2={midY}
+            className="monitor-chart-midline"
+            shapeRendering="crispEdges"
           />
-        )}
-      </svg>
+          <line
+            x1={PAD_X}
+            y1={plotBottom}
+            x2={measuredWidth - PAD_X}
+            y2={plotBottom}
+            className="monitor-chart-baseline"
+            shapeRendering="crispEdges"
+          />
+
+          {primaryGeom.segments.map((segment, index) => (
+            <g key={`p:${index}:${segment.line}`} className={`monitor-chart-series--${primaryTone}`}>
+              <polygon points={segment.area} fill={`url(#${gradientId})`} />
+              <polyline
+                points={segment.line}
+                className="monitor-chart-line monitor-chart-line--primary"
+              />
+            </g>
+          ))}
+
+          {secondaryGeom?.segments.map((segment, index) => (
+            <g
+              key={`s:${index}:${segment.line}`}
+              className={`monitor-chart-series--${secondaryTone}`}
+            >
+              <polyline
+                points={segment.line}
+                className="monitor-chart-line monitor-chart-line--secondary"
+              />
+            </g>
+          ))}
+
+          {secondaryGeom?.lastPoint && (
+            <circle
+              cx={secondaryGeom.lastPoint.x}
+              cy={secondaryGeom.lastPoint.y}
+              r={secondaryDotR}
+              className={`monitor-chart-dot monitor-chart-series--${secondaryTone}`}
+            />
+          )}
+
+          {primaryGeom.lastPoint && (
+            <circle
+              cx={primaryGeom.lastPoint.x}
+              cy={primaryGeom.lastPoint.y}
+              r={primaryDotR}
+              className={`monitor-chart-dot monitor-chart-series--${primaryTone}`}
+            />
+          )}
+        </svg>
+      </div>
 
       <div className="monitor-chart-axis" aria-hidden="true">
         <span>{windowLabel}</span>

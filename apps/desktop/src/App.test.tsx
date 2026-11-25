@@ -355,6 +355,35 @@ describe('unified SSH workspace', () => {
     expect(screen.getByTestId(`${host.id}-pty`)).toBe(terminalNode);
     expect(terminalApi.open).toHaveBeenCalledOnce();
   });
+
+  it('keeps the Terminal toolbar strictly above Live monitoring across toggles, combined files, and Focus restore', async () => {
+    const client = await openTerminal();
+    const ptyInput = await screen.findByRole('textbox', { name: 'Synthetic Shell' });
+    await userEvent.type(ptyInput, ' stable');
+    await combine();
+
+    const toolbar = screen.getByRole('banner', { name: `${host.displayName} terminal toolbar` });
+    await userEvent.click(within(toolbar).getByRole('button', { name: 'Show monitoring' }));
+
+    const monitoring = screen.getByRole('region', { name: 'Live monitoring' });
+    const hideBtn = within(toolbar).getByRole('button', { name: 'Hide monitoring' });
+    expect(hideBtn).toBeInTheDocument();
+    expect(
+      toolbar.compareDocumentPosition(monitoring) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await userEvent.click(within(toolbar).getByRole('button', { name: 'Focus' }));
+    expect(screen.queryByRole('region', { name: 'Live monitoring' })).not.toBeInTheDocument();
+    await userEvent.click(within(toolbar).getByRole('button', { name: 'Exit focus' }));
+    expect(screen.getByRole('region', { name: 'Live monitoring' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: `Files on ${host.displayName}` })).toBeVisible();
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback stable',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+    expect(filesApi.open).toHaveBeenCalledOnce();
+    expect(client.isFetching()).toBeGreaterThanOrEqual(0);
+  });
 });
 
 describe('manual update availability check', () => {

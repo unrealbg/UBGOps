@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { CredentialInput, Host, HostInput } from '@ubgops/protocol';
 import { SecurityWorkspace } from './features/security/SecurityWorkspace';
@@ -7,6 +7,7 @@ import { hostApi, applicationError } from './api/client';
 import { hostKeys, useHosts, useHostSession } from './api/queries';
 import { useSelection } from './state/selection';
 import { CommandPalette } from './components/CommandPalette';
+import { ConnectionBadge } from './components/ConnectionBadge';
 import { HostSidebar, type WorkspaceSection } from './components/HostSidebar';
 import { Icon } from './components/Icon';
 import { UpdateCheck } from './components/UpdateCheck';
@@ -14,7 +15,7 @@ import { HostForm } from './features/hosts/HostForm';
 import { HostList } from './features/hosts/HostList';
 import { HostOverview } from './features/overview/HostOverview';
 import { LiveMonitoring } from './features/overview/LiveMonitoring';
-import { TerminalWorkspace } from './features/terminal/TerminalWorkspace';
+import { TerminalWorkspace, type TerminalWorkspaceHandle } from './features/terminal/TerminalWorkspace';
 import { FilesWorkspace } from './features/files/FilesWorkspace';
 import { ServicesWorkspace } from './features/services/ServicesWorkspace';
 import { LogsWorkspace } from './features/logs/LogsWorkspace';
@@ -54,6 +55,7 @@ function SshWorkspace({
   embedded = false,
   showCompactMonitor = false,
   monitoringOpen = false,
+  monitoringSlot,
   onToggleMonitoring,
   onToggleFocus,
   onShowOverview,
@@ -67,6 +69,7 @@ function SshWorkspace({
   embedded?: boolean;
   showCompactMonitor?: boolean;
   monitoringOpen?: boolean;
+  monitoringSlot?: ReactNode;
   onToggleMonitoring?: () => void;
   onToggleFocus: () => void;
   onShowOverview: () => void;
@@ -75,9 +78,11 @@ function SshWorkspace({
   const connection = useHostSession(host.id);
   const [combined, setCombined] = useState(false);
   const [filesRequested, setFilesRequested] = useState(false);
+  const [terminalOpening, setTerminalOpening] = useState(false);
   const [fraction, setFraction] = useState(0.33);
   const [width, setWidth] = useState(0);
   const root = useRef<HTMLDivElement>(null);
+  const terminalActionsRef = useRef<TerminalWorkspaceHandle | null>(null);
   const drag = useRef<{
     pointer: number;
     element: HTMLElement;
@@ -118,8 +123,65 @@ function SshWorkspace({
     setFraction(Math.min(maximum, Math.max(FILES_MIN_WIDTH, next)) / (width - SPLIT_HANDLE_WIDTH));
   }
 
+  const connected = connection.data?.state === 'connected';
+  const toggleFiles = () => {
+    setFilesRequested(true);
+    setCombined((current) => !current);
+  };
+
   return (
     <div className="ssh-host-root" hidden={mode === null}>
+      {mode === 'terminal' && !embedded && (
+        <header className="terminal-heading" aria-label={`${host.displayName} terminal toolbar`}>
+          <div className="terminal-heading-identity">
+            <div className="eyebrow">REMOTE TERMINAL</div>
+            <div className="terminal-title-line">
+              <h1>{host.displayName}</h1>
+              <ConnectionBadge state={connection.data?.state ?? 'disconnected'} />
+              <span className="terminal-endpoint mono">
+                {host.connection.username}@{host.connection.hostname}:{host.connection.port}
+              </span>
+            </div>
+          </div>
+          <div className="heading-actions terminal-workspace-actions">
+            {onToggleMonitoring && (
+              <Button
+                variant="ghost"
+                aria-pressed={monitoringOpen}
+                disabled={!connected}
+                onClick={onToggleMonitoring}
+              >
+                <Icon name="activity" size={14} />
+                {monitoringOpen ? 'Hide monitoring' : 'Show monitoring'}
+              </Button>
+            )}
+            <Button aria-pressed={combined} onClick={toggleFiles}>
+              {combined ? 'Hide files panel' : 'Combine Terminal + Files'}
+            </Button>
+            <Button
+              variant="ghost"
+              aria-pressed={focused}
+              title={focused ? 'Exit terminal focus mode' : 'Focus terminal workspace'}
+              onClick={onToggleFocus}
+            >
+              <Icon name={focused ? 'minimize' : 'maximize'} size={14} />
+              {focused ? 'Exit focus' : 'Focus'}
+            </Button>
+            <Button variant="ghost" onClick={onShowOverview}>
+              Overview
+            </Button>
+            <Button
+              variant="primary"
+              disabled={!connected || terminalOpening}
+              onClick={() => terminalActionsRef.current?.openTerminal()}
+            >
+              <Icon name="plus" size={14} />
+              {terminalOpening ? 'Opening…' : 'New terminal'}
+            </Button>
+          </div>
+        </header>
+      )}
+      {monitoringSlot}
       <div
         ref={root}
         className={`ssh-layout ${split ? 'ssh-layout--split' : ''}`}
@@ -198,13 +260,13 @@ function SshWorkspace({
               combined={combined}
               focused={focused}
               embedded={embedded}
+              hideHeading={!embedded}
               monitoringOpen={monitoringOpen}
               onToggleMonitoring={onToggleMonitoring}
               onToggleFocus={onToggleFocus}
-              onToggleFiles={() => {
-                setFilesRequested(true);
-                setCombined((current) => !current);
-              }}
+              onToggleFiles={toggleFiles}
+              actionsRef={terminalActionsRef}
+              onOpeningChange={setTerminalOpening}
             />
           )}
         </div>
@@ -459,16 +521,6 @@ export default function App({
               onAdd={() => setDialog({ type: 'add' })}
             />
           ) : null}
-          {terminalMonitoringVisible && selectedHost && (
-            <LiveMonitoring
-              key={`term-mon:${selectedHost.id}`}
-              hostId={selectedHost.id}
-              hostSessionId={selectedSession.data?.hostSessionId ?? null}
-              connected
-              visible
-              compact
-            />
-          )}
           {[
             ...new Set([
               ...terminalHosts,
@@ -487,6 +539,7 @@ export default function App({
                   ? 'terminal'
                   : null
               : null;
+            const showMonitoringHere = isSelected && terminalMonitoringVisible && mode === 'terminal';
             return (
               <SshWorkspace
                 key={host.id}
@@ -498,6 +551,18 @@ export default function App({
                 embedded={hostUnified}
                 showCompactMonitor={false}
                 monitoringOpen={terminalMonitoringOpen}
+                monitoringSlot={
+                  showMonitoringHere ? (
+                    <LiveMonitoring
+                      key={`term-mon:${host.id}`}
+                      hostId={host.id}
+                      hostSessionId={selectedSession.data?.hostSessionId ?? null}
+                      connected
+                      visible
+                      compact
+                    />
+                  ) : null
+                }
                 onToggleMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
                 onToggleFocus={() => setTerminalFocus((current) => !current)}
                 onShowOverview={() => selectSection('overview')}
