@@ -49,13 +49,19 @@ pub struct BlockDeviceMeta {
     pub sysfs_path: String,
     pub vendor: String,
     pub model: String,
+    pub disk_seq: Option<u64>,
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiskCounterEntry {
     major: u32,
     minor: u32,
+    size_sectors: u64,
     kind: DiskDeviceKind,
+    disk_seq: Option<u64>,
+    device_id: Option<String>,
+    sysfs_path: String,
     is_partition: bool,
     has_holders: bool,
     is_root_backing: bool,
@@ -66,7 +72,12 @@ struct DiskCounterEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskCounters {
     primary_device: String,
+    primary_major: u32,
+    primary_minor: u32,
     primary_kind: DiskDeviceKind,
+    primary_disk_seq: Option<u64>,
+    primary_device_id: Option<String>,
+    is_root_backing: bool,
     entries: BTreeMap<String, DiskCounterEntry>,
 }
 
@@ -335,7 +346,7 @@ fn clean_sysfs_text(value: &str) -> Result<String, AppError> {
     Ok(trimmed.to_owned())
 }
 
-/// Parses bounded 11-column tab-separated metadata from `/sys/class/block/*`.
+/// Parses bounded 13-column tab-separated metadata from `/sys/class/block/*`.
 pub fn parse_block_metadata(output: &str) -> Result<BTreeMap<String, BlockDeviceMeta>, AppError> {
     let mut devices = BTreeMap::new();
     for raw in output.lines().filter(|line| !line.trim().is_empty()) {
@@ -344,7 +355,7 @@ pub fn parse_block_metadata(output: &str) -> Result<BTreeMap<String, BlockDevice
         }
         let line = raw.trim_end_matches('\r');
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() != 11 {
+        if cols.len() != 13 {
             return Err(invalid());
         }
         let name = cols[0];
@@ -364,6 +375,17 @@ pub fn parse_block_metadata(output: &str) -> Result<BTreeMap<String, BlockDevice
         let sysfs_path = clean_sysfs_text(cols[8])?;
         let vendor = clean_sysfs_text(cols[9])?;
         let model = clean_sysfs_text(cols[10])?;
+        let disk_seq_text = clean_sysfs_text(cols[11])?;
+        let disk_seq = if disk_seq_text.is_empty() {
+            None
+        } else {
+            Some(disk_seq_text.parse::<u64>().map_err(|_| invalid())?)
+        };
+        let device_id_text = clean_sysfs_text(cols[12])?;
+        if device_id_text.len() > 128 {
+            return Err(invalid());
+        }
+        let device_id = (!device_id_text.is_empty()).then_some(device_id_text);
         let meta = BlockDeviceMeta {
             name: name.to_owned(),
             major,
@@ -377,6 +399,8 @@ pub fn parse_block_metadata(output: &str) -> Result<BTreeMap<String, BlockDevice
             sysfs_path,
             vendor,
             model,
+            disk_seq,
+            device_id,
         };
         if devices.insert(name.to_owned(), meta).is_some() {
             return Err(invalid());
@@ -388,7 +412,8 @@ pub fn parse_block_metadata(output: &str) -> Result<BTreeMap<String, BlockDevice
     Ok(devices)
 }
 
-/// Classifies a block device without claiming virtualization layers are bare-metal disks.
+/// Conservatively classifies a block device without claiming bare-metal physical storage
+/// solely from a PCI sysfs path or inferring virtualized storage to be physical.
 pub fn classify_device(meta: &BlockDeviceMeta) -> DiskDeviceKind {
     if meta.is_partition {
         return DiskDeviceKind::Partition;
@@ -414,23 +439,43 @@ pub fn classify_device(meta: &BlockDeviceMeta) -> DiskDeviceKind {
             "qemu",
             "vbox",
             "vmware",
+            "hyper-v",
+            "proxmox",
+            "ovirt",
+            "parallels",
         ]
         .iter()
         .any(|marker| sysfs.contains(marker))
-        || ["virtual", "msft", "qemu", "vbox", "vmware", "virtio", "xen"]
-            .iter()
-            .any(|marker| hw.contains(marker));
+        || [
+            "virtual",
+            "msft",
+            "qemu",
+            "vbox",
+            "vmware",
+            "virtio",
+            "xen",
+            "bochs",
+            "red hat",
+            "google",
+            "amazon",
+            "ec2",
+            "ephemeral",
+            "ebs",
+            "hyper-v",
+            "parallels",
+        ]
+        .iter()
+        .any(|marker| hw.contains(marker));
     if is_virtual {
         DiskDeviceKind::VirtualDisk
-    } else if !meta.sysfs_path.is_empty() && sysfs.contains("/pci") {
-        DiskDeviceKind::PhysicalDisk
     } else {
         DiskDeviceKind::Unknown
     }
 }
 
 /// Verifies `(major, minor)` consistency between procfs and sysfs and selects one unambiguous
-/// primary device without double-counting parent/child layers.
+/// primary device without double-counting parent/child layers or claiming unmatched fallbacks
+/// back the root filesystem.
 pub fn build_disk_counters(
     stats: &BTreeMap<String, DiskStatEntry>,
     meta: &BTreeMap<String, BlockDeviceMeta>,
@@ -461,7 +506,11 @@ pub fn build_disk_counters(
             DiskCounterEntry {
                 major: stat.major,
                 minor: stat.minor,
+                size_sectors: info.size_sectors,
                 kind: classify_device(info),
+                disk_seq: info.disk_seq,
+                device_id: info.device_id.clone(),
+                sysfs_path: info.sysfs_path.clone(),
                 is_partition: info.is_partition,
                 has_holders: info.has_holders,
                 is_root_backing: false,
@@ -484,11 +533,11 @@ pub fn build_disk_counters(
         }
     });
 
-    let (primary_device, root_backing_confirmed) = if let Some(name) = matched_root {
+    let (primary_device, is_root_backing) = if let Some(name) = matched_root {
         (name, true)
     } else {
         // Root source is non-block (e.g. overlayfs or /dev/root) or probe unavailable:
-        // allow only when a single unambiguous leaf non-partition device exists.
+        // allow single-device fallback without asserting it backs `/`.
         let candidates: Vec<&String> = entries
             .iter()
             .filter(|(_, entry)| !entry.is_partition && !entry.has_holders)
@@ -500,15 +549,31 @@ pub fn build_disk_counters(
         (candidates[0].clone(), false)
     };
 
-    if root_backing_confirmed && let Some(primary) = entries.get_mut(&primary_device) {
+    if is_root_backing && let Some(primary) = entries.get_mut(&primary_device) {
         primary.is_root_backing = true;
     }
-    let primary_kind = entries.get(&primary_device).ok_or_else(invalid)?.kind;
+    let primary_entry = entries.get(&primary_device).ok_or_else(invalid)?;
     Ok(DiskCounters {
         primary_device,
-        primary_kind,
+        primary_major: primary_entry.major,
+        primary_minor: primary_entry.minor,
+        primary_kind: primary_entry.kind,
+        primary_disk_seq: primary_entry.disk_seq,
+        primary_device_id: primary_entry.device_id.clone(),
+        is_root_backing,
         entries,
     })
+}
+
+fn same_device_identity(current: &DiskCounterEntry, previous: &DiskCounterEntry) -> bool {
+    current.major == previous.major
+        && current.minor == previous.minor
+        && current.kind == previous.kind
+        && current.size_sectors == previous.size_sectors
+        && current.disk_seq == previous.disk_seq
+        && current.device_id == previous.device_id
+        && current.sysfs_path == previous.sysfs_path
+        && current.is_root_backing == previous.is_root_backing
 }
 
 fn sector_rate(current: u64, previous: u64, seconds: f64) -> Option<f64> {
@@ -523,7 +588,10 @@ fn disk_rates(
     previous: &DiskCounters,
     elapsed: Duration,
 ) -> Option<DiskIoSample> {
-    if elapsed.is_zero() || current.primary_device != previous.primary_device {
+    if elapsed.is_zero()
+        || current.primary_device != previous.primary_device
+        || current.is_root_backing != previous.is_root_backing
+    {
         return None;
     }
     let seconds = elapsed.as_secs_f64();
@@ -532,10 +600,7 @@ fn disk_rates(
     }
     let cur_primary = current.entries.get(&current.primary_device)?;
     let prev_primary = previous.entries.get(&previous.primary_device)?;
-    if cur_primary.major != prev_primary.major
-        || cur_primary.minor != prev_primary.minor
-        || cur_primary.kind != prev_primary.kind
-    {
+    if !same_device_identity(cur_primary, prev_primary) {
         return None;
     }
     let read_bytes_per_second =
@@ -552,6 +617,8 @@ fn disk_rates(
         major: cur_primary.major,
         minor: cur_primary.minor,
         kind: cur_primary.kind,
+        disk_seq: cur_primary.disk_seq.map(|seq| seq.to_string()),
+        device_id: cur_primary.device_id.clone(),
         is_root_backing: cur_primary.is_root_backing,
         read_bytes_per_second,
         write_bytes_per_second,
@@ -566,7 +633,7 @@ fn disk_rates(
         let Some(prev) = previous.entries.get(name) else {
             continue;
         };
-        if cur.major != prev.major || cur.minor != prev.minor || cur.kind != prev.kind {
+        if !same_device_identity(cur, prev) {
             continue;
         }
         let (Some(read_bps), Some(write_bps)) = (
@@ -580,6 +647,8 @@ fn disk_rates(
             major: cur.major,
             minor: cur.minor,
             kind: cur.kind,
+            disk_seq: cur.disk_seq.map(|seq| seq.to_string()),
+            device_id: cur.device_id.clone(),
             is_root_backing: cur.is_root_backing,
             read_bytes_per_second: read_bps,
             write_bytes_per_second: write_bps,
@@ -588,7 +657,12 @@ fn disk_rates(
 
     Some(DiskIoSample {
         primary_device: Some(current.primary_device.clone()),
+        primary_major: current.primary_major,
+        primary_minor: current.primary_minor,
         primary_kind: current.primary_kind,
+        primary_disk_seq: current.primary_disk_seq.map(|seq| seq.to_string()),
+        primary_device_id: current.primary_device_id.clone(),
+        is_root_backing: current.is_root_backing,
         read_bytes_per_second,
         write_bytes_per_second,
         devices,
@@ -736,6 +810,18 @@ fn cancelled() -> AppError {
     AppError::new(ErrorCode::Cancelled, "Host monitoring was cancelled.")
 }
 
+fn resolve_elapsed(
+    current: Option<Instant>,
+    previous: Option<Instant>,
+    fallback: Option<Duration>,
+) -> Option<Duration> {
+    match (current, previous) {
+        (Some(now), Some(old)) => now.checked_duration_since(old).filter(|d| !d.is_zero()),
+        (None, None) => fallback.filter(|d| !d.is_zero()),
+        (Some(_), None) | (None, Some(_)) => None,
+    }
+}
+
 pub fn derive_sample(
     host_id: HostId,
     host_session_id: HostSessionId,
@@ -746,20 +832,20 @@ pub fn derive_sample(
     let cpu_usage_percent = previous
         .and_then(|old| reading.cpu.as_ref().zip(old.cpu.as_ref()))
         .and_then(|(a, b)| cpu_percent(a, b));
-    let network_elapsed = reading
-        .network_observed_at
-        .zip(previous.and_then(|old| old.network_observed_at))
-        .and_then(|(current, old)| current.checked_duration_since(old))
-        .or(elapsed);
+    let network_elapsed = resolve_elapsed(
+        reading.network_observed_at,
+        previous.and_then(|old| old.network_observed_at),
+        elapsed,
+    );
     let (network_rx_bytes_per_second, network_tx_bytes_per_second) = previous
         .and_then(|old| reading.network.as_ref().zip(old.network.as_ref()))
         .and_then(|(a, b)| network_elapsed.and_then(|duration| network_rates(a, b, duration)))
         .map_or((None, None), |(rx, tx)| (Some(rx), Some(tx)));
-    let disk_elapsed = reading
-        .disk_observed_at
-        .zip(previous.and_then(|old| old.disk_observed_at))
-        .and_then(|(current, old)| current.checked_duration_since(old))
-        .or(elapsed);
+    let disk_elapsed = resolve_elapsed(
+        reading.disk_observed_at,
+        previous.and_then(|old| old.disk_observed_at),
+        elapsed,
+    );
     let disk_io = previous
         .and_then(|old| reading.disk_io.as_ref().zip(old.disk_io.as_ref()))
         .and_then(|(a, b)| disk_elapsed.and_then(|duration| disk_rates(a, b, duration)));
@@ -822,7 +908,7 @@ mod tests {
     const NET_B: &str = "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n lo: 30 0 0 0 0 0 0 0 40 0 0 0 0 0 0 0\n eth0: 1500 0 0 0 0 0 0 0 3000 0 0 0 0 0 0 0\n";
     const DISK_A: &str = "   1       0 ram0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   8      48 sdd 10 0 1000 0 20 0 2000 0 0 0 0 0 0 0 0 0 0\n";
     const DISK_B: &str = "   8      48 sdd 20 0 1100 0 40 0 2200 0 0 0 0 0 0 0 0 0 0\n";
-    const META_VIRTUAL: &str = "sdd\t8:48\t2147483648\t0\t0\t\t0\t0\t../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/host0/target0:0:0/0:0:0:3/block/sdd\tMsft\tVirtual Disk\n";
+    const META_VIRTUAL: &str = "sdd\t8:48\t2147483648\t0\t0\t\t0\t0\t../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/host0/target0:0:0/0:0:0:3/block/sdd\tMsft\tVirtual Disk\t28\tnaa.60022480\n";
 
     #[test]
     fn parses_cpu_and_derives_known_delta() {
@@ -852,7 +938,11 @@ mod tests {
         assert_eq!(sample.network_tx_bytes_per_second, Some(200.0));
         let disk = sample.disk_io.expect("disk I/O sample");
         assert_eq!(disk.primary_device.as_deref(), Some("sdd"));
+        assert_eq!((disk.primary_major, disk.primary_minor), (8, 48));
         assert_eq!(disk.primary_kind, DiskDeviceKind::VirtualDisk);
+        assert_eq!(disk.primary_disk_seq.as_deref(), Some("28"));
+        assert_eq!(disk.primary_device_id.as_deref(), Some("naa.60022480"));
+        assert!(disk.is_root_backing);
         // 100 sectors * 512 / 5s = 10240 B/s read; 200 sectors * 512 / 5s = 20480 B/s write
         assert_eq!(disk.read_bytes_per_second, 10_240.0);
         assert_eq!(disk.write_bytes_per_second, 20_480.0);
@@ -952,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_devices_and_prevents_double_counting_across_lvm_stack() {
+    fn classifies_devices_conservatively_and_prevents_double_counting_across_lvm_stack() {
         let stats = parse_diskstats(
             "   8 0 sda 10 0 500 0 20 0 900 0 0 0 0 0 0 0 0 0 0\n\
                 8 1 sda1 10 0 500 0 20 0 900 0 0 0 0 0 0 0 0 0 0\n\
@@ -961,19 +1051,17 @@ mod tests {
         )
         .unwrap();
         let meta = parse_block_metadata(
-            "sda\t8:0\t100000\t0\t0\t\t0\t1\t../../devices/pci0000:00/0000:00:1f.2/ata1/host0/block/sda\tATA\tSamsung SSD 870\n\
-             sda1\t8:1\t99000\t1\t0\t\t0\t1\t../../devices/pci0000:00/0000:00:1f.2/ata1/host0/block/sda/sda1\t\t\n\
-             dm-0\t253:0\t98000\t0\t1\tubuntu--vg-root\t0\t0\t../../devices/virtual/block/dm-0\t\t\n\
-             nvme0n1\t259:0\t200000\t0\t0\t\t0\t1\t../../devices/pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1\t\tSamsung SSD 980 PRO\n",
+            "sda\t8:0\t100000\t0\t0\t\t0\t1\t../../devices/pci0000:00/0000:00:1f.2/ata1/host0/block/sda\tATA\tSamsung SSD 870\t11\tnaa.5002538\n\
+             sda1\t8:1\t99000\t1\t0\t\t0\t1\t../../devices/pci0000:00/0000:00:1f.2/ata1/host0/block/sda/sda1\t\t\t11\t\n\
+             dm-0\t253:0\t98000\t0\t1\tubuntu--vg-root\t0\t0\t../../devices/virtual/block/dm-0\t\t\t12\tLVM-abc\n\
+             nvme0n1\t259:0\t200000\t0\t0\t\t0\t1\t../../devices/pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1\t\tGeneric NVMe\t13\teui.001\n",
         )
         .unwrap();
-        assert_eq!(classify_device(&meta["sda"]), DiskDeviceKind::PhysicalDisk);
+        // Uncertain PCI storage must NOT be inferred as PhysicalDisk from PCI path alone.
+        assert_eq!(classify_device(&meta["sda"]), DiskDeviceKind::Unknown);
         assert_eq!(classify_device(&meta["sda1"]), DiskDeviceKind::Partition);
         assert_eq!(classify_device(&meta["dm-0"]), DiskDeviceKind::DeviceMapper);
-        assert_eq!(
-            classify_device(&meta["nvme0n1"]),
-            DiskDeviceKind::PhysicalDisk
-        );
+        assert_eq!(classify_device(&meta["nvme0n1"]), DiskDeviceKind::Unknown);
 
         let a = build_disk_counters(&stats, &meta, Some("/dev/mapper/ubuntu--vg-root")).unwrap();
         let stats_b = parse_diskstats(
@@ -987,6 +1075,9 @@ mod tests {
         let rates = disk_rates(&b, &a, Duration::from_secs(2)).unwrap();
         assert_eq!(rates.primary_device.as_deref(), Some("dm-0"));
         assert_eq!(rates.primary_kind, DiskDeviceKind::DeviceMapper);
+        assert_eq!(rates.primary_disk_seq.as_deref(), Some("12"));
+        assert_eq!(rates.primary_device_id.as_deref(), Some("LVM-abc"));
+        assert!(rates.is_root_backing);
         // Must report dm-0 alone (10 sectors read, 20 written), NEVER 3x stacked sum.
         assert_eq!(rates.read_bytes_per_second, 2_560.0);
         assert_eq!(rates.write_bytes_per_second, 5_120.0);
@@ -1001,18 +1092,111 @@ mod tests {
         )
         .unwrap();
         let meta = parse_block_metadata(
-            "sda\t8:0\t1000\t0\t0\t\t0\t0\t../../devices/virtual/block/sda\tQEMU\tQEMU HARDDISK\n\
-             sdb\t8:16\t1000\t0\t0\t\t0\t0\t../../devices/virtual/block/sdb\tQEMU\tQEMU HARDDISK\n",
+            "sda\t8:0\t1000\t0\t0\t\t0\t0\t../../devices/virtual/block/sda\tQEMU\tQEMU HARDDISK\t1\t\n\
+             sdb\t8:16\t1000\t0\t0\t\t0\t0\t../../devices/virtual/block/sdb\tQEMU\tQEMU HARDDISK\t2\t\n",
         )
         .unwrap();
         // Overlay root with two whole disks is ambiguous -> must fail closed.
         assert!(build_disk_counters(&stats, &meta, Some("overlay")).is_err());
         // Mismatched major:minor between /proc/diskstats and /sys/class/block must fail closed.
         let bad_meta = parse_block_metadata(
-            "sda\t8:99\t1000\t0\t0\t\t0\t0\t../../devices/virtual/block/sda\tQEMU\tQEMU HARDDISK\n",
+            "sda\t8:99\t1000\t0\t0\t\t0\t0\t../../devices/virtual/block/sda\tQEMU\tQEMU HARDDISK\t1\t\n",
         )
         .unwrap();
         assert!(build_disk_counters(&stats, &bad_meta, Some("/dev/sda")).is_err());
+    }
+
+    #[test]
+    fn resets_baseline_on_reused_identifiers_with_changed_diskseq_id_size_or_sysfs_path() {
+        let stats_a = parse_diskstats(" 8 48 sdd 1 0 100 0 1 0 200 0 0 0 0 0 0 0 0 0 0\n").unwrap();
+        let stats_b = parse_diskstats(" 8 48 sdd 2 0 120 0 2 0 240 0 0 0 0 0 0 0 0 0 0\n").unwrap();
+        let base_meta = parse_block_metadata(
+            "sdd\t8:48\t204800\t0\t0\t\t0\t0\t../../devices/virtual/block/sdd\tQEMU\tQEMU HARDDISK\t28\tnaa.111\n",
+        )
+        .unwrap();
+        let baseline = build_disk_counters(&stats_a, &base_meta, Some("/dev/sdd")).unwrap();
+
+        for (label, changed_meta) in [
+            (
+                "diskseq",
+                "sdd\t8:48\t204800\t0\t0\t\t0\t0\t../../devices/virtual/block/sdd\tQEMU\tQEMU HARDDISK\t29\tnaa.111\n",
+            ),
+            (
+                "device_id",
+                "sdd\t8:48\t204800\t0\t0\t\t0\t0\t../../devices/virtual/block/sdd\tQEMU\tQEMU HARDDISK\t28\tnaa.222\n",
+            ),
+            (
+                "size",
+                "sdd\t8:48\t409600\t0\t0\t\t0\t0\t../../devices/virtual/block/sdd\tQEMU\tQEMU HARDDISK\t28\tnaa.111\n",
+            ),
+            (
+                "sysfs_path",
+                "sdd\t8:48\t204800\t0\t0\t\t0\t0\t../../devices/pci0000:00/block/sdd\tQEMU\tQEMU HARDDISK\t28\tnaa.111\n",
+            ),
+        ] {
+            let parsed_meta = parse_block_metadata(changed_meta).unwrap();
+            let current = build_disk_counters(&stats_b, &parsed_meta, Some("/dev/sdd")).unwrap();
+            assert!(
+                disk_rates(&current, &baseline, Duration::from_secs(2)).is_none(),
+                "expected baseline reset on {label} change"
+            );
+        }
+
+        // Identical identity with valid sector increase and fractional interval (2.5s):
+        // (20 * 512) / 2.5 = 4096.0 B/s read; (40 * 512) / 2.5 = 8192.0 B/s write.
+        let same = build_disk_counters(&stats_b, &base_meta, Some("/dev/sdd")).unwrap();
+        let exact = disk_rates(&same, &baseline, Duration::from_millis(2500)).unwrap();
+        assert_eq!(exact.read_bytes_per_second, 4_096.0);
+        assert_eq!(exact.write_bytes_per_second, 8_192.0);
+    }
+
+    #[test]
+    fn distinguishes_single_device_fallback_from_confirmed_root_and_rejects_bad_monotonic_intervals()
+     {
+        let stats_a = parse_diskstats(" 8 0 sda 1 0 100 0 1 0 200 0 0 0 0 0 0 0 0 0 0\n").unwrap();
+        let stats_b = parse_diskstats(" 8 0 sda 2 0 108 0 2 0 216 0 0 0 0 0 0 0 0 0 0\n").unwrap();
+        let meta = parse_block_metadata(
+            "sda\t8:0\t100000\t0\t0\t\t0\t0\t../../devices/virtual/block/sda\tQEMU\tQEMU HARDDISK\t7\twwid-7\n",
+        )
+        .unwrap();
+        let fallback_a = build_disk_counters(&stats_a, &meta, Some("overlay")).unwrap();
+        let fallback_b = build_disk_counters(&stats_b, &meta, Some("overlay")).unwrap();
+        let fallback_rate = disk_rates(&fallback_b, &fallback_a, Duration::from_secs(4)).unwrap();
+        assert!(!fallback_rate.is_root_backing);
+        assert!(!fallback_rate.devices[0].is_root_backing);
+        assert_eq!(fallback_rate.read_bytes_per_second, 1_024.0);
+        assert_eq!(fallback_rate.write_bytes_per_second, 2_048.0);
+
+        let root_b = build_disk_counters(&stats_b, &meta, Some("/dev/sda")).unwrap();
+        assert!(disk_rates(&root_b, &fallback_a, Duration::from_secs(4)).is_none());
+
+        // Strict resolve_elapsed never silently falls back to sample-completion duration.
+        let t1 = Instant::now();
+        let t2 = t1 + Duration::from_secs(2);
+        assert_eq!(
+            resolve_elapsed(Some(t2), Some(t1), Some(Duration::from_secs(9))),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            resolve_elapsed(Some(t1), Some(t2), Some(Duration::from_secs(5))),
+            None
+        );
+        assert_eq!(
+            resolve_elapsed(Some(t1), Some(t1), Some(Duration::from_secs(5))),
+            None
+        );
+        assert_eq!(
+            resolve_elapsed(Some(t2), None, Some(Duration::from_secs(5))),
+            None
+        );
+        assert_eq!(
+            resolve_elapsed(None, Some(t1), Some(Duration::from_secs(5))),
+            None
+        );
+        assert_eq!(
+            resolve_elapsed(None, None, Some(Duration::from_secs(5))),
+            Some(Duration::from_secs(5))
+        );
     }
 
     #[tokio::test]

@@ -29,7 +29,6 @@ impl Application {
         };
         let reading =
             ubgops_discovery::observe_monitor(transport.as_ref(), cancellation.clone()).await?;
-        let observed = Instant::now();
         let data = slot.data.lock().await;
         if cancellation.is_cancelled()
             || data.generation != generation
@@ -42,20 +41,20 @@ impl Application {
         let previous = baselines
             .get(&host_id)
             .filter(|state| state.session_id == host_session_id);
-        let elapsed = previous.map(|state| observed.saturating_duration_since(state.observed_at));
+        // Probe-specific monotonic Instant timestamps inside MonitorReading/MonitorBaseline
+        // govern network and disk rates; never fall back to sample-completion elapsed time.
         let (sample, baseline) = ubgops_discovery::derive_sample(
             host_id,
             host_session_id,
             reading,
             previous.map(|state| &state.baseline),
-            elapsed,
+            None,
         );
         baselines.insert(
             host_id,
             MonitorState {
                 session_id: host_session_id,
                 baseline,
-                observed_at: observed,
             },
         );
         Ok(sample)

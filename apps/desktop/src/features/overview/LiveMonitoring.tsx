@@ -1,5 +1,5 @@
 import { useId, useMemo } from 'react';
-import type { DiskDeviceKind } from '@ubgops/protocol';
+import type { DiskDeviceKind, DiskIoSample } from '@ubgops/protocol';
 import { Icon } from '../../components/Icon';
 import { bytes, bytesPerSecond, percentage } from './format';
 
@@ -112,11 +112,13 @@ function DualSparkline({
   secondaryValues,
   primaryTone = 'cyan',
   secondaryTone = 'blue',
+  deviceKey,
 }: {
   primaryValues: Array<number | null>;
   secondaryValues: Array<number | null>;
   primaryTone?: SparkTone;
   secondaryTone?: SparkTone;
+  deviceKey?: string | null;
 }) {
   const rawId = useId();
   const gradientId = `dspark-${rawId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
@@ -137,6 +139,8 @@ function DualSparkline({
       aria-hidden="true"
       data-point-count={Math.max(primaryValues.length, secondaryValues.length)}
       data-series-count="2"
+      data-segment-count={primary.segments.length}
+      data-disk-device-key={deviceKey ?? undefined}
     >
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
@@ -191,6 +195,19 @@ function formatDeviceKind(kind: DiskDeviceKind): string {
     case 'unknown':
       return 'Block';
   }
+}
+
+function diskIdentityKey(diskIo: DiskIoSample | null | undefined): string | null {
+  if (!diskIo?.primaryDevice) return null;
+  return [
+    diskIo.primaryDevice,
+    diskIo.primaryMajor,
+    diskIo.primaryMinor,
+    diskIo.primaryKind,
+    diskIo.isRootBacking ? 'root' : 'fallback',
+    diskIo.primaryDiskSeq ?? '',
+    diskIo.primaryDeviceId ?? '',
+  ].join(':');
 }
 
 function usageTone(percent: number | null | undefined): 'ok' | 'warn' | 'danger' | 'muted' {
@@ -287,6 +304,24 @@ export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
   const diskIo = sample?.diskIo ?? null;
   const diskIoReady = !diskIoUnavailable && diskIo !== null;
   const diskIoTone = diskIoUnavailable ? 'muted' : diskIoReady ? 'ok' : 'muted';
+  const activeDiskKey = useMemo(() => {
+    for (let i = visibleHistory.length - 1; i >= 0; i -= 1) {
+      const key = diskIdentityKey(visibleHistory[i]?.diskIo);
+      if (key) return key;
+    }
+    return null;
+  }, [visibleHistory]);
+  const diskHistory = useMemo(() => {
+    if (!activeDiskKey) return visibleHistory;
+    let cutoff = 0;
+    for (let i = 0; i < visibleHistory.length; i += 1) {
+      const key = diskIdentityKey(visibleHistory[i]?.diskIo);
+      if (key && key !== activeDiskKey) {
+        cutoff = i + 1;
+      }
+    }
+    return visibleHistory.slice(cutoff);
+  }, [activeDiskKey, visibleHistory]);
   const compact = props.compact ?? true;
 
   return (
@@ -487,8 +522,16 @@ export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
             </span>
             <span className="monitor-card-header-right">
               {diskIoReady && diskIo.primaryDevice && (
-                <span className="monitor-device-badge" title={`${diskIo.primaryDevice} (${formatDeviceKind(diskIo.primaryKind)})`}>
-                  {diskIo.primaryDevice} · {formatDeviceKind(diskIo.primaryKind)}
+                <span
+                  className="monitor-device-badge"
+                  title={
+                    diskIo.isRootBacking
+                      ? `Root backing block device: ${diskIo.primaryDevice} (${formatDeviceKind(diskIo.primaryKind)})`
+                      : `Single-device fallback (root mount unmatched): ${diskIo.primaryDevice} (${formatDeviceKind(diskIo.primaryKind)})`
+                  }
+                >
+                  {diskIo.primaryDevice} ·{' '}
+                  {diskIo.isRootBacking ? formatDeviceKind(diskIo.primaryKind) : 'Fallback'}
                 </span>
               )}
               <span
@@ -520,10 +563,19 @@ export function LiveMonitoring(props: MonitoringProps & { compact?: boolean }) {
             />
           </div>
           <DualSparkline
-            primaryValues={visibleHistory.map((item) => item.diskIo?.readBytesPerSecond ?? null)}
-            secondaryValues={visibleHistory.map((item) => item.diskIo?.writeBytesPerSecond ?? null)}
+            primaryValues={diskHistory.map((item) =>
+              diskIdentityKey(item.diskIo) === activeDiskKey
+                ? (item.diskIo?.readBytesPerSecond ?? null)
+                : null,
+            )}
+            secondaryValues={diskHistory.map((item) =>
+              diskIdentityKey(item.diskIo) === activeDiskKey
+                ? (item.diskIo?.writeBytesPerSecond ?? null)
+                : null,
+            )}
             primaryTone="emerald"
             secondaryTone="amber"
+            deviceKey={activeDiskKey}
           />
         </article>
       </div>

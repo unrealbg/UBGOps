@@ -139,7 +139,7 @@ impl RemoteSession for TestSession {
                 return Ok(format!("   8       0 sda 10 0 {} 0 20 0 {} 0 0 0 0 0 0 0 0 0 0\n", 1000 + sample * 20, 2000 + sample * 40));
             }
             ReadOnlyCommand::BlockDeviceMetadata => {
-                "sda\t8:0\t16777216\t0\t0\t\t0\t0\t../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sda\tMsft\tVirtual Disk\n"
+                "sda\t8:0\t16777216\t0\t0\t\t0\t0\t../../devices/LNXSYSTM:00/ACPI0004:00/MSFT1000:00/block/sda\tMsft\tVirtual Disk\t10\tnaa.0001\n"
             }
             ReadOnlyCommand::SystemJournal => {
                 if self.logs.stall.load(Ordering::SeqCst) {
@@ -2273,7 +2273,11 @@ async fn disconnect_cancels_delayed_monitoring_and_reconnect_resets_baseline() {
         .expect("second sample after reconnect");
     let disk_io = second_sample.disk_io.expect("disk I/O rate after baseline");
     assert_eq!(disk_io.primary_device.as_deref(), Some("sda"));
+    assert_eq!((disk_io.primary_major, disk_io.primary_minor), (8, 0));
     assert_eq!(disk_io.primary_kind, DiskDeviceKind::VirtualDisk);
+    assert_eq!(disk_io.primary_disk_seq.as_deref(), Some("10"));
+    assert_eq!(disk_io.primary_device_id.as_deref(), Some("naa.0001"));
+    assert!(!disk_io.is_root_backing);
     assert!(disk_io.read_bytes_per_second > 0.0);
     assert!(disk_io.write_bytes_per_second > 0.0);
     assert!(second_sample.warnings.is_empty());

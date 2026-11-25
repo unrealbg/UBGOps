@@ -13,6 +13,7 @@ import { UpdateCheck } from './components/UpdateCheck';
 import { HostForm } from './features/hosts/HostForm';
 import { HostList } from './features/hosts/HostList';
 import { HostOverview } from './features/overview/HostOverview';
+import { LiveMonitoring } from './features/overview/LiveMonitoring';
 import { TerminalWorkspace } from './features/terminal/TerminalWorkspace';
 import { FilesWorkspace } from './features/files/FilesWorkspace';
 import { ServicesWorkspace } from './features/services/ServicesWorkspace';
@@ -52,6 +53,8 @@ function SshWorkspace({
   focused,
   embedded = false,
   showCompactMonitor = false,
+  monitoringOpen = false,
+  onToggleMonitoring,
   onToggleFocus,
   onShowOverview,
   onShowFiles,
@@ -63,6 +66,8 @@ function SshWorkspace({
   focused: boolean;
   embedded?: boolean;
   showCompactMonitor?: boolean;
+  monitoringOpen?: boolean;
+  onToggleMonitoring?: () => void;
   onToggleFocus: () => void;
   onShowOverview: () => void;
   onShowFiles: () => void;
@@ -193,6 +198,8 @@ function SshWorkspace({
               combined={combined}
               focused={focused}
               embedded={embedded}
+              monitoringOpen={monitoringOpen}
+              onToggleMonitoring={onToggleMonitoring}
               onToggleFocus={onToggleFocus}
               onToggleFiles={() => {
                 setFilesRequested(true);
@@ -218,33 +225,42 @@ function SshWorkspace({
   );
 }
 
-export default function App() {
+export default function App({
+  initialSection = 'overview',
+  initialTerminalMonitoring = false,
+}: {
+  initialSection?: WorkspaceSection;
+  initialTerminalMonitoring?: boolean;
+} = {}) {
   const hostsQuery = useHosts();
   const queryClient = useQueryClient();
   const { hostId, select } = useSelection();
   const [dialog, setDialog] = useState<DialogState>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [section, setSection] = useState<WorkspaceSection>('overview');
-  const [terminalHosts, setTerminalHosts] = useState<string[]>([]);
+  const [section, setSection] = useState<WorkspaceSection>(initialSection);
+  const [terminalHosts, setTerminalHosts] = useState<string[]>(() =>
+    initialSection === 'terminal' && hostId ? [hostId] : [],
+  );
   const [fileHosts, setFileHosts] = useState<string[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [terminalFocus, setTerminalFocus] = useState(false);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
+  const [terminalMonitoringOpen, setTerminalMonitoringOpen] = useState(initialTerminalMonitoring);
 
   const hosts = hostsQuery.data ?? [];
   const selectedHost = hosts.find((host) => host.id === hostId) ?? null;
   const selectedSession = useHostSession(selectedHost?.id ?? '');
   const isSelectedConnected = Boolean(selectedHost && selectedSession.data?.state === 'connected');
-  const unifiedConnectedMode = Boolean(
-    selectedHost && isSelectedConnected && (section === 'overview' || section === 'terminal'),
+  const overviewUnifiedMode = Boolean(
+    selectedHost && isSelectedConnected && section === 'overview',
   );
   const activeTerminalFocus = Boolean(
-    terminalFocus && selectedHost && (section === 'terminal' || unifiedConnectedMode),
+    terminalFocus && selectedHost && (section === 'terminal' || overviewUnifiedMode),
   );
   const terminalViewportLocked = Boolean(
-    selectedHost && (section === 'terminal' || unifiedConnectedMode),
+    selectedHost && (section === 'terminal' || overviewUnifiedMode),
   );
 
   useEffect(() => {
@@ -268,11 +284,14 @@ export default function App() {
   }
 
   function selectHost(id: string | null) {
-    if (unifiedConnectedMode && selectedHost) visitTerminal(selectedHost);
+    if (overviewUnifiedMode && selectedHost) visitTerminal(selectedHost);
     select(id);
     setSystemInfoOpen(false);
     const host = hosts.find((candidate) => candidate.id === id);
-    if (!host) setTerminalFocus(false);
+    if (!host) {
+      setTerminalFocus(false);
+      setTerminalMonitoringOpen(false);
+    }
     if (host && section === 'terminal') visitTerminal(host);
     if (host && section === 'files') {
       setFileHosts((current) => (current.includes(host.id) ? current : [...current, host.id]));
@@ -280,7 +299,7 @@ export default function App() {
   }
 
   function selectSection(next: WorkspaceSection) {
-    if (unifiedConnectedMode && selectedHost) visitTerminal(selectedHost);
+    if (overviewUnifiedMode && selectedHost) visitTerminal(selectedHost);
     setSection(next);
     if (next !== 'overview') setSystemInfoOpen(false);
     if (next !== 'terminal' && !(next === 'overview' && isSelectedConnected)) {
@@ -318,8 +337,13 @@ export default function App() {
     }
   }
 
-  const showHostOverview = Boolean(
-    selectedHost && (section === 'overview' || (isSelectedConnected && section === 'terminal')),
+  const showHostOverview = Boolean(selectedHost && section === 'overview');
+  const terminalMonitoringVisible = Boolean(
+    selectedHost &&
+      isSelectedConnected &&
+      section === 'terminal' &&
+      terminalMonitoringOpen &&
+      !activeTerminalFocus,
   );
 
   return (
@@ -387,7 +411,7 @@ export default function App() {
         <main
           id="main-content"
           tabIndex={-1}
-          className={`main-content ${unifiedConnectedMode ? 'main-content--unified' : ''} ${section === 'terminal' && !unifiedConnectedMode ? 'main-content--terminal' : ''} ${section === 'files' ? 'main-content--files' : ''}`}
+          className={`main-content ${overviewUnifiedMode ? 'main-content--unified' : ''} ${section === 'terminal' ? 'main-content--terminal' : ''} ${section === 'files' ? 'main-content--files' : ''}`}
         >
           {hostsQuery.isPending ? (
             <div className="state-panel">
@@ -435,17 +459,27 @@ export default function App() {
               onAdd={() => setDialog({ type: 'add' })}
             />
           ) : null}
+          {terminalMonitoringVisible && selectedHost && (
+            <LiveMonitoring
+              key={`term-mon:${selectedHost.id}`}
+              hostId={selectedHost.id}
+              hostSessionId={selectedSession.data?.hostSessionId ?? null}
+              connected
+              visible
+              compact
+            />
+          )}
           {[
             ...new Set([
               ...terminalHosts,
               ...fileHosts,
-              ...(unifiedConnectedMode && selectedHost ? [selectedHost.id] : []),
+              ...(overviewUnifiedMode && selectedHost ? [selectedHost.id] : []),
             ]),
           ].map((id) => {
             const host = hosts.find((candidate) => candidate.id === id);
             if (!host) return null;
             const isSelected = selectedHost?.id === id;
-            const hostUnified = isSelected && unifiedConnectedMode;
+            const hostUnified = isSelected && overviewUnifiedMode;
             const mode: 'terminal' | 'files' | null = isSelected
               ? section === 'files'
                 ? 'files'
@@ -462,7 +496,9 @@ export default function App() {
                 filesVisited={fileHosts.includes(id)}
                 focused={activeTerminalFocus && isSelected}
                 embedded={hostUnified}
-                showCompactMonitor={!hostUnified}
+                showCompactMonitor={false}
+                monitoringOpen={terminalMonitoringOpen}
+                onToggleMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
                 onToggleFocus={() => setTerminalFocus((current) => !current)}
                 onShowOverview={() => selectSection('overview')}
                 onShowFiles={() => selectSection('files')}
@@ -488,7 +524,7 @@ export default function App() {
         <footer className="app-footer">
           <span>
             UBGOps <span className="footer-divider">/</span>{' '}
-            {unifiedConnectedMode
+            {overviewUnifiedMode
               ? 'Unified SSH workspace'
               : section === 'files'
                 ? 'SFTP files'
@@ -528,14 +564,16 @@ export default function App() {
         activeSection={section}
         sidebarCollapsed={sidebarCollapsed}
         terminalFocus={activeTerminalFocus}
-        unifiedConnected={unifiedConnectedMode}
+        unifiedConnected={overviewUnifiedMode}
         systemInfoOpen={systemInfoOpen}
+        terminalMonitoringOpen={terminalMonitoringOpen}
         onSelectHost={selectHost}
         onSelectSection={selectSection}
         onAddHost={() => setDialog({ type: 'add' })}
         onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
         onToggleTerminalFocus={() => setTerminalFocus((current) => !current)}
         onToggleSystemInfo={() => setSystemInfoOpen((current) => !current)}
+        onToggleTerminalMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
       />
       {dialog && dialog.type !== 'delete' && (
         <HostForm

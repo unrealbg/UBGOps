@@ -40,6 +40,8 @@ if (!import.meta.env.DEV) throw new Error('Visual test entry is development-only
 
 const params = new URLSearchParams(location.search);
 const mode = params.get('state') ?? 'connected';
+const initialSection = params.get('section') === 'terminal' ? 'terminal' : 'overview';
+const initialTerminalMonitoring = params.get('monitoring') === '1';
 
 const hosts: Host[] =
   mode === 'empty'
@@ -158,7 +160,12 @@ monitorApi.sample = async (hostId, hostSessionId): Promise<HostMonitorSample> =>
       ? null
       : {
           primaryDevice: 'sdd',
+          primaryMajor: 8,
+          primaryMinor: 48,
           primaryKind: 'virtualDisk' as const,
+          primaryDiskSeq: '28',
+          primaryDeviceId: 'naa.60022480',
+          isRootBacking: true,
           readBytesPerSecond: diskReadCurve[idx]!,
           writeBytesPerSecond: diskWriteCurve[idx]!,
           devices: [
@@ -167,6 +174,8 @@ monitorApi.sample = async (hostId, hostSessionId): Promise<HostMonitorSample> =>
               major: 8,
               minor: 48,
               kind: 'virtualDisk' as const,
+              diskSeq: '28',
+              deviceId: 'naa.60022480',
               isRootBacking: true,
               readBytesPerSecond: diskReadCurve[idx]!,
               writeBytesPerSecond: diskWriteCurve[idx]!,
@@ -529,6 +538,9 @@ createRoot(root).render(
     >
       UI TEST FIXTURE · Simulated hosts and measurements · No SSH connection
     </div>
-    <App />
+    <App
+      initialSection={initialSection}
+      initialTerminalMonitoring={initialTerminalMonitoring}
+    />
   </QueryClientProvider>,
 );

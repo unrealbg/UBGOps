@@ -23,6 +23,8 @@ export function TerminalWorkspace({
   focused = false,
   onToggleFocus,
   embedded = false,
+  monitoringOpen = false,
+  onToggleMonitoring,
 }: {
   host: Host;
   visible: boolean;
@@ -32,6 +34,8 @@ export function TerminalWorkspace({
   focused?: boolean;
   onToggleFocus?: () => void;
   embedded?: boolean;
+  monitoringOpen?: boolean;
+  onToggleMonitoring?: () => void;
 }) {
   const hostSession = useHostSession(host.id);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
@@ -237,6 +241,17 @@ export function TerminalWorkspace({
 
   const workspaceActionButtons = (
     <div className="heading-actions terminal-workspace-actions">
+      {!embedded && onToggleMonitoring && (
+        <Button
+          variant="ghost"
+          aria-pressed={monitoringOpen}
+          disabled={!connected}
+          onClick={onToggleMonitoring}
+        >
+          <Icon name="activity" size={14} />
+          {monitoringOpen ? 'Hide monitoring' : 'Show monitoring'}
+        </Button>
+      )}
       {onToggleFiles && (
         <Button aria-pressed={combined} onClick={onToggleFiles}>
           {combined ? 'Hide files panel' : 'Combine Terminal + Files'}

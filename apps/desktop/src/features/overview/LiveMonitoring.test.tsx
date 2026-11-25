@@ -1,5 +1,5 @@
 import { act, render, screen } from '@testing-library/react';
-import type { HostMonitorSample } from '@ubgops/protocol';
+import type { DiskIoSample, HostMonitorSample } from '@ubgops/protocol';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ sample: vi.fn() }));
@@ -172,6 +172,50 @@ describe('live monitoring lifecycle', () => {
     expect(mocks.sample).toHaveBeenCalledTimes(1);
   });
 
+function diskSample(
+  name: string,
+  read: number,
+  write: number,
+  {
+    major = 8,
+    minor = 0,
+    diskSeq = '10',
+    deviceId = 'naa.1000',
+    isRootBacking = true,
+  }: {
+    major?: number;
+    minor?: number;
+    diskSeq?: string | null;
+    deviceId?: string | null;
+    isRootBacking?: boolean;
+  } = {},
+): DiskIoSample {
+  return {
+    primaryDevice: name,
+    primaryMajor: major,
+    primaryMinor: minor,
+    primaryKind: 'virtualDisk',
+    primaryDiskSeq: diskSeq,
+    primaryDeviceId: deviceId,
+    isRootBacking,
+    readBytesPerSecond: read,
+    writeBytesPerSecond: write,
+    devices: [
+      {
+        name,
+        major,
+        minor,
+        kind: 'virtualDisk',
+        diskSeq,
+        deviceId,
+        isRootBacking,
+        readBytesPerSecond: read,
+        writeBytesPerSecond: write,
+      },
+    ],
+  };
+}
+
   it('renders six live monitoring cards with dual-series network and real disk I/O states', async () => {
     const firstSample = sample({
       cpuUsagePercent: 42.5,
@@ -179,23 +223,7 @@ describe('live monitoring lifecycle', () => {
       swapUsedBytes: 512 * 1024 ** 2,
       networkRxBytesPerSecond: 1024,
       networkTxBytesPerSecond: 2048,
-      diskIo: {
-        primaryDevice: 'sda',
-        primaryKind: 'virtualDisk',
-        readBytesPerSecond: 4096,
-        writeBytesPerSecond: 0,
-        devices: [
-          {
-            name: 'sda',
-            major: 8,
-            minor: 0,
-            kind: 'virtualDisk',
-            isRootBacking: true,
-            readBytesPerSecond: 4096,
-            writeBytesPerSecond: 0,
-          },
-        ],
-      },
+      diskIo: diskSample('sda', 4096, 0),
     });
     const gapSample = sample({
       cpuUsagePercent: 45,
@@ -240,5 +268,90 @@ describe('live monitoring lifecycle', () => {
       await vi.advanceTimersByTimeAsync(MONITOR_INTERVAL_MS);
     });
     expect(screen.getByText('Unavailable')).toBeInTheDocument();
+  });
+
+  it('isolates Disk I/O chart history across primary device change, major/minor change, replacement, unavailable recovery, and fallback badge', async () => {
+    mocks.sample
+      // 1-2: Device A (sda 8:0 diskSeq=10)
+      .mockResolvedValueOnce(sample({ diskIo: diskSample('sda', 1000, 500) }))
+      .mockResolvedValueOnce(sample({ diskIo: diskSample('sda', 2000, 1000) }))
+      // 3-4: Primary device changed A -> B (sdb 8:16 diskSeq=11)
+      .mockResolvedValueOnce(sample({ diskIo: null }))
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 3000, 1500, { major: 8, minor: 16, diskSeq: '11', deviceId: 'naa.2000' }) }),
+      )
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 4000, 2000, { major: 8, minor: 16, diskSeq: '11', deviceId: 'naa.2000' }) }),
+      )
+      // 6-7: Same name 'sdb', changed major/minor (8:32)
+      .mockResolvedValueOnce(sample({ diskIo: null }))
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 5000, 2500, { major: 8, minor: 32, diskSeq: '12', deviceId: 'naa.2000' }) }),
+      )
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 6000, 3000, { major: 8, minor: 32, diskSeq: '12', deviceId: 'naa.2000' }) }),
+      )
+      // 9-10: Detectable replacement (same name 'sdb', same 8:32, changed diskSeq '13' + deviceId)
+      .mockResolvedValueOnce(sample({ diskIo: null }))
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 7000, 3500, { major: 8, minor: 32, diskSeq: '13', deviceId: 'naa.3000' }) }),
+      )
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 8000, 4000, { major: 8, minor: 32, diskSeq: '13', deviceId: 'naa.3000' }) }),
+      )
+      // 12-14: Unavailable sample followed by recovery on SAME device identity + fallback badge check later
+      .mockResolvedValueOnce(
+        sample({ diskIo: null, warnings: [{ code: 'discovery', message: 'disk I/O monitoring is unavailable.', hostKey: null }] }),
+      )
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 9000, 4500, { major: 8, minor: 32, diskSeq: '13', deviceId: 'naa.3000' }) }),
+      )
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('sdb', 10000, 5000, { major: 8, minor: 32, diskSeq: '13', deviceId: 'naa.3000' }) }),
+      )
+      // 15: Single-device fallback (isRootBacking=false)
+      .mockResolvedValueOnce(
+        sample({ diskIo: diskSample('nvme0n1', 1024, 512, { major: 259, minor: 0, diskSeq: '99', deviceId: 'eui.9', isRootBacking: false }) }),
+      );
+
+    render(<LiveMonitoring hostId="host-a" hostSessionId={SESSION_A} connected visible />);
+    const tick = async (times = 1) => {
+      for (let i = 0; i < times; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(MONITOR_INTERVAL_MS);
+        });
+      }
+    };
+    const chart = () => document.querySelector('.monitor-card--diskio .monitor-chart')!;
+
+    await act(async () => { await Promise.resolve(); });
+    await tick(1); // sample 2 (sda)
+    expect(chart()).toHaveAttribute('data-point-count', '2');
+    expect(chart().getAttribute('data-disk-device-key')).toContain('sda:8:0:');
+
+    await tick(3); // sample 5 (sdb 8:16) — must exclude sda samples!
+    expect(chart().getAttribute('data-disk-device-key')).toContain('sdb:8:16:');
+    expect(chart()).toHaveAttribute('data-point-count', '3'); // [null reset, b1, b2]
+    expect(chart()).toHaveAttribute('data-segment-count', '1');
+
+    await tick(3); // sample 8 (sdb 8:32) — must exclude 8:16 samples!
+    expect(chart().getAttribute('data-disk-device-key')).toContain('sdb:8:32:');
+    expect(chart()).toHaveAttribute('data-point-count', '3');
+    expect(chart()).toHaveAttribute('data-segment-count', '1');
+
+    await tick(3); // sample 11 (sdb 8:32 replaced diskSeq=13) — must exclude diskSeq=12 samples!
+    expect(chart().getAttribute('data-disk-device-key')).toContain('13:naa.3000');
+    expect(chart()).toHaveAttribute('data-point-count', '3');
+    expect(chart()).toHaveAttribute('data-segment-count', '1');
+
+    await tick(1); // sample 12 (unavailable)
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+
+    await tick(2); // samples 13-14 (recovery on same diskSeq=13 -> preserves 2 segments across unavailable gap!)
+    expect(chart()).toHaveAttribute('data-point-count', '6');
+    expect(chart()).toHaveAttribute('data-segment-count', '2');
+
+    await tick(1); // sample 15 (explicit Fallback badge)
+    expect(screen.getByText('nvme0n1 · Fallback')).toBeInTheDocument();
   });
 });

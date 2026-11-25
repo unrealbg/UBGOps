@@ -74,7 +74,6 @@ mod terminal;
 pub(crate) struct MonitorState {
     pub session_id: HostSessionId,
     pub baseline: ubgops_discovery::MonitorBaseline,
-    pub observed_at: Instant,
 }
 pub(crate) struct RotationAuthority {
     pub plan: HostKeyRotationPlan,

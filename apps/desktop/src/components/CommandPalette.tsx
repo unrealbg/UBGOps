@@ -24,12 +24,14 @@ export function CommandPalette({
   terminalFocus,
   unifiedConnected = false,
   systemInfoOpen = false,
+  terminalMonitoringOpen = false,
   onSelectHost,
   onSelectSection,
   onAddHost,
   onToggleSidebar,
   onToggleTerminalFocus,
   onToggleSystemInfo,
+  onToggleTerminalMonitoring,
 }: {
   open: boolean;
   onClose: () => void;
@@ -40,12 +42,14 @@ export function CommandPalette({
   terminalFocus: boolean;
   unifiedConnected?: boolean;
   systemInfoOpen?: boolean;
+  terminalMonitoringOpen?: boolean;
   onSelectHost: (id: string | null) => void;
   onSelectSection: (section: WorkspaceSection) => void;
   onAddHost: () => void;
   onToggleSidebar: () => void;
   onToggleTerminalFocus: () => void;
   onToggleSystemInfo?: () => void;
+  onToggleTerminalMonitoring?: () => void;
 }) {
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
@@ -155,6 +159,18 @@ export function CommandPalette({
       });
     }
 
+    if (selectedHost && activeSection === 'terminal' && onToggleTerminalMonitoring) {
+      items.push({
+        id: 'action:terminal-monitoring',
+        category: 'Terminal',
+        label: terminalMonitoringOpen ? 'Hide live monitoring' : 'Show live monitoring',
+        detail: 'Toggle the 6-card telemetry strip above Terminal',
+        icon: 'activity',
+        keywords: 'monitoring telemetry charts cpu memory disk network',
+        run: onToggleTerminalMonitoring,
+      });
+    }
+
     if (selectedHost && unifiedConnected && onToggleSystemInfo) {
       items.push({
         id: 'action:system-info',
@@ -189,10 +205,12 @@ export function CommandPalette({
     onToggleSidebar,
     onToggleSystemInfo,
     onToggleTerminalFocus,
+    onToggleTerminalMonitoring,
     selectedHost,
     sidebarCollapsed,
     systemInfoOpen,
     terminalFocus,
+    terminalMonitoringOpen,
     unifiedConnected,
   ]);
 

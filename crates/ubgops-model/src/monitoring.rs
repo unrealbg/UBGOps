@@ -22,6 +22,8 @@ pub struct DiskIoDeviceSample {
     pub major: u32,
     pub minor: u32,
     pub kind: DiskDeviceKind,
+    pub disk_seq: Option<String>,
+    pub device_id: Option<String>,
     pub is_root_backing: bool,
     pub read_bytes_per_second: f64,
     pub write_bytes_per_second: f64,
@@ -32,7 +34,12 @@ pub struct DiskIoDeviceSample {
 #[serde(rename_all = "camelCase")]
 pub struct DiskIoSample {
     pub primary_device: Option<String>,
+    pub primary_major: u32,
+    pub primary_minor: u32,
     pub primary_kind: DiskDeviceKind,
+    pub primary_disk_seq: Option<String>,
+    pub primary_device_id: Option<String>,
+    pub is_root_backing: bool,
     pub read_bytes_per_second: f64,
     pub write_bytes_per_second: f64,
     pub devices: Vec<DiskIoDeviceSample>,
