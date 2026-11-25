@@ -358,6 +358,8 @@ fn setup(stall: bool) -> (tempfile::TempDir, Arc<Application>, Arc<TestProvider>
         sftp_startups: Mutex::new(HashMap::new()),
         file_plans: ubgops_sftp::FilePlanStore::default(),
         transfers: ubgops_sftp::TransferManager::new(),
+        read_only_opens: Mutex::new(HashMap::new()),
+        read_only_open_limit: Semaphore::new(8),
         monitor_baselines: Mutex::new(HashMap::new()),
         monitor_gates: Mutex::new(HashMap::new()),
         service_gates: Mutex::new(HashMap::new()),
@@ -2757,6 +2759,8 @@ struct LifecycleSftpClient {
     stall_plan_identity: AtomicBool,
     stall_plan_stat: AtomicBool,
     stall_editor_read: AtomicBool,
+    stall_readonly_read: AtomicBool,
+    readonly_payload: std::sync::Mutex<Result<Vec<u8>, AppError>>,
     plan_remote_started: Notify,
     plan_remote_release: Notify,
     closed: Notify,
@@ -2806,6 +2810,8 @@ impl LifecycleSftpClient {
             stall_plan_identity: AtomicBool::new(false),
             stall_plan_stat: AtomicBool::new(false),
             stall_editor_read: AtomicBool::new(false),
+            stall_readonly_read: AtomicBool::new(false),
+            readonly_payload: std::sync::Mutex::new(Ok(b"\xef\xbb\xbfhello\r\n".to_vec())),
             plan_remote_started: Notify::new(),
             plan_remote_release: Notify::new(),
             closed: Notify::new(),
@@ -2894,6 +2900,31 @@ impl ubgops_sftp::SftpClient for LifecycleSftpClient {
             self.plan_remote_release.notified().await;
         }
         Ok(b"data".to_vec())
+    }
+    async fn read_only_file_bytes(
+        &self,
+        _path: &str,
+        cancel: CancellationToken,
+    ) -> Result<ubgops_sftp::ReadOnlyFileBytes, AppError> {
+        if self.stall_readonly_read.swap(false, Ordering::SeqCst) {
+            self.plan_remote_started.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(AppError::new(
+                        ErrorCode::Cancelled,
+                        "Read-only file loading was cancelled.",
+                    ));
+                }
+                _ = self.plan_remote_release.notified() => {}
+            }
+        }
+        let bytes = self.readonly_payload.lock().unwrap().clone()?;
+        Ok(ubgops_sftp::ReadOnlyFileBytes {
+            bytes,
+            modified_at: Some("2026-11-25T12:00:00Z".into()),
+            permissions: Some("-rw-r--r--".into()),
+        })
     }
     async fn preserve_editor_metadata(
         &self,
@@ -4218,4 +4249,157 @@ async fn core_retry_boundary_releases_authority_and_requires_new_selection() {
             .code,
         ErrorCode::Policy
     );
+}
+
+#[tokio::test]
+async fn readonly_document_enforces_session_utf8_cancellation_and_no_write_authority() {
+    let (profile, app, _) = setup(false);
+    let host = app.save_host(input(), Some(credential())).await.unwrap();
+    app.connect_host(host.id).await.unwrap();
+    let session_id = app
+        .slot(host.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let client = LifecycleSftpClient::new(host.id, session_id);
+    let sftp_id = client.info.id;
+    app.sftp_sessions
+        .lock()
+        .await
+        .insert(host.id, client.clone());
+
+    let request_id = ReadOnlyDocumentId::new();
+    let doc = app
+        .open_remote_readonly_document(
+            host.id,
+            session_id,
+            sftp_id,
+            request_id,
+            "/etc/test\n.conf".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(doc.text, "hello\n");
+    assert_eq!(doc.newline, TextNewline::CrLf);
+    assert!(doc.bom);
+    assert_eq!(doc.display_name, "/etc/test\\u{000A}.conf");
+
+    // Read-only document IDs allocate no save authority in FilePlanStore.
+    let save_err = app
+        .plan_remote_text_save(
+            host.id,
+            session_id,
+            sftp_id,
+            EditorDocumentId(doc.id.0),
+            "mutated".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(save_err.code, ErrorCode::FilePolicy);
+
+    // Reject NUL and invalid UTF-8 bytes.
+    *client.readonly_payload.lock().unwrap() = Ok(b"abc\0def".to_vec());
+    assert_eq!(
+        app.open_remote_readonly_document(
+            host.id,
+            session_id,
+            sftp_id,
+            ReadOnlyDocumentId::new(),
+            "/tmp/bin".into(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::FilePolicy
+    );
+    *client.readonly_payload.lock().unwrap() = Ok(vec![0xff, 0xfe]);
+    assert_eq!(
+        app.open_remote_readonly_document(
+            host.id,
+            session_id,
+            sftp_id,
+            ReadOnlyDocumentId::new(),
+            "/tmp/badutf8".into(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::FilePolicy
+    );
+
+    // Reject stale session IDs.
+    *client.readonly_payload.lock().unwrap() = Ok(b"ok".to_vec());
+    assert_eq!(
+        app.open_remote_readonly_document(
+            host.id,
+            HostSessionId::new(),
+            sftp_id,
+            ReadOnlyDocumentId::new(),
+            "/tmp/a.txt".into(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Connection
+    );
+
+    // Explicit cancellation cancels an in-flight read-only open.
+    client.stall_readonly_read.store(true, Ordering::SeqCst);
+    let cancel_id = ReadOnlyDocumentId::new();
+    let app_clone = app.clone();
+    let pending = tokio::spawn(async move {
+        app_clone
+            .open_remote_readonly_document(
+                host.id,
+                session_id,
+                sftp_id,
+                cancel_id,
+                "/tmp/slow.txt".into(),
+            )
+            .await
+    });
+    client.plan_remote_started.notified().await;
+    assert!(
+        !app.cancel_remote_readonly_open(host.id, HostSessionId::new(), sftp_id, cancel_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        app.cancel_remote_readonly_open(host.id, session_id, sftp_id, cancel_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        pending.await.unwrap().unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+
+    // Disconnect cancels active read-only opens.
+    client.stall_readonly_read.store(true, Ordering::SeqCst);
+    let app_clone = app.clone();
+    let pending_dc = tokio::spawn(async move {
+        app_clone
+            .open_remote_readonly_document(
+                host.id,
+                session_id,
+                sftp_id,
+                ReadOnlyDocumentId::new(),
+                "/tmp/dc.txt".into(),
+            )
+            .await
+    });
+    client.plan_remote_started.notified().await;
+    app.disconnect_host(host.id).await.unwrap();
+    assert_eq!(
+        pending_dc.await.unwrap().unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+
+    // No read-only audit records or file content leaked to audit log.
+    let audit = std::fs::read_to_string(profile.path().join("audit.jsonl")).unwrap_or_default();
+    assert!(!audit.contains("hello"));
+    assert!(!audit.contains("readonly"));
 }

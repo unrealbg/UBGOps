@@ -11,6 +11,9 @@ use ubgops_sftp::{FilePlanStore, SftpClient, TransferManager};
 use ubgops_ssh::{KnownHosts, SshProvider};
 use ubgops_terminal::TerminalManager;
 
+pub(crate) type ReadOnlyOpenKey = (HostId, HostSessionId, SftpSessionId, ReadOnlyDocumentId);
+pub(crate) type ReadOnlyOpenMap = Mutex<HashMap<ReadOnlyOpenKey, CancellationToken>>;
+
 /// Typed application facade. All connection mutations are serialized just long enough
 /// to update local state; network work never holds the metadata gate.
 pub struct Application {
@@ -24,6 +27,8 @@ pub struct Application {
     pub(crate) sftp_startups: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
     pub(crate) file_plans: FilePlanStore,
     pub(crate) transfers: TransferManager,
+    pub(crate) read_only_opens: ReadOnlyOpenMap,
+    pub(crate) read_only_open_limit: Semaphore,
     pub(crate) monitor_baselines: Mutex<HashMap<HostId, MonitorState>>,
     pub(crate) monitor_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
     pub(crate) service_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
@@ -124,6 +129,8 @@ impl Application {
             sftp_startups: Mutex::new(HashMap::new()),
             file_plans: FilePlanStore::default(),
             transfers: TransferManager::new(),
+            read_only_opens: Mutex::new(HashMap::new()),
+            read_only_open_limit: Semaphore::new(8),
             monitor_baselines: Mutex::new(HashMap::new()),
             monitor_gates: Mutex::new(HashMap::new()),
             service_gates: Mutex::new(HashMap::new()),
@@ -229,6 +236,9 @@ impl Application {
             slots
         };
         self.transfers.shutdown();
+        for (_, cancel) in self.read_only_opens.lock().await.drain() {
+            cancel.cancel();
+        }
         let sessions = self
             .sftp_sessions
             .lock()

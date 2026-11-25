@@ -8,6 +8,12 @@ import { useHostSession } from '../../api/queries';
 import { Icon } from '../../components/Icon';
 import { buildRemoteBreadcrumbs, parentRemotePath } from './remotePath';
 import { RemoteTextEditor } from './RemoteTextEditor';
+import { ReadOnlyEditorPanel } from '../editor/ReadOnlyEditorPanel';
+import {
+  ReadOnlyEditorProvider,
+  useOptionalReadOnlyEditor,
+  useReadOnlyEditor,
+} from '../editor/ReadOnlyEditorRegistry';
 
 type EntryDialog = { type: 'mkdir'; value: string } | { type: 'rename'; entry: RemoteEntry; value: string } | null;
 type Approval = { session: SftpSessionInfo; generation: number; plans: FileOperationPlan[] };
@@ -20,16 +26,38 @@ function ownsPlan(session: SftpSessionInfo, plan: FileOperationPlan) {
   return session.hostId === plan.hostId && session.hostSessionId === plan.hostSessionId && session.id === plan.sftpSessionId;
 }
 
-export function FilesWorkspace({ host, visible, onShowOverview, presentation = 'full', onShowFull }: {
+export function FilesWorkspace(props: {
+  host: Host;
+  visible: boolean;
+  onShowOverview: () => void;
+  presentation?: 'full' | 'compact';
+  onShowFull?: () => void;
+}) {
+  const outerRegistry = useOptionalReadOnlyEditor();
+  if (outerRegistry) {
+    return <FilesWorkspaceInner {...props} />;
+  }
+  return (
+    <ReadOnlyEditorProvider>
+      <FilesWorkspaceInner {...props} />
+    </ReadOnlyEditorProvider>
+  );
+}
+
+function FilesWorkspaceInner({ host, visible, onShowOverview, presentation = 'full', onShowFull }: {
   host: Host; visible: boolean; onShowOverview: () => void;
   presentation?: 'full' | 'compact'; onShowFull?: () => void;
 }) {
+  const registry = useReadOnlyEditor();
   const connection = useHostSession(host.id);
   const [sftp, setSftp] = useState<SftpSessionInfo | null>(null);
   const [listing, setListing] = useState<{ path: string; entries: RemoteEntry[]; partial: boolean; entryCap: number } | null>(null);
   const [address, setAddress] = useState('');
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const historyRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1);
+  const [viewerOpen, setViewerOpen] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState('');
   const [showHidden, setShowHidden] = useState(false);
@@ -101,32 +129,60 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
     setApproval(next);
   }
 
-  async function loadDirectory(session: SftpSessionInfo, target: string, mode: 'push' | 'replace' | 'history' = 'push') {
+  async function loadDirectory(
+    session: SftpSessionInfo,
+    target: string,
+    mode:
+      | { type: 'push' }
+      | { type: 'replace' }
+      | { type: 'history'; targetIndex?: number } = { type: 'push' },
+  ) {
     const generation = ++requestGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const result = await filesApi.list(session, target);
-      if (generation !== requestGeneration.current) return;
-      if (result.hostId !== session.hostId || result.hostSessionId !== session.hostSessionId || result.sftpSessionId !== session.id) {
-        throw new Error('The directory listing does not match the current SFTP session.');
+      if (!mounted.current || generation !== requestGeneration.current) return;
+      if (
+        !activeSession.current ||
+        !sameSession(activeSession.current, session) ||
+        result.hostId !== session.hostId ||
+        result.hostSessionId !== session.hostSessionId ||
+        result.sftpSessionId !== session.id
+      ) {
+        return;
       }
       setListing({ path: result.path, entries: result.entries, partial: result.partial, entryCap: result.entryCap });
       setAddress(result.path);
       setSelected(new Set());
       setStale(false);
       setBreadcrumbMenuOpen(false);
-      if (mode === 'push') {
-        setHistory((current) => [...current.slice(0, historyIndex + 1), result.path]);
-        setHistoryIndex((current) => current + 1);
-      } else if (mode === 'replace') {
+      if (mode.type === 'push') {
+        const nextHistory = [...historyRef.current.slice(0, historyIndexRef.current + 1), result.path];
+        const nextIndex = nextHistory.length - 1;
+        historyRef.current = nextHistory;
+        historyIndexRef.current = nextIndex;
+        setHistory(nextHistory);
+        setHistoryIndex(nextIndex);
+      } else if (mode.type === 'replace') {
+        historyRef.current = [result.path];
+        historyIndexRef.current = 0;
         setHistory([result.path]);
         setHistoryIndex(0);
+      } else if (typeof mode.targetIndex === 'number') {
+        const boundedIndex = Math.max(
+          0,
+          Math.min(historyRef.current.length - 1, mode.targetIndex),
+        );
+        historyIndexRef.current = boundedIndex;
+        setHistoryIndex(boundedIndex);
       }
     } catch (reason) {
-      if (generation === requestGeneration.current) setError(applicationError(reason).message);
+      if (mounted.current && generation === requestGeneration.current) {
+        setError(applicationError(reason).message);
+      }
     } finally {
-      if (generation === requestGeneration.current) setLoading(false);
+      if (mounted.current && generation === requestGeneration.current) setLoading(false);
     }
   }
 
@@ -164,7 +220,11 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
       }
       activeSession.current = session;
       setSftp(session);
-      void loadDirectory(session, listing?.path ?? session.rootPath, listing ? 'history' : 'replace');
+      void loadDirectory(
+        session,
+        listing?.path ?? session.rootPath,
+        listing ? { type: 'history' } : { type: 'replace' },
+      );
     }).catch((reason) => {
       // Retire this failed attempt even after hide, without evicting a newer owner or Promise.
       if (openingSession.current?.owner === connectionOwner && openingSession.current.promise === opening.promise) {
@@ -176,6 +236,10 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
     // Reopen after a visible disconnect/reconnect transition; keep location by host.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [host.id, hostSessionId, connected, connectionOwner, visible]);
+
+  useEffect(() => {
+    registry.syncHostConnection(host.id, connected, hostSessionId, ownsConnection ? sftp.id : null);
+  }, [registry, host.id, connected, hostSessionId, ownsConnection, sftp]);
 
   useEffect(() => {
     if (!visible || !connected) return;
@@ -274,7 +338,7 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
         if (!isCurrent(session, pending.generation)) { discardStale(session, pending.plans); return; }
         await filesApi.execute(session, plan.id);
       }
-      if (listing && isCurrent(session, pending.generation)) await loadDirectory(session, listing.path, 'history');
+      if (listing && isCurrent(session, pending.generation)) await loadDirectory(session, listing.path, { type: 'history' });
     } catch (reason) {
       discardStale(pending.session, pending.plans);
       if (isCurrent(pending.session, pending.generation)) setError(applicationError(reason).message);
@@ -307,6 +371,12 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
     } catch (reason) { if (mounted.current && session && isCurrent(session, generation)) setError(applicationError(reason).message); }
     finally { openingEditorGuard.current = false; if (mounted.current) setOpeningEditor(false); }
   }
+  async function viewReadOnly(entry: RemoteEntry) {
+    if (entry.kind !== 'file' || editor || !sftp || !connected || !ownsConnection || stale) return;
+    setError(null);
+    setViewerOpen(true);
+    await registry.openDocument(sftp, entry.path);
+  }
   async function retry(job: TransferJob) {
     let session: SftpSessionInfo | null = null;
     let generation = approvalGeneration.current;
@@ -321,16 +391,15 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
     () => (currentPath ? buildRemoteBreadcrumbs(currentPath) : []),
     [currentPath],
   );
-  const canGoBack = historyIndex > 0 && !loading;
-  const canGoForward = historyIndex >= 0 && historyIndex < history.length - 1 && !loading;
+  const canGoBack = !!sftp && historyIndex > 0;
+  const canGoForward = !!sftp && historyIndex >= 0 && historyIndex < history.length - 1;
   const canGoParent = !!sftp && !!parentPath && !loading;
   const canRefresh = !!sftp && !!listing && !loading;
 
   function visitHistory(index: number) {
-    const target = history[index];
-    if (!sftp || !target) return;
-    setHistoryIndex(index);
-    void loadDirectory(sftp, target, 'history');
+    const target = historyRef.current[index];
+    if (!sftp || !connected || !ownsConnection || !target) return;
+    void loadDirectory(sftp, target, { type: 'history', targetIndex: index });
   }
 
   function up() {
@@ -345,7 +414,7 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
     const target = event.target;
     if (
       target instanceof HTMLElement &&
-      target.closest('input, textarea, select, [contenteditable="true"]')
+      target.closest('input, textarea, select, [contenteditable="true"], .monaco-editor, .readonly-editor-panel')
     ) {
       return;
     }
@@ -368,6 +437,14 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
       }
     }
   }
+
+  const hostTabs = registry.documents.filter((doc) => doc.hostId === host.id);
+  const hostPending = registry.pendingOpens.filter((item) => item.hostId === host.id);
+  const hostViewerError = registry.errorsByHost[host.id] ?? null;
+  const activeHostTab =
+    hostTabs.find((doc) => doc.id === registry.activeByHost[host.id]) ?? hostTabs[0] ?? null;
+  const showReadOnlyViewer =
+    !compact && !editor && viewerOpen && (hostTabs.length > 0 || hostPending.length > 0 || hostViewerError !== null);
 
   const maxVisibleCrumbs = compact ? 4 : 6;
   const shouldCollapseCrumbs = breadcrumbs.length > maxVisibleCrumbs;
@@ -429,7 +506,7 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
             disabled={!canRefresh}
             aria-label="Refresh"
             title={canRefresh ? 'Refresh current directory' : 'Directory unavailable to refresh'}
-            onClick={() => { if (sftp && listing) void loadDirectory(sftp, listing.path, 'history'); }}
+            onClick={() => { if (sftp && listing) void loadDirectory(sftp, listing.path, { type: 'history' }); }}
           >
             <Icon name="refresh" size={15} />
           </button>
@@ -535,6 +612,7 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
       <div className="files-actions" hidden={compact}>
         <Button disabled={!canMutate} onClick={() => void upload()}>Upload files…</Button>
         <Button disabled={!canMutate || !selectedEntries.some((entry) => entry.kind === 'file')} onClick={() => void download()}>Download selected…</Button>
+        <Button disabled={!canMutate || !!editor || selectedEntries.length !== 1 || selectedEntries[0]?.kind !== 'file'} onClick={() => { const entry = selectedEntries[0]; if (entry) void viewReadOnly(entry); }}>View (Read-only)</Button>
         <Button disabled={!canMutate || !!editor || openingEditor || selectedEntries.length !== 1 || selectedEntries[0]?.kind !== 'file'} onClick={() => { const entry = selectedEntries[0]; if (entry) void openEditor(entry); }}>Edit</Button>
         <Button disabled={!canMutate} onClick={() => setDialog({ type: 'mkdir', value: '' })}>New directory</Button>
         <Button disabled={!canMutate || selectedEntries.length !== 1 || selectedEntries[0]?.kind !== 'file'} onClick={() => { const entry = selectedEntries[0]; if (entry) setDialog({ type: 'rename', entry, value: entry.name }); }}>Rename</Button>
@@ -545,9 +623,41 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
         <label><input type="checkbox" checked={showHidden} onChange={(event) => setShowHidden(event.target.checked)} /> Show hidden</label>
         <label>Filter loaded entries <input value={filter} onChange={(event) => setFilter(event.target.value)} /></label>
         <span>{listing ? `${listing.entries.length}${listing.partial ? '+' : ''} loaded` : 'No listing'}</span>
+        {!compact && !editor && !showReadOnlyViewer && (hostTabs.length > 0 || hostPending.length > 0) && (
+          <Button onClick={() => setViewerOpen(true)}>
+            Open viewer ({hostTabs.length})
+          </Button>
+        )}
       </div>
       </div>
-      {editor ? <RemoteTextEditor initial={editor} host={host} session={sftp} connected={connected} visible={visible} transfers={transfers} onClose={() => setEditor(null)} /> : <div className="files-table-wrap">
+      {editor ? <RemoteTextEditor initial={editor} host={host} session={sftp} connected={connected} visible={visible} transfers={transfers} onClose={() => setEditor(null)} /> : showReadOnlyViewer ? (
+        <ReadOnlyEditorPanel
+          hostDisplayName={host.displayName}
+          tabs={hostTabs}
+          totalOpenCount={registry.documents.length}
+          activeTab={activeHostTab}
+          pendingOpens={hostPending}
+          error={hostViewerError}
+          onSelectTab={(documentId) => registry.selectDocument(host.id, documentId)}
+          onCloseTab={(documentId) => {
+            registry.closeDocument(documentId);
+            if (hostTabs.length <= 1 && hostPending.length === 0 && !hostViewerError) {
+              setViewerOpen(false);
+            }
+          }}
+          onCloseAllHostTabs={() => {
+            registry.closeHostDocuments(host.id);
+            registry.clearHostError(host.id);
+            if (hostPending.length === 0) setViewerOpen(false);
+          }}
+          onCancelPending={(requestId) => { void registry.cancelOpen(host.id, requestId); }}
+          onDismissError={() => {
+            registry.clearHostError(host.id);
+            if (hostTabs.length === 0 && hostPending.length === 0) setViewerOpen(false);
+          }}
+          onBrowseFiles={() => setViewerOpen(false)}
+        />
+      ) : <div className="files-table-wrap">
         {loading && !listing ? <Spinner label="Loading remote directory…" /> : (
           <table className="files-table">
             <thead><tr><th><span className="sr-only">Select</span></th><th><button onClick={() => { if (sort === 'name') setDescending(!descending); else { setSort('name'); setDescending(false); } }}>Name</button></th><th>Type</th><th><button onClick={() => { if (sort === 'size') setDescending(!descending); else { setSort('size'); setDescending(false); } }}>Size</button></th><th><button onClick={() => { if (sort === 'modified') setDescending(!descending); else { setSort('modified'); setDescending(false); } }}>Modified</button></th><th>Mode</th><th><span className="sr-only">Actions</span></th></tr></thead>
@@ -581,7 +691,18 @@ export function FilesWorkspace({ host, visible, onShowOverview, presentation = '
               <td><input aria-label={`Select ${entry.displayName}`} type="checkbox" checked={selected.has(entry.path)} onChange={(event) => toggle(entry.path, event.target.checked)} /></td>
               <td><button className="file-name" onClick={() => toggle(entry.path, !selected.has(entry.path))} onKeyDown={(event) => { if (event.key === 'Enter' && entry.kind === 'directory' && sftp) void loadDirectory(sftp, entry.path); }}>{entry.kind === 'directory' ? '📁' : entry.kind === 'symlink' ? '↗' : '▧'} {entry.displayName}</button></td>
               <td>{entry.kind}</td><td>{entry.sizeBytes ?? 'Unknown'}</td><td>{entry.modifiedAt ? new Date(entry.modifiedAt).toLocaleString() : 'Unknown'}</td><td>{entry.permissions ?? 'Unknown'}</td>
-              <td><button onClick={() => void showProperties(entry)}>Properties</button></td>
+              <td className="files-row-actions">
+                {!compact && entry.kind === 'file' && (
+                  <button
+                    type="button"
+                    disabled={!canMutate || !!editor}
+                    onClick={() => void viewReadOnly(entry)}
+                  >
+                    View
+                  </button>
+                )}
+                <button onClick={() => void showProperties(entry)}>Properties</button>
+              </td>
             </tr>)}</tbody>
           </table>
         )}

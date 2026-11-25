@@ -9,12 +9,21 @@ import { hostKeys } from '../../api/queries';
 import { connected, disconnected, host } from '../../test/fixtures';
 import { FilesWorkspace } from './FilesWorkspace';
 
+vi.mock('../editor/MonacoViewerSurface', () => ({
+  default: ({ documentId, text, ariaLabel }: { documentId: string; text: string; ariaLabel: string }) => (
+    <div data-testid="mock-monaco-surface" data-doc-id={documentId}>
+      <textarea readOnly aria-label={ariaLabel} value={text} />
+    </div>
+  ),
+}));
+
 vi.mock('../../api/client', async (original) => ({
   ...(await original<typeof import('../../api/client')>()),
   hostApi: { session: vi.fn() },
   filesApi: {
     open: vi.fn(), list: vi.fn(), properties: vi.fn(), chooseUploadFiles: vi.fn(),
-    openText: vi.fn(), planTextSave: vi.fn(), discardTextDocument: vi.fn(),
+    openText: vi.fn(), openReadOnly: vi.fn(), cancelReadOnlyOpen: vi.fn(),
+    planTextSave: vi.fn(), discardTextDocument: vi.fn(),
     chooseDownloadDirectory: vi.fn(), planUpload: vi.fn(), planDownload: vi.fn(),
     planCreateDirectory: vi.fn(), planRename: vi.fn(), planDelete: vi.fn(),
     execute: vi.fn(), discardPlan: vi.fn(), discardGrant: vi.fn(),
@@ -686,5 +695,100 @@ describe('Files workspace boundaries', () => {
     fireEvent.keyDown(nav, { key: 'Escape' });
     expect(within(nav).queryByRole('menu', { name: 'Ancestor directories' })).not.toBeInTheDocument();
     expect(filesApi.open).toHaveBeenCalledOnce();
+  });
+
+  it('L-05 keeps committed history index intact across permission failures, rapid Back/Forward, and out-of-order responses', async () => {
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+
+    const pathInput = screen.getByLabelText('Remote path');
+    await userEvent.clear(pathInput);
+    await userEvent.type(pathInput, '/etc{Enter}');
+    await screen.findByDisplayValue('/etc');
+
+    await userEvent.clear(pathInput);
+    await userEvent.type(pathInput, '/var/log{Enter}');
+    await screen.findByDisplayValue('/var/log');
+
+    const back = screen.getByRole('button', { name: 'Back' });
+    const forward = screen.getByRole('button', { name: 'Forward' });
+    expect(back).toBeEnabled();
+    expect(forward).toBeDisabled();
+
+    // 1. Failed history Back (deleted or permission denied) leaves committed directory and Back/Forward unchanged.
+    vi.mocked(filesApi.list).mockRejectedValueOnce({
+      code: 'fileTransfer',
+      message: 'Permission denied for /etc',
+      hostKey: null,
+    });
+    await userEvent.click(back);
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Permission denied for /etc'));
+    expect(screen.getByLabelText('Remote path')).toHaveValue('/var/log');
+    expect(back).toBeEnabled();
+    expect(forward).toBeDisabled();
+
+    // 2. Rapid Back + Forward with out-of-order responses only commits the latest generation.
+    // Navigate Back cleanly to /etc first so both Back (/home/test) and Forward (/var/log) are enabled.
+    vi.mocked(filesApi.list).mockResolvedValueOnce(listing('/etc'));
+    await userEvent.click(back);
+    await screen.findByDisplayValue('/etc');
+    expect(back).toBeEnabled();
+    expect(forward).toBeEnabled();
+
+    const slowBack = deferred<DirectoryListing>();
+    const fastForward = deferred<DirectoryListing>();
+    vi.mocked(filesApi.list)
+      .mockReturnValueOnce(slowBack.promise)
+      .mockReturnValueOnce(fastForward.promise);
+
+    await userEvent.click(back);
+    await userEvent.click(forward);
+
+    await act(async () => {
+      fastForward.resolve(listing('/var/log'));
+    });
+    await screen.findByDisplayValue('/var/log');
+
+    await act(async () => {
+      slowBack.resolve(listing('/home/test'));
+    });
+    expect(screen.getByLabelText('Remote path')).toHaveValue('/var/log');
+    expect(screen.getByRole('button', { name: 'Forward' })).toBeDisabled();
+  });
+
+  it('exposes read-only Monaco viewing without mutation IPC while keeping Goal 02C Edit intact', async () => {
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'ro-doc-1',
+      hostId: host.id,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path: '/home/test/данни.bin',
+      displayName: '/home/test/данни.bin',
+      text: 'readonly preview\n',
+      originalBytes: 17,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+    const selection = await screen.findByRole('checkbox', { name: 'Select данни.bin' });
+    await userEvent.click(selection);
+
+    await userEvent.click(screen.getByRole('button', { name: 'View (Read-only)' }));
+    const surface = await screen.findByTestId('mock-monaco-surface');
+    expect(surface).toHaveAttribute('data-doc-id', 'ro-doc-1');
+    expect(screen.getByTestId('readonly-status-badge')).toHaveTextContent('Read-Only');
+    expect(filesApi.openReadOnly).toHaveBeenCalledTimes(1);
+    expect(filesApi.openText).not.toHaveBeenCalled();
+    expect(filesApi.planTextSave).not.toHaveBeenCalled();
+    expect(filesApi.execute).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Save / review' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Browse files' }));
+    await screen.findByRole('button', { name: 'Open viewer (1)' });
   });
 });

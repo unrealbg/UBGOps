@@ -27,6 +27,7 @@ opaque_id!(LocalGrantId);
 opaque_id!(FilePlanId);
 opaque_id!(TransferJobId);
 opaque_id!(EditorDocumentId);
+opaque_id!(ReadOnlyDocumentId);
 
 pub const MAX_REMOTE_EDITOR_BYTES: usize = 1024 * 1024;
 
@@ -50,6 +51,24 @@ pub struct RemoteTextDocument {
     pub newline: TextNewline,
     pub bom: bool,
     pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReadOnlyDocument {
+    pub id: ReadOnlyDocumentId,
+    pub host_id: HostId,
+    pub host_session_id: HostSessionId,
+    pub sftp_session_id: SftpSessionId,
+    pub path: String,
+    pub display_name: String,
+    pub text: String,
+    pub original_bytes: u32,
+    pub newline: TextNewline,
+    pub bom: bool,
+    pub max_bytes: u32,
+    pub modified_at: Option<String>,
+    pub permissions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -126,6 +126,108 @@ impl Application {
         })
     }
 
+    pub async fn open_remote_readonly_document(
+        &self,
+        host_id: HostId,
+        host_session_id: HostSessionId,
+        sftp_session_id: SftpSessionId,
+        request_id: ReadOnlyDocumentId,
+        path: String,
+    ) -> Result<RemoteReadOnlyDocument, AppError> {
+        let client = self
+            .owned_sftp(host_id, host_session_id, sftp_session_id)
+            .await?;
+        let cancel = CancellationToken::new();
+        let key = (host_id, host_session_id, sftp_session_id, request_id);
+        {
+            let mut opens = self.read_only_opens.lock().await;
+            if opens.contains_key(&key) {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "A read-only open with this request identity is already in progress.",
+                ));
+            }
+            opens.insert(key, cancel.clone());
+        }
+        struct ReadOnlyOpenCleanup<'a> {
+            opens: &'a crate::application::ReadOnlyOpenMap,
+            key: crate::application::ReadOnlyOpenKey,
+        }
+        impl Drop for ReadOnlyOpenCleanup<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut opens) = self.opens.try_lock() {
+                    opens.remove(&self.key);
+                } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let _ = runtime;
+                }
+            }
+        }
+        let _cleanup = ReadOnlyOpenCleanup {
+            opens: &self.read_only_opens,
+            key,
+        };
+
+        let result = async {
+            let _permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(AppError::new(
+                        ErrorCode::Cancelled,
+                        "Read-only file loading was cancelled.",
+                    ));
+                }
+                permit = self.read_only_open_limit.acquire() => permit.map_err(|_| {
+                    AppError::new(ErrorCode::Cancelled, "Read-only file loading was closed.")
+                })?,
+            };
+            let raw = client.read_only_file_bytes(&path, cancel.clone()).await?;
+            let (text, newline, bom) = ubgops_sftp::decode_text(&raw.bytes)?;
+            self.owned_sftp(host_id, host_session_id, sftp_session_id)
+                .await?;
+            if cancel.is_cancelled() {
+                return Err(AppError::new(
+                    ErrorCode::Cancelled,
+                    "Read-only file loading was cancelled.",
+                ));
+            }
+            Ok(RemoteReadOnlyDocument {
+                id: ReadOnlyDocumentId::new(),
+                host_id,
+                host_session_id,
+                sftp_session_id,
+                display_name: ubgops_sftp::display_name(&path),
+                path,
+                text,
+                original_bytes: raw.bytes.len() as u32,
+                newline,
+                bom,
+                max_bytes: MAX_REMOTE_EDITOR_BYTES as u32,
+                modified_at: raw.modified_at,
+                permissions: raw.permissions,
+            })
+        }
+        .await;
+        self.read_only_opens.lock().await.remove(&key);
+        result
+    }
+
+    pub async fn cancel_remote_readonly_open(
+        &self,
+        host_id: HostId,
+        host_session_id: HostSessionId,
+        sftp_session_id: SftpSessionId,
+        request_id: ReadOnlyDocumentId,
+    ) -> Result<bool, AppError> {
+        let key = (host_id, host_session_id, sftp_session_id, request_id);
+        let removed = self.read_only_opens.lock().await.remove(&key);
+        if let Some(token) = removed {
+            token.cancel();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub async fn plan_remote_text_save(
         &self,
         host_id: HostId,
@@ -392,6 +494,17 @@ impl Application {
     ) -> Result<(), AppError> {
         let startup = self.sftp_lifecycle_gate(host_id).await;
         let _startup_guard = startup.lock().await;
+        {
+            let mut opens = self.read_only_opens.lock().await;
+            opens.retain(|(open_host, open_session, _, _), cancel| {
+                if *open_host == host_id && *open_session == host_session_id {
+                    cancel.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         self.file_plans.revoke_session(host_id, host_session_id);
         self.transfers
             .quiesce_session(host_id, host_session_id)

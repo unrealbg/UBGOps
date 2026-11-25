@@ -39,6 +39,13 @@ pub struct EditorRevision {
     pub gid: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlyFileBytes {
+    pub bytes: Vec<u8>,
+    pub modified_at: Option<String>,
+    pub permissions: Option<String>,
+}
+
 pub type Progress = Arc<dyn Fn(u64) + Send + Sync>;
 
 #[derive(Debug, Clone)]
@@ -107,6 +114,16 @@ pub trait SftpClient: Send + Sync {
         Err(AppError::new(
             ErrorCode::SftpUnavailable,
             "Remote text editing is unavailable.",
+        ))
+    }
+    async fn read_only_file_bytes(
+        &self,
+        _path: &str,
+        _cancel: CancellationToken,
+    ) -> Result<ReadOnlyFileBytes, AppError> {
+        Err(AppError::new(
+            ErrorCode::SftpUnavailable,
+            "Read-only remote viewing is unavailable.",
         ))
     }
     async fn preserve_editor_metadata(
@@ -497,6 +514,131 @@ impl SftpClient for RawSftpClient {
         Ok(bytes)
     }
 
+    async fn read_only_file_bytes(
+        &self,
+        path: &str,
+        cancel: CancellationToken,
+    ) -> Result<ReadOnlyFileBytes, AppError> {
+        validate_remote_path(path)?;
+        let cancelled = || {
+            AppError::new(
+                ErrorCode::Cancelled,
+                "Read-only file loading was cancelled.",
+            )
+        };
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let before = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(cancelled()),
+            value = self.raw.lstat(path) => value.map_err(map_error)?.attrs,
+        };
+        let expected = read_only_snapshot(&before)?;
+        let handle = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(cancelled()),
+            value = self.raw.open(path, OpenFlags::READ, FileAttributes::default()) => {
+                value.map_err(map_error)?.handle
+            }
+        };
+        let mut bytes = Vec::new();
+        let stream_result = async {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            let opened = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(cancelled()),
+                value = self.raw.fstat(handle.clone()) => value.map_err(map_error)?.attrs,
+            };
+            if read_only_snapshot(&opened).ok().as_ref() != Some(&expected) {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "The remote file changed while opening.",
+                ));
+            }
+            while bytes.len() <= MAX_REMOTE_EDITOR_BYTES {
+                let remaining = MAX_REMOTE_EDITOR_BYTES + 1 - bytes.len();
+                let request = self.read_chunk.min(remaining as u32);
+                let chunk = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(cancelled()),
+                    value = self.raw.read(handle.clone(), bytes.len() as u64, request) => value,
+                };
+                match chunk {
+                    Ok(data) if data.data.is_empty() => break,
+                    Ok(data) => {
+                        if data.data.len() > remaining {
+                            return Err(AppError::new(
+                                ErrorCode::FilePolicy,
+                                "The SFTP server exceeded the bounded file read limit.",
+                            ));
+                        }
+                        bytes.extend_from_slice(&data.data);
+                    }
+                    Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                        break;
+                    }
+                    Err(error) => return Err(map_error(error)),
+                }
+            }
+            if bytes.len() > MAX_REMOTE_EDITOR_BYTES {
+                return Err(AppError::new(
+                    ErrorCode::FilePolicy,
+                    "The remote text file exceeds the 1 MiB viewer limit.",
+                ));
+            }
+            let finished = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(cancelled()),
+                value = self.raw.fstat(handle.clone()) => value.map_err(map_error)?.attrs,
+            };
+            if read_only_snapshot(&finished).ok().as_ref() != Some(&expected)
+                || expected
+                    .0
+                    .size
+                    .is_some_and(|declared| declared != bytes.len() as u64)
+            {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "The remote file changed while reading.",
+                ));
+            }
+            Ok(bytes)
+        }
+        .await;
+        let close = self.close_handle(handle).await;
+        let bytes = stream_result?;
+        close?;
+        let after = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(cancelled()),
+            value = self.raw.lstat(path) => value.map_err(map_error)?.attrs,
+        };
+        if read_only_snapshot(&after).ok().as_ref() != Some(&expected)
+            || expected
+                .0
+                .size
+                .is_some_and(|declared| declared != bytes.len() as u64)
+        {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "The remote file changed while reading.",
+            ));
+        }
+        let modified_at = before
+            .mtime
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value as i64, 0))
+            .map(|value| value.to_rfc3339());
+        let permissions = before.permissions.map(|_| before.permissions().to_string());
+        Ok(ReadOnlyFileBytes {
+            bytes,
+            modified_at,
+            permissions,
+        })
+    }
+
     async fn preserve_editor_metadata(
         &self,
         staging: &str,
@@ -867,6 +1009,27 @@ fn identity(attrs: &FileAttributes) -> EntryIdentity {
         size: attrs.size,
         modified: attrs.mtime,
     }
+}
+
+type ReadOnlySnapshot = (EntryIdentity, Option<u32>, Option<u32>, Option<u32>);
+
+fn read_only_snapshot(attrs: &FileAttributes) -> Result<ReadOnlySnapshot, AppError> {
+    if attrs.permissions.is_none() || attrs.file_type() != FileType::File {
+        return Err(AppError::new(
+            ErrorCode::FilePolicy,
+            "Only regular non-symlink files can be opened in the read-only viewer.",
+        ));
+    }
+    if attrs
+        .size
+        .is_some_and(|size| size > MAX_REMOTE_EDITOR_BYTES as u64)
+    {
+        return Err(AppError::new(
+            ErrorCode::FilePolicy,
+            "The remote text file exceeds the 1 MiB viewer limit.",
+        ));
+    }
+    Ok((identity(attrs), attrs.permissions, attrs.uid, attrs.gid))
 }
 
 fn initialization_error(error: SftpError) -> AppError {
@@ -2045,5 +2208,82 @@ mod fault_tests {
         assert_eq!(*calls.lock().unwrap(), ["REPLACE executed; reply lost"]);
         assert_eq!(files.lock().unwrap()["/fixture/final"], b"new-final");
         assert!(!files.lock().unwrap().contains_key("/fixture/staging"));
+    }
+
+    #[tokio::test]
+    async fn read_only_file_bytes_handles_empty_exact_limit_bom_and_rejects_oversize_binary_symlink_change_and_cancel()
+     {
+        let (client, state) = matrix_client(Fault::None).await;
+        {
+            let mut s = state.lock().unwrap();
+            s.files.insert("/fixture/empty".into(), Vec::new());
+            s.files.insert(
+                "/fixture/exact1m".into(),
+                vec![b'a'; MAX_REMOTE_EDITOR_BYTES],
+            );
+            s.files.insert(
+                "/fixture/over1m".into(),
+                vec![b'b'; MAX_REMOTE_EDITOR_BYTES + 1],
+            );
+            s.files.insert(
+                "/fixture/bomcrlf".into(),
+                b"\xef\xbb\xbfline1\r\nline2\r\n".to_vec(),
+            );
+        }
+
+        let empty = client
+            .read_only_file_bytes("/fixture/empty", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(empty.bytes.is_empty());
+
+        let exact = client
+            .read_only_file_bytes("/fixture/exact1m", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(exact.bytes.len(), MAX_REMOTE_EDITOR_BYTES);
+
+        let bom = client
+            .read_only_file_bytes("/fixture/bomcrlf", CancellationToken::new())
+            .await
+            .unwrap();
+        let (text, newline, has_bom) = crate::decode_text(&bom.bytes).unwrap();
+        assert_eq!(text, "line1\nline2\n");
+        assert_eq!(newline, ubgops_model::TextNewline::CrLf);
+        assert!(has_bom);
+
+        let over = client
+            .read_only_file_bytes("/fixture/over1m", CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(over.code, ErrorCode::FilePolicy);
+
+        let pre_cancel = CancellationToken::new();
+        pre_cancel.cancel();
+        let cancelled = client
+            .read_only_file_bytes("/fixture/empty", pre_cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(cancelled.code, ErrorCode::Cancelled);
+
+        for (fault, expected_code) in [
+            (Fault::EditorSymlink, ErrorCode::FilePolicy),
+            (Fault::EditorDirectory, ErrorCode::FilePolicy),
+            (Fault::EditorSpecial, ErrorCode::FilePolicy),
+            (Fault::EditorUnknown, ErrorCode::FilePolicy),
+            (Fault::DeclaredSmall, ErrorCode::Conflict),
+        ] {
+            let (fault_client, fault_state) = matrix_client(fault).await;
+            fault_state
+                .lock()
+                .unwrap()
+                .files
+                .insert("/fixture/editor".into(), b"hello world".to_vec());
+            let err = fault_client
+                .read_only_file_bytes("/fixture/editor", CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, expected_code, "fault yielded unexpected error");
+        }
     }
 }

@@ -17,6 +17,7 @@ import { HostOverview } from './features/overview/HostOverview';
 import { LiveMonitoring } from './features/overview/LiveMonitoring';
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from './features/terminal/TerminalWorkspace';
 import { FilesWorkspace } from './features/files/FilesWorkspace';
+import { ReadOnlyEditorProvider, useReadOnlyEditor } from './features/editor/ReadOnlyEditorRegistry';
 import { ServicesWorkspace } from './features/services/ServicesWorkspace';
 import { LogsWorkspace } from './features/logs/LogsWorkspace';
 import { ContainersWorkspace } from './features/containers/ContainersWorkspace';
@@ -294,6 +295,24 @@ export default function App({
   initialSection?: WorkspaceSection;
   initialTerminalMonitoring?: boolean;
 } = {}) {
+  return (
+    <ReadOnlyEditorProvider>
+      <AppShellContent
+        initialSection={initialSection}
+        initialTerminalMonitoring={initialTerminalMonitoring}
+      />
+    </ReadOnlyEditorProvider>
+  );
+}
+
+function AppShellContent({
+  initialSection = 'overview',
+  initialTerminalMonitoring = false,
+}: {
+  initialSection?: WorkspaceSection;
+  initialTerminalMonitoring?: boolean;
+}) {
+  const { purgeHost } = useReadOnlyEditor();
   const hostsQuery = useHosts();
   const queryClient = useQueryClient();
   const { hostId, select } = useSelection();
@@ -388,6 +407,7 @@ export default function App({
     setDeleteError(null);
     try {
       await hostApi.delete(host.id);
+      purgeHost(host.id);
       queryClient.removeQueries({ queryKey: hostKeys.session(host.id) });
       await queryClient.invalidateQueries({ queryKey: hostKeys.all });
       if (hostId === host.id) select(null);

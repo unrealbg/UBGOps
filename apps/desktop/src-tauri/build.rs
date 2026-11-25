@@ -44,6 +44,8 @@ fn main() {
             "list_remote_directory",
             "remote_properties",
             "open_remote_text_file",
+            "open_remote_readonly_document",
+            "cancel_remote_readonly_open",
             "plan_remote_text_save",
             "discard_remote_text_document",
             "choose_upload_files",

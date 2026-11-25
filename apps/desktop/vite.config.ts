@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath } from 'node:url';
+import { monacoFrozenPrototypeCompatibility } from './src/build/monacoFrozenPrototype.ts';
 
 function xtermFrozenPrototypeCompatibility() {
   const xtermSuffix = '/@xterm/xterm/lib/xterm.mjs';
@@ -24,10 +25,17 @@ function xtermFrozenPrototypeCompatibility() {
 
 export default defineConfig({
   root: fileURLToPath(new URL('.', import.meta.url)),
-  plugins: [xtermFrozenPrototypeCompatibility(), react()],
+  plugins: [xtermFrozenPrototypeCompatibility(), monacoFrozenPrototypeCompatibility(), react()],
+  worker: {
+    format: 'es',
+    plugins: () => [monacoFrozenPrototypeCompatibility()],
+  },
   clearScreen: false,
   server: { host: '127.0.0.1', port: 1420, strictPort: true },
-  build: { target: 'es2022' },
+  build: {
+    target: 'es2022',
+    assetsInlineLimit: 0,
+  },
   test: {
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],

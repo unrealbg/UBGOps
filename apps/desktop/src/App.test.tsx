@@ -17,6 +17,14 @@ vi.mock('./features/terminal/TerminalPane', () => ({
     </div>,
 }));
 
+vi.mock('./features/editor/MonacoViewerSurface', () => ({
+  default: ({ documentId, text, ariaLabel }: { documentId: string; text: string; ariaLabel: string }) => (
+    <div data-testid="mock-monaco-surface" data-doc-id={documentId}>
+      <textarea readOnly aria-label={ariaLabel} value={text} />
+    </div>
+  ),
+}));
+
 vi.mock('./api/client', async (original) => ({
   ...(await original<typeof import('./api/client')>()),
   securityApi: { get: vi.fn() },
@@ -24,7 +32,7 @@ vi.mock('./api/client', async (original) => ({
   containersApi: { list: vi.fn() },
   updateApi: { state: vi.fn(), check: vi.fn(), download: vi.fn(), install: vi.fn() },
   terminalApi: { list: vi.fn(), open: vi.fn(), close: vi.fn(), rename: vi.fn() },
-  filesApi: { open: vi.fn(), list: vi.fn(), transfers: vi.fn() },
+  filesApi: { open: vi.fn(), list: vi.fn(), transfers: vi.fn(), openReadOnly: vi.fn(), cancelReadOnlyOpen: vi.fn() },
   monitorApi: { sample: vi.fn() },
   hostApi: {
     list: vi.fn(),
@@ -58,6 +66,8 @@ beforeEach(() => {
   vi.mocked(terminalApi.open).mockReset();
   vi.mocked(filesApi.open).mockReset();
   vi.mocked(filesApi.list).mockReset();
+  vi.mocked(filesApi.openReadOnly).mockReset();
+  vi.mocked(filesApi.cancelReadOnlyOpen).mockReset().mockResolvedValue(true);
   vi.mocked(filesApi.transfers).mockReset().mockResolvedValue([]);
   vi.mocked(monitorApi.sample).mockReset().mockImplementation(async (hostId, hostSessionId) => ({
     hostId, hostSessionId, observedAt: new Date().toISOString(), cpuUsagePercent: null,
@@ -822,5 +832,102 @@ describe('workspace flows', () => {
       'Synthetic local scrollback persisted',
     );
     expect(terminalApi.open).toHaveBeenCalledOnce();
+  });
+
+  it('preserves active PTY across read-only Monaco viewing and disposes host models on host deletion', async () => {
+    vi.mocked(hostApi.list).mockResolvedValue([host]);
+    vi.mocked(hostApi.session).mockResolvedValue(connected);
+    vi.mocked(terminalApi.open).mockImplementation(async (id, size) => ({
+      id: `${id}-pty`,
+      hostId: id,
+      hostSessionId: connected.hostSessionId!,
+      label: 'Shell',
+      size,
+      state: 'open',
+      error: null,
+    }));
+    vi.mocked(filesApi.open).mockImplementation(async (id) => ({
+      id: `${id}-sftp`,
+      hostId: id,
+      hostSessionId: connected.hostSessionId!,
+      protocolVersion: 3,
+      rootPath: '/synthetic',
+      extensions: [],
+      limits: {
+        maxPacketBytes: '262144',
+        maxReadBytes: '65536',
+        maxWriteBytes: '65536',
+        maxOpenHandles: '64',
+        clientChunkBytes: '65536',
+        listingEntryCap: 5000,
+      },
+    }));
+    vi.mocked(filesApi.list).mockImplementation(async (session, path) => ({
+      hostId: session.hostId,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path,
+      partial: false,
+      entryCap: 5000,
+      entries: [
+        {
+          name: 'synthetic-file',
+          displayName: 'synthetic-file',
+          path: `${path}/synthetic-file`,
+          kind: 'file',
+          sizeBytes: '15',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+      ],
+    }));
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'app-ro-1',
+      hostId: host.id,
+      hostSessionId: connected.hostSessionId!,
+      sftpSessionId: `${host.id}-sftp`,
+      path: '/synthetic/synthetic-file',
+      displayName: '/synthetic/synthetic-file',
+      text: 'service=ubgops\n',
+      originalBytes: 15,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+    vi.mocked(hostApi.disconnect).mockResolvedValue(undefined);
+    vi.mocked(hostApi.delete).mockResolvedValue(undefined);
+
+    const client = renderApp();
+    await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    await userEvent.click(screen.getByRole('button', { name: 'Terminal' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Open terminal' }));
+    const ptyInput = await screen.findByRole('textbox', { name: 'Synthetic Shell' });
+    await userEvent.type(ptyInput, ' running');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Files' }));
+    await screen.findByDisplayValue('/synthetic');
+    await userEvent.click(screen.getByRole('button', { name: 'View' }));
+    const surface = await screen.findByTestId('mock-monaco-surface');
+    expect(surface).toHaveAttribute('data-doc-id', 'app-ro-1');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Terminal' }));
+    expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
+      'Synthetic local scrollback running',
+    );
+    expect(terminalApi.open).toHaveBeenCalledOnce();
+
+    // Deleting the host revokes & cleans up its read-only document state cleanly.
+    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: 'Overview' }));
+    vi.mocked(hostApi.session).mockResolvedValue(disconnected);
+    await userEvent.click(await screen.findByRole('button', { name: 'Disconnect' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Delete host' }));
+    await waitFor(() => expect(hostApi.delete).toHaveBeenCalledWith(host.id));
+    expect(screen.queryByTestId('mock-monaco-surface')).not.toBeInTheDocument();
+    expect(client.getQueryCache().getAll().some((q) => JSON.stringify(q.state).includes('app-ro-1'))).toBe(false);
   });
 });
