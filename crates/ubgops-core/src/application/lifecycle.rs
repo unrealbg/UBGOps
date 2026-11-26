@@ -89,6 +89,9 @@ impl Application {
             data.view.state = state.transition(ConnectionState::Disconnecting)?;
         }
         drop(data);
+        if let Some(connection_id) = connection_id {
+            self.read_only_ops.cancel_session(id, connection_id);
+        }
         self.clear_monitor(id).await;
         Ok(DisconnectWork {
             started,

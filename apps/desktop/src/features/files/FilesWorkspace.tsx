@@ -392,8 +392,29 @@ function FilesWorkspaceInner({
   async function showProperties(entry: RemoteEntry) {
     try { setProperties(await filesApi.properties(owner(), entry.path)); } catch (reason) { setError(applicationError(reason).message); }
   }
+  useEffect(() => {
+    registry.syncTransfers(transfers);
+  }, [registry, transfers]);
+
+  useEffect(() => {
+    if (!editor) return;
+    registry.registerExternalEdit(
+      { hostId: editor.hostId, hostSessionId: editor.hostSessionId, id: editor.sftpSessionId },
+      editor.path,
+      editor.id,
+    );
+    return () => {
+      registry.unregisterExternalEdit(editor.id);
+    };
+  }, [editor, registry]);
+
   async function openEditor(entry: RemoteEntry) {
     if (entry.kind !== 'file' || editor || openingEditorGuard.current) return;
+    const precheckSession = owner();
+    if (registry.hasActiveEditAuthority(precheckSession, entry.path)) {
+      setError('This file already has an active editable Monaco session. Close or save it before opening the modal editor.');
+      return;
+    }
     openingEditorGuard.current = true;
     setOpeningEditor(true);
     let session: SftpSessionInfo | null = null;
@@ -403,7 +424,8 @@ function FilesWorkspaceInner({
       const document = await filesApi.openText(session, entry.path);
       if (mounted.current && visibleNow.current && isCurrent(session, generation) &&
           document.hostId === session.hostId && document.hostSessionId === session.hostSessionId &&
-          document.sftpSessionId === session.id) {
+          document.sftpSessionId === session.id &&
+          registry.registerExternalEdit(session, entry.path, document.id)) {
         setEditor(document);
         onTextEditorOpenChange?.(true);
         onExitEditorFocus?.();

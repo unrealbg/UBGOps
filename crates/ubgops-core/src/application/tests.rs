@@ -4756,3 +4756,147 @@ async fn readonly_supervisor_holds_permits_through_cleanup_protects_reused_reque
     assert_eq!(end.held_permits, 0);
     assert_eq!(end.registered_requests, 0);
 }
+
+#[tokio::test]
+async fn readonly_open_passing_owned_sftp_before_disconnect_cannot_register_or_spawn_after_disconnect()
+ {
+    let (_profile, app, _) = setup(false);
+    let host1 = app.save_host(input(), Some(credential())).await.unwrap();
+    let mut second_input = input();
+    second_input.display_name = "Healthy peer after disconnect race".into();
+    second_input.connection.hostname = "peer-race.example.test".into();
+    let host2 = app
+        .save_host(second_input, Some(credential()))
+        .await
+        .unwrap();
+
+    app.connect_host(host1.id).await.unwrap();
+    app.connect_host(host2.id).await.unwrap();
+    let session1 = app
+        .slot(host1.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let session2 = app
+        .slot(host2.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+
+    let client1 = LifecycleSftpClient::new(host1.id, session1);
+    let client2 = LifecycleSftpClient::new(host2.id, session2);
+    let sftp1 = client1.info.id;
+    let sftp2 = client2.info.id;
+    {
+        let mut sessions = app.sftp_sessions.lock().await;
+        sessions.insert(host1.id, client1.clone());
+        sessions.insert(host2.id, client2.clone());
+    }
+
+    // Also keep a live terminal session open on the healthy peer host to verify zero collateral harm.
+    let peer_terminal = app.open_terminal(host2.id, terminal_size()).await.unwrap();
+
+    // Force Request A to pause deterministically AFTER owned_sftp() succeeds and BEFORE
+    // ReadOnlyOpenSupervisor::register() runs.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    app.read_only_ops
+        .set_before_register_barrier(Some((Arc::clone(&entered), Arc::clone(&barrier))));
+
+    let app_req = app.clone();
+    let req_id_a = ReadOnlyDocumentId::new();
+    let inflight = tokio::spawn(async move {
+        app_req
+            .open_remote_readonly_document(
+                host1.id,
+                session1,
+                sftp1,
+                req_id_a,
+                "/etc/race.conf".into(),
+            )
+            .await
+    });
+
+    // Wait until Request A has passed owned_sftp() and is parked right before register().
+    entered.notified().await;
+    app.read_only_ops.set_before_register_barrier(None);
+
+    // Run disconnect_host concurrently while Request A is inside the admission micro-window.
+    app.disconnect_host(host1.id).await.unwrap();
+    assert!(app.read_only_ops.is_session_sealed(host1.id, session1));
+
+    // Release Request A across the barrier into try_acquire_permit()/register(): it MUST fail!
+    barrier.wait().await;
+    let err_a = inflight.await.unwrap().unwrap_err();
+    assert_eq!(err_a.code, ErrorCode::Cancelled);
+
+    // Zero permits held, zero tasks spawned, 8/8 permits available.
+    let metrics = app.read_only_open_metrics();
+    assert_eq!(metrics.held_permits, 0);
+    assert_eq!(
+        metrics.available_permits,
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+    assert_eq!(metrics.registered_requests, 0);
+    assert_eq!(metrics.live_supervised_tasks, 0);
+
+    // Post-quiescence attempt against the OLD stale session generation MUST remain sealed/rejected.
+    let err_b = app
+        .open_remote_readonly_document(
+            host1.id,
+            session1,
+            sftp1,
+            ReadOnlyDocumentId::new(),
+            "/etc/stale.conf".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err_b.code, ErrorCode::Cancelled);
+
+    // Reconnecting host1 creates a new session generation that succeeds cleanly.
+    app.connect_host(host1.id).await.unwrap();
+    let session1_reconnected = app
+        .slot(host1.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    assert_ne!(session1_reconnected, session1);
+    let client1_new = LifecycleSftpClient::new(host1.id, session1_reconnected);
+    let sftp1_new = client1_new.info.id;
+    app.sftp_sessions.lock().await.insert(host1.id, client1_new);
+    let reconnected_doc = app
+        .open_remote_readonly_document(
+            host1.id,
+            session1_reconnected,
+            sftp1_new,
+            ReadOnlyDocumentId::new(),
+            "/etc/reconnected.conf".into(),
+        )
+        .await
+        .expect("reconnected open succeeds under fresh session generation");
+    assert_eq!(reconnected_doc.host_session_id, session1_reconnected);
+
+    // Healthy peer host SFTP + active terminal session stay completely intact.
+    app.validate_sftp_session(host2.id, session2, sftp2)
+        .await
+        .unwrap();
+    assert!(
+        app.list_terminals(host2.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.id == peer_terminal.id)
+    );
+    app.close_terminal(host2.id, session2, peer_terminal.id)
+        .await
+        .unwrap();
+}

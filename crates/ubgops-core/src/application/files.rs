@@ -139,15 +139,20 @@ impl Application {
         request_id: ReadOnlyDocumentId,
         path: String,
     ) -> Result<RemoteReadOnlyDocument, AppError> {
-        if self.read_only_ops.is_shutdown() {
-            return Err(AppError::new(
-                ErrorCode::Cancelled,
-                "UBGOps is shutting down.",
-            ));
-        }
+        self.read_only_ops
+            .ensure_admissible(host_id, host_session_id, sftp_session_id)?;
         let client = self
             .owned_sftp(host_id, host_session_id, sftp_session_id)
             .await?;
+        #[cfg(test)]
+        self.read_only_ops.wait_before_register().await;
+        if client.is_retired() {
+            self.read_only_ops.seal_sftp_channel(sftp_session_id);
+            return Err(AppError::new(
+                ErrorCode::SftpUnavailable,
+                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+            ));
+        }
         let permit = self.read_only_ops.try_acquire_permit()?;
         let cancel = CancellationToken::new();
         let key = (host_id, host_session_id, sftp_session_id, request_id);
@@ -167,6 +172,7 @@ impl Application {
         let task_cancel = cancel.clone();
         let task_sessions = Arc::clone(&self.sftp_sessions);
         let task_state = Arc::clone(&supervisor_state);
+        let task_ops = self.read_only_ops.clone();
         tokio::spawn(async move {
             let raw_res = {
                 let _guard = crate::application::readonly_ops::SupervisedTaskGuard::new(
@@ -180,6 +186,7 @@ impl Application {
                     .read_only_file_bytes(&task_path, task_cancel.clone())
                     .await;
                 if task_client.is_retired() {
+                    task_ops.seal_sftp_channel(sftp_session_id);
                     let mut sessions = task_sessions.lock().await;
                     if sessions
                         .get(&host_id)
@@ -603,6 +610,7 @@ impl Application {
             ));
         }
         if client.is_retired() {
+            self.read_only_ops.seal_sftp_channel(sftp_session_id);
             let mut sessions = self.sftp_sessions.lock().await;
             if sessions
                 .get(&host_id)

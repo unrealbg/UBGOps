@@ -8,6 +8,7 @@ import { hostApi, filesApi } from '../../api/client';
 import { hostKeys } from '../../api/queries';
 import { connected, disconnected, host } from '../../test/fixtures';
 import { FilesWorkspace } from './FilesWorkspace';
+import { ReadOnlyEditorProvider, useReadOnlyEditor } from '../editor/ReadOnlyEditorRegistry';
 
 vi.mock('../editor/MonacoViewerSurface', () => ({
   default: ({ documentId, text, ariaLabel }: { documentId: string; text: string; ariaLabel: string }) => (
@@ -921,5 +922,53 @@ describe('Files workspace boundaries', () => {
 
     await userEvent.click(screen.getByRole('button', { name: /Close данни\.bin/ }));
     expect(onExitFocus).toHaveBeenCalled();
+  });
+
+  it('blocks legacy RemoteTextEditor when coordinator holds write authority on the same session and path, and unlocks after close', async () => {
+    vi.mocked(filesApi.openText).mockResolvedValue(textDocument);
+    let registryHandle!: ReturnType<typeof useReadOnlyEditor>;
+    function RegistryProbe() {
+      registryHandle = useReadOnlyEditor();
+      return null;
+    }
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <ReadOnlyEditorProvider>
+        <RegistryProbe />
+        <QueryClientProvider client={client}>
+          <FilesWorkspace host={host} visible onShowOverview={vi.fn()} />
+        </QueryClientProvider>
+      </ReadOnlyEditorProvider>,
+    );
+
+    await screen.findByDisplayValue('/home/test');
+    await act(async () => {
+      await registryHandle.openEditableDocument(session, '/home/test/данни.bin');
+    });
+    expect(registryHandle.hasActiveEditAuthority(session, '/home/test/данни.bin')).toBe(true);
+
+    const selection = await screen.findByRole('checkbox', { name: 'Select данни.bin' });
+    await userEvent.click(selection);
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
+
+    expect(
+      await screen.findByText(/active editable Monaco session\. Close or save it before opening the modal editor/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: /Edit /i })).not.toBeInTheDocument();
+
+    // Close the coordinator tab cleanly -> legacy Edit succeeds on click
+    const tabId = registryHandle.documents[0]!.id;
+    await act(async () => {
+      expect(registryHandle.closeDocument(tabId)).toBe(true);
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(await screen.findByRole('textbox', { name: 'Remote text' })).toBeInTheDocument();
+
+    // Closing RemoteTextEditor releases external authority cleanly
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await waitFor(() =>
+      expect(registryHandle.hasActiveEditAuthority(session, '/home/test/данни.bin')).toBe(false),
+    );
   });
 });

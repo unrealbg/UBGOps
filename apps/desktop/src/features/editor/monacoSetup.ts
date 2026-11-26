@@ -145,7 +145,25 @@ export function opaqueReadOnlyModelUri(documentId: string): monaco.Uri {
   return monaco.Uri.parse(`${READONLY_MODEL_SCHEME}://document/${encodeURIComponent(documentId)}`);
 }
 
-export function ensureReadOnlyModel(
+export function getModelValueLf(model: monaco.editor.ITextModel): string {
+  return model.getValue(monaco.editor.EndOfLinePreference.LF);
+}
+
+export function getModelAlternativeVersionId(model: monaco.editor.ITextModel): number {
+  return model.getAlternativeVersionId();
+}
+
+export function getModelUndoRedoState(model: monaco.editor.ITextModel): {
+  canUndo: boolean;
+  canRedo: boolean;
+} {
+  return {
+    canUndo: model.canUndo(),
+    canRedo: model.canRedo(),
+  };
+}
+
+export function ensureDocumentModel(
   documentId: string,
   text: string,
   languageId: string,
@@ -154,7 +172,8 @@ export function ensureReadOnlyModel(
   const uri = opaqueReadOnlyModelUri(documentId);
   const existing = monaco.editor.getModel(uri);
   if (existing) {
-    if (existing.getValue() !== text) {
+    existing.setEOL(monaco.editor.EndOfLineSequence.LF);
+    if (getModelValueLf(existing) !== text) {
       existing.setValue(text);
     }
     if (existing.getLanguageId() !== languageId) {
@@ -162,7 +181,25 @@ export function ensureReadOnlyModel(
     }
     return existing;
   }
-  return monaco.editor.createModel(text, languageId, uri);
+  const created = monaco.editor.createModel(text, languageId, uri);
+  created.setEOL(monaco.editor.EndOfLineSequence.LF);
+  return created;
+}
+
+export function resetModelValueLf(
+  model: monaco.editor.ITextModel,
+  text: string,
+): void {
+  model.setEOL(monaco.editor.EndOfLineSequence.LF);
+  model.setValue(text);
+}
+
+export function ensureReadOnlyModel(
+  documentId: string,
+  text: string,
+  languageId: string,
+): monaco.editor.ITextModel {
+  return ensureDocumentModel(documentId, text, languageId);
 }
 
 export function disposeReadOnlyModel(documentId: string): void {
