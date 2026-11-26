@@ -7,6 +7,7 @@ import {
   EXPECTED_MONACO_VERSION,
   MONACO_PROTOTYPE_PATCHES,
   applyPinnedMonacoPrototypePatch,
+  resolvePinnedMonacoFile,
   verifyInstalledMonacoVersion,
 } from '../../build/monacoFrozenPrototype';
 
@@ -15,8 +16,13 @@ const DESKTOP_VITE_CONFIG = existsSync(resolve('vite.config.ts'))
   : resolve('apps/desktop/vite.config.ts');
 
 describe('pinned Monaco frozen-prototype build transform', () => {
-  it('verifies the exact pinned monaco-editor version', () => {
+  it('verifies the exact pinned monaco-editor version and resolves pinned codicon CSS assets fail-closed', () => {
     expect(verifyInstalledMonacoVersion()).toBe(EXPECTED_MONACO_VERSION);
+    expect(existsSync(resolvePinnedMonacoFile('esm/vs/base/browser/ui/codicons/codicon/codicon.css'))).toBe(true);
+    expect(
+      existsSync(resolvePinnedMonacoFile('esm/vs/base/browser/ui/codicons/codicon/codicon-modifiers.css')),
+    ).toBe(true);
+    expect(() => resolvePinnedMonacoFile('esm/vs/does/not/exist.css')).toThrow(/Pinned monaco-editor asset/);
   });
 
   it('transforms only the five pinned assignments (including Vite query-suffixed ids) and fails closed on drift', () => {

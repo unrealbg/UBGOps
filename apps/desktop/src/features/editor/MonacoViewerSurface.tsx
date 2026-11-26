@@ -60,6 +60,7 @@ export default function MonacoViewerSurface({
       theme: UBGOPS_MONACO_THEME,
       readOnly: true,
       domReadOnly: true,
+      renderValidationDecorations: 'on',
       links: false,
       minimap: { enabled: false },
       lineNumbers: 'on',
@@ -125,6 +126,7 @@ export default function MonacoViewerSurface({
     editorRef.current?.updateOptions({
       readOnly: true,
       domReadOnly: true,
+      renderValidationDecorations: 'on',
       fontSize,
       wordWrap,
       ariaLabel,

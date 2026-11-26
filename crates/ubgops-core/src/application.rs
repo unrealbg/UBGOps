@@ -13,7 +13,7 @@ use ubgops_terminal::TerminalManager;
 
 pub(crate) const MAX_CONCURRENT_READONLY_OPENS: usize = 8;
 pub(crate) type ReadOnlyOpenKey = (HostId, HostSessionId, SftpSessionId, ReadOnlyDocumentId);
-pub(crate) type ReadOnlyOpenMap = std::sync::Mutex<HashMap<ReadOnlyOpenKey, CancellationToken>>;
+pub use readonly_ops::ReadOnlyOpenMetrics;
 
 /// Typed application facade. All connection mutations are serialized just long enough
 /// to update local state; network work never holds the metadata gate.
@@ -24,12 +24,11 @@ pub struct Application {
     pub(crate) known_hosts: Arc<KnownHosts>,
     pub(crate) audit: Arc<AuditLog>,
     pub(crate) terminals: Arc<TerminalManager>,
-    pub(crate) sftp_sessions: Mutex<HashMap<HostId, Arc<dyn SftpClient>>>,
+    pub(crate) sftp_sessions: Arc<Mutex<HashMap<HostId, Arc<dyn SftpClient>>>>,
     pub(crate) sftp_startups: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
     pub(crate) file_plans: FilePlanStore,
     pub(crate) transfers: TransferManager,
-    pub(crate) read_only_opens: ReadOnlyOpenMap,
-    pub(crate) read_only_open_limit: Semaphore,
+    pub(crate) read_only_ops: readonly_ops::ReadOnlyOpenSupervisor,
     pub(crate) monitor_baselines: Mutex<HashMap<HostId, MonitorState>>,
     pub(crate) monitor_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
     pub(crate) service_gates: Mutex<HashMap<HostId, Arc<Mutex<()>>>>,
@@ -72,6 +71,7 @@ mod lifecycle;
 mod logs;
 mod monitoring;
 mod network;
+mod readonly_ops;
 mod rotation;
 mod security;
 mod services;
@@ -126,12 +126,11 @@ impl Application {
             known_hosts,
             audit,
             terminals: Arc::new(TerminalManager::new()),
-            sftp_sessions: Mutex::new(HashMap::new()),
+            sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
             sftp_startups: Mutex::new(HashMap::new()),
             file_plans: FilePlanStore::default(),
             transfers: TransferManager::new(),
-            read_only_opens: std::sync::Mutex::new(HashMap::new()),
-            read_only_open_limit: Semaphore::new(MAX_CONCURRENT_READONLY_OPENS),
+            read_only_ops: readonly_ops::ReadOnlyOpenSupervisor::default(),
             monitor_baselines: Mutex::new(HashMap::new()),
             monitor_gates: Mutex::new(HashMap::new()),
             service_gates: Mutex::new(HashMap::new()),
@@ -237,16 +236,7 @@ impl Application {
             slots
         };
         self.transfers.shutdown();
-        let pending_read_only = {
-            let mut opens = self
-                .read_only_opens
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            opens.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>()
-        };
-        for cancel in pending_read_only {
-            cancel.cancel();
-        }
+        let pending_read_only = self.read_only_ops.begin_shutdown();
         let sessions = self
             .sftp_sessions
             .lock()
@@ -257,6 +247,11 @@ impl Application {
         for (host, session) in sessions {
             self.close_sftp(host, session).await?;
         }
+        readonly_ops::ReadOnlyOpenSupervisor::quiesce(
+            pending_read_only,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
         self.transfers.quiesce_all().await?;
         self.file_plans.revoke_all()?;
         self.sftp_startups.lock().await.clear();

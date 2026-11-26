@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import {
   monacoFrozenPrototypeCompatibility,
   monacoFrozenPrototypeRolldownPlugin,
+  resolvePinnedMonacoFile,
 } from './src/build/monacoFrozenPrototype.ts';
 
 function applyPinnedXtermPrototypePatch(source: string, id: string): string | undefined {
@@ -42,6 +43,18 @@ function xtermFrozenPrototypeRolldownPlugin() {
 
 export default defineConfig({
   root: fileURLToPath(new URL('.', import.meta.url)),
+  resolve: {
+    alias: {
+      '@ubgops/monaco-codicon.css': resolvePinnedMonacoFile(
+        'esm/vs/base/browser/ui/codicons/codicon/codicon.css',
+        new URL('./package.json', import.meta.url).href,
+      ),
+      '@ubgops/monaco-codicon-modifiers.css': resolvePinnedMonacoFile(
+        'esm/vs/base/browser/ui/codicons/codicon/codicon-modifiers.css',
+        new URL('./package.json', import.meta.url).href,
+      ),
+    },
+  },
   plugins: [xtermFrozenPrototypeCompatibility(), monacoFrozenPrototypeCompatibility(), react()],
   worker: {
     format: 'es',

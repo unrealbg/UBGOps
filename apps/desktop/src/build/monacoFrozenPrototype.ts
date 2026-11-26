@@ -46,7 +46,7 @@ export const MONACO_PROTOTYPE_PATCHES: readonly MonacoPrototypePatch[] = [
   },
 ];
 
-export function verifyInstalledMonacoVersion(
+export function resolvePinnedMonacoRoot(
   resolveFromUrl: string = import.meta.url,
 ): string {
   const require = createRequire(resolveFromUrl);
@@ -70,7 +70,7 @@ export function verifyInstalledMonacoVersion(
             `Expected monaco-editor@${EXPECTED_MONACO_VERSION}, found ${String(parsed.version)}.`,
           );
         }
-        return EXPECTED_MONACO_VERSION;
+        return dir;
       }
     }
     const parent = dirname(dir);
@@ -78,6 +78,25 @@ export function verifyInstalledMonacoVersion(
     dir = parent;
   }
   throw new Error(`Pinned monaco-editor package metadata is missing near ${entryPath}.`);
+}
+
+export function verifyInstalledMonacoVersion(
+  resolveFromUrl: string = import.meta.url,
+): string {
+  resolvePinnedMonacoRoot(resolveFromUrl);
+  return EXPECTED_MONACO_VERSION;
+}
+
+export function resolvePinnedMonacoFile(
+  relativePath: string,
+  resolveFromUrl: string = import.meta.url,
+): string {
+  const root = resolvePinnedMonacoRoot(resolveFromUrl);
+  const fullPath = join(root, relativePath);
+  if (!existsSync(fullPath)) {
+    throw new Error(`Pinned monaco-editor asset is missing: ${relativePath}`);
+  }
+  return fullPath;
 }
 
 export function applyPinnedMonacoPrototypePatch(source: string, id: string): string | undefined {

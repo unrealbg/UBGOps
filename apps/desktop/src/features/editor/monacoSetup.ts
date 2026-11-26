@@ -1,5 +1,7 @@
 // Lazy local-only Monaco Editor initialization for UBGOps read-only viewing.
 // Zero CDN requests, zero external LSP/extensions, zero hover Markdown UI.
+import '@ubgops/monaco-codicon.css';
+import '@ubgops/monaco-codicon-modifiers.css';
 import 'monaco-editor/editor/browser/widget/codeEditor/codeEditorWidget';
 import 'monaco-editor/editor/browser/coreCommands';
 import 'monaco-editor/editor/common/services/treeViewsDndService';
