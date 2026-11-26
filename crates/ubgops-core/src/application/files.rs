@@ -31,6 +31,7 @@ impl Application {
         };
         if let Some(existing) = self.sftp_sessions.lock().await.get(&host_id).cloned()
             && existing.info().host_session_id == connection_id
+            && !existing.is_retired()
         {
             return Ok(existing.info());
         }
@@ -124,6 +125,135 @@ impl Application {
             bom,
             max_bytes: ubgops_model::MAX_REMOTE_EDITOR_BYTES as u32,
         })
+    }
+
+    pub fn read_only_open_metrics(&self) -> crate::application::ReadOnlyOpenMetrics {
+        self.read_only_ops.metrics()
+    }
+
+    pub async fn open_remote_readonly_document(
+        &self,
+        host_id: HostId,
+        host_session_id: HostSessionId,
+        sftp_session_id: SftpSessionId,
+        request_id: ReadOnlyDocumentId,
+        path: String,
+    ) -> Result<RemoteReadOnlyDocument, AppError> {
+        if self.read_only_ops.is_shutdown() {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "UBGOps is shutting down.",
+            ));
+        }
+        let client = self
+            .owned_sftp(host_id, host_session_id, sftp_session_id)
+            .await?;
+        let permit = self.read_only_ops.try_acquire_permit()?;
+        let cancel = CancellationToken::new();
+        let key = (host_id, host_session_id, sftp_session_id, request_id);
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let op_id = self.read_only_ops.register(key, cancel.clone(), done_rx)?;
+        let supervisor_state = self.read_only_ops.state_arc();
+        let mut caller_guard = crate::application::readonly_ops::CallerDropGuard::new(
+            Arc::clone(&supervisor_state),
+            key,
+            op_id,
+            cancel.clone(),
+        );
+        let (result_tx, mut result_rx) =
+            tokio::sync::oneshot::channel::<Result<ubgops_sftp::ReadOnlyFileBytes, AppError>>();
+        let task_client = Arc::clone(&client);
+        let task_path = path.clone();
+        let task_cancel = cancel.clone();
+        let task_sessions = Arc::clone(&self.sftp_sessions);
+        let task_state = Arc::clone(&supervisor_state);
+        tokio::spawn(async move {
+            let raw_res = {
+                let _guard = crate::application::readonly_ops::SupervisedTaskGuard::new(
+                    Arc::clone(&task_state),
+                    key,
+                    op_id,
+                    done_tx,
+                    permit,
+                );
+                let raw_res = task_client
+                    .read_only_file_bytes(&task_path, task_cancel.clone())
+                    .await;
+                if task_client.is_retired() {
+                    let mut sessions = task_sessions.lock().await;
+                    if sessions
+                        .get(&host_id)
+                        .is_some_and(|session| session.info().id == sftp_session_id)
+                    {
+                        sessions.remove(&host_id);
+                    }
+                    let mut state = task_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.retired_channel_unknown_settlements += 1;
+                } else if raw_res.is_err() && task_cancel.is_cancelled() {
+                    let mut state = task_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.confirmed_cleanups += 1;
+                }
+                raw_res
+            };
+            let _ = result_tx.send(raw_res);
+        });
+
+        let raw = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                caller_guard.disarm();
+                return Err(AppError::new(
+                    ErrorCode::Cancelled,
+                    "Read-only file loading was cancelled.",
+                ));
+            }
+            joined = &mut result_rx => {
+                caller_guard.disarm();
+                joined.map_err(|_| AppError::new(
+                    ErrorCode::SftpProtocol,
+                    "The read-only file loader stopped unexpectedly.",
+                ))??
+            }
+        };
+        let (text, newline, bom) = ubgops_sftp::decode_text(&raw.bytes)?;
+        self.owned_sftp(host_id, host_session_id, sftp_session_id)
+            .await?;
+        if cancel.is_cancelled() {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "Read-only file loading was cancelled.",
+            ));
+        }
+        Ok(RemoteReadOnlyDocument {
+            id: ReadOnlyDocumentId::new(),
+            host_id,
+            host_session_id,
+            sftp_session_id,
+            display_name: ubgops_sftp::display_name(&path),
+            path,
+            text,
+            original_bytes: raw.bytes.len() as u32,
+            newline,
+            bom,
+            max_bytes: MAX_REMOTE_EDITOR_BYTES as u32,
+            modified_at: raw.modified_at,
+            permissions: raw.permissions,
+        })
+    }
+
+    pub async fn cancel_remote_readonly_open(
+        &self,
+        host_id: HostId,
+        host_session_id: HostSessionId,
+        sftp_session_id: SftpSessionId,
+        request_id: ReadOnlyDocumentId,
+    ) -> Result<bool, AppError> {
+        let key = (host_id, host_session_id, sftp_session_id, request_id);
+        Ok(self.read_only_ops.cancel_by_key(key))
     }
 
     pub async fn plan_remote_text_save(
@@ -392,6 +522,7 @@ impl Application {
     ) -> Result<(), AppError> {
         let startup = self.sftp_lifecycle_gate(host_id).await;
         let _startup_guard = startup.lock().await;
+        let pending_receivers = self.read_only_ops.cancel_session(host_id, host_session_id);
         self.file_plans.revoke_session(host_id, host_session_id);
         self.transfers
             .quiesce_session(host_id, host_session_id)
@@ -408,6 +539,11 @@ impl Application {
         if let Some(session) = session {
             session.close().await;
         }
+        crate::application::readonly_ops::ReadOnlyOpenSupervisor::quiesce(
+            pending_receivers,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
         Ok(())
     }
 
@@ -464,6 +600,19 @@ impl Application {
             return Err(AppError::new(
                 ErrorCode::Policy,
                 "This file operation belongs to an old SFTP session.",
+            ));
+        }
+        if client.is_retired() {
+            let mut sessions = self.sftp_sessions.lock().await;
+            if sessions
+                .get(&host_id)
+                .is_some_and(|session| session.info().id == sftp_session_id)
+            {
+                sessions.remove(&host_id);
+            }
+            return Err(AppError::new(
+                ErrorCode::SftpUnavailable,
+                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
             ));
         }
         Ok(client)

@@ -11,6 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +22,8 @@ use ubgops_model::{
 
 pub const CLIENT_CHUNK_BYTES: usize = 64 * 1024;
 pub const LISTING_ENTRY_CAP: usize = 5_000;
+pub const DEFAULT_READ_ONLY_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_READ_ONLY_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryIdentity {
@@ -37,6 +40,13 @@ pub struct EditorRevision {
     pub raw_mode: u32,
     pub uid: u32,
     pub gid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlyFileBytes {
+    pub bytes: Vec<u8>,
+    pub modified_at: Option<String>,
+    pub permissions: Option<String>,
 }
 
 pub type Progress = Arc<dyn Fn(u64) + Send + Sync>;
@@ -109,6 +119,16 @@ pub trait SftpClient: Send + Sync {
             "Remote text editing is unavailable.",
         ))
     }
+    async fn read_only_file_bytes(
+        &self,
+        _path: &str,
+        _cancel: CancellationToken,
+    ) -> Result<ReadOnlyFileBytes, AppError> {
+        Err(AppError::new(
+            ErrorCode::SftpUnavailable,
+            "Read-only remote viewing is unavailable.",
+        ))
+    }
     async fn preserve_editor_metadata(
         &self,
         _staging: &str,
@@ -143,15 +163,28 @@ pub trait SftpClient: Send + Sync {
     /// Only call after exclusive creation established ownership. A lost REMOVE
     /// reply is an error, not confirmation that the staging path is gone.
     async fn remove_owned_staging(&self, staging: &str) -> Result<StagingCleanup, AppError>;
+    /// Returns true when the SFTP channel was retired locally after an unresolved
+    /// protocol timeout, error, or explicit close.
+    fn is_retired(&self) -> bool {
+        false
+    }
+    /// Retires and closes the SFTP channel cleanly without touching the parent SSH
+    /// connection or unrelated terminal sessions.
+    async fn retire_channel(&self) {
+        self.close().await;
+    }
     async fn close(&self);
 }
 
 pub struct RawSftpClient {
-    raw: RawSftpSession,
+    raw: Arc<RawSftpSession>,
     info: SftpSessionInfo,
     extension_map: HashMap<String, String>,
     read_chunk: u32,
     write_chunk: usize,
+    retired: AtomicBool,
+    read_only_open_timeout: Duration,
+    read_only_close_timeout: Duration,
 }
 
 impl RawSftpClient {
@@ -159,6 +192,26 @@ impl RawSftpClient {
         stream: S,
         host_id: HostId,
         host_session_id: HostSessionId,
+    ) -> Result<Arc<dyn SftpClient>, AppError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::connect_with_read_only_timeouts(
+            stream,
+            host_id,
+            host_session_id,
+            DEFAULT_READ_ONLY_OPEN_TIMEOUT,
+            DEFAULT_READ_ONLY_CLOSE_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn connect_with_read_only_timeouts<S>(
+        stream: S,
+        host_id: HostId,
+        host_session_id: HostSessionId,
+        read_only_open_timeout: Duration,
+        read_only_close_timeout: Duration,
     ) -> Result<Arc<dyn SftpClient>, AppError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -240,7 +293,7 @@ impl RawSftpClient {
             .collect::<Vec<_>>();
         extensions.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Arc::new(Self {
-            raw,
+            raw: Arc::new(raw),
             info: SftpSessionInfo {
                 id: SftpSessionId::new(),
                 host_id,
@@ -253,6 +306,9 @@ impl RawSftpClient {
             extension_map,
             read_chunk,
             write_chunk,
+            retired: AtomicBool::new(false),
+            read_only_open_timeout,
+            read_only_close_timeout,
         }))
     }
 
@@ -287,6 +343,13 @@ impl RawSftpClient {
 
     async fn close_handle(&self, handle: String) -> Result<(), AppError> {
         Self::status_ok(self.raw.close(handle).await).await
+    }
+
+    async fn close_handle_bounded(&self, handle: String) -> bool {
+        matches!(
+            tokio::time::timeout(self.read_only_close_timeout, self.raw.close(handle)).await,
+            Ok(Ok(status)) if status.status_code == StatusCode::Ok
+        )
     }
 }
 
@@ -495,6 +558,211 @@ impl SftpClient for RawSftpClient {
         let bytes = result?;
         close?;
         Ok(bytes)
+    }
+
+    async fn read_only_file_bytes(
+        &self,
+        path: &str,
+        cancel: CancellationToken,
+    ) -> Result<ReadOnlyFileBytes, AppError> {
+        validate_remote_path(path)?;
+        let cancelled = || {
+            AppError::new(
+                ErrorCode::Cancelled,
+                "Read-only file loading was cancelled.",
+            )
+        };
+        let retired_err = || {
+            AppError::new(
+                ErrorCode::SftpUnavailable,
+                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+            )
+        };
+        if self.is_retired() {
+            return Err(retired_err());
+        }
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let before = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(cancelled()),
+            value = self.raw.lstat(path) => value.map_err(map_error)?.attrs,
+        };
+        let expected = read_only_snapshot(&before)?;
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let dispatched = AtomicBool::new(false);
+        let open_fut = async {
+            dispatched.store(true, Ordering::Release);
+            self.raw
+                .open(path, OpenFlags::READ, FileAttributes::default())
+                .await
+        };
+        tokio::pin!(open_fut);
+        let deadline = tokio::time::sleep(self.read_only_open_timeout);
+        tokio::pin!(deadline);
+        let handle = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Keep ownership of the in-flight OPEN inside this supervised task until a
+                // handle arrives and is closed, a protocol rejection arrives, or the channel
+                // is explicitly retired after the bounded deadline.
+                if dispatched.load(Ordering::Acquire) {
+                    tokio::select! {
+                        biased;
+                        _ = &mut deadline => {
+                            self.retire_channel().await;
+                        }
+                        opened = &mut open_fut => {
+                            match opened {
+                                Ok(opened) => {
+                                    if !self.close_handle_bounded(opened.handle).await {
+                                        self.retire_channel().await;
+                                    }
+                                }
+                                Err(SftpError::Status(_)) | Err(SftpError::Limited(_)) => {}
+                                Err(_) => {
+                                    self.retire_channel().await;
+                                }
+                            }
+                        }
+                    }
+                }
+                return Err(cancelled());
+            }
+            _ = &mut deadline => {
+                self.retire_channel().await;
+                return Err(AppError::new(
+                    ErrorCode::SftpProtocol,
+                    "Timed out waiting for SFTP OPEN response; the SFTP channel was retired.",
+                ));
+            }
+            opened = &mut open_fut => {
+                match opened {
+                    Ok(opened) => opened.handle,
+                    Err(SftpError::Status(status)) => return Err(map_status(status.status_code)),
+                    Err(error) => {
+                        if dispatched.load(Ordering::Acquire)
+                            && matches!(
+                                error,
+                                SftpError::Timeout
+                                    | SftpError::IO(_)
+                                    | SftpError::UnexpectedPacket
+                                    | SftpError::UnexpectedBehavior(_)
+                            )
+                        {
+                            self.retire_channel().await;
+                        }
+                        return Err(map_error(error));
+                    }
+                }
+            }
+        };
+        let mut bytes = Vec::new();
+        let stream_result = async {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            let opened = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(cancelled()),
+                value = self.raw.fstat(handle.clone()) => value.map_err(map_error)?.attrs,
+            };
+            if read_only_snapshot(&opened).ok().as_ref() != Some(&expected) {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "The remote file changed while opening.",
+                ));
+            }
+            while bytes.len() <= MAX_REMOTE_EDITOR_BYTES {
+                let remaining = MAX_REMOTE_EDITOR_BYTES + 1 - bytes.len();
+                let request = self.read_chunk.min(remaining as u32);
+                let chunk = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(cancelled()),
+                    value = self.raw.read(handle.clone(), bytes.len() as u64, request) => value,
+                };
+                match chunk {
+                    Ok(data) if data.data.is_empty() => break,
+                    Ok(data) => {
+                        if data.data.len() > remaining {
+                            return Err(AppError::new(
+                                ErrorCode::FilePolicy,
+                                "The SFTP server exceeded the bounded file read limit.",
+                            ));
+                        }
+                        bytes.extend_from_slice(&data.data);
+                    }
+                    Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                        break;
+                    }
+                    Err(error) => return Err(map_error(error)),
+                }
+            }
+            if bytes.len() > MAX_REMOTE_EDITOR_BYTES {
+                return Err(AppError::new(
+                    ErrorCode::FilePolicy,
+                    "The remote text file exceeds the 1 MiB viewer limit.",
+                ));
+            }
+            let finished = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(cancelled()),
+                value = self.raw.fstat(handle.clone()) => value.map_err(map_error)?.attrs,
+            };
+            if read_only_snapshot(&finished).ok().as_ref() != Some(&expected)
+                || expected
+                    .0
+                    .size
+                    .is_some_and(|declared| declared != bytes.len() as u64)
+            {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "The remote file changed while reading.",
+                ));
+            }
+            Ok(bytes)
+        }
+        .await;
+        let close_ok = self.close_handle_bounded(handle).await;
+        if !close_ok {
+            self.retire_channel().await;
+        }
+        let bytes = stream_result?;
+        if !close_ok {
+            return Err(AppError::new(
+                ErrorCode::SftpProtocol,
+                "The SFTP server did not confirm closing the remote file handle; the SFTP channel was retired.",
+            ));
+        }
+        let after = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(cancelled()),
+            value = self.raw.lstat(path) => value.map_err(map_error)?.attrs,
+        };
+        if read_only_snapshot(&after).ok().as_ref() != Some(&expected)
+            || expected
+                .0
+                .size
+                .is_some_and(|declared| declared != bytes.len() as u64)
+        {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "The remote file changed while reading.",
+            ));
+        }
+        let modified_at = before
+            .mtime
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value as i64, 0))
+            .map(|value| value.to_rfc3339());
+        let permissions = before.permissions.map(|_| before.permissions().to_string());
+        Ok(ReadOnlyFileBytes {
+            bytes,
+            modified_at,
+            permissions,
+        })
     }
 
     async fn preserve_editor_metadata(
@@ -818,8 +1086,15 @@ impl SftpClient for RawSftpClient {
             )),
         }
     }
-    async fn close(&self) {
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+    async fn retire_channel(&self) {
+        self.retired.store(true, Ordering::Release);
         let _ = self.raw.close_session();
+    }
+    async fn close(&self) {
+        self.retire_channel().await;
     }
 }
 
@@ -867,6 +1142,27 @@ fn identity(attrs: &FileAttributes) -> EntryIdentity {
         size: attrs.size,
         modified: attrs.mtime,
     }
+}
+
+type ReadOnlySnapshot = (EntryIdentity, Option<u32>, Option<u32>, Option<u32>);
+
+fn read_only_snapshot(attrs: &FileAttributes) -> Result<ReadOnlySnapshot, AppError> {
+    if attrs.permissions.is_none() || attrs.file_type() != FileType::File {
+        return Err(AppError::new(
+            ErrorCode::FilePolicy,
+            "Only regular non-symlink files can be opened in the read-only viewer.",
+        ));
+    }
+    if attrs
+        .size
+        .is_some_and(|size| size > MAX_REMOTE_EDITOR_BYTES as u64)
+    {
+        return Err(AppError::new(
+            ErrorCode::FilePolicy,
+            "The remote text file exceeds the 1 MiB viewer limit.",
+        ));
+    }
+    Ok((identity(attrs), attrs.permissions, attrs.uid, attrs.gid))
 }
 
 fn initialization_error(error: SftpError) -> AppError {
@@ -2045,5 +2341,358 @@ mod fault_tests {
         assert_eq!(*calls.lock().unwrap(), ["REPLACE executed; reply lost"]);
         assert_eq!(files.lock().unwrap()["/fixture/final"], b"new-final");
         assert!(!files.lock().unwrap().contains_key("/fixture/staging"));
+    }
+
+    #[tokio::test]
+    async fn read_only_file_bytes_handles_empty_exact_limit_bom_and_rejects_oversize_binary_symlink_change_and_cancel()
+     {
+        let (client, state) = matrix_client(Fault::None).await;
+        {
+            let mut s = state.lock().unwrap();
+            s.files.insert("/fixture/empty".into(), Vec::new());
+            s.files.insert(
+                "/fixture/exact1m".into(),
+                vec![b'a'; MAX_REMOTE_EDITOR_BYTES],
+            );
+            s.files.insert(
+                "/fixture/over1m".into(),
+                vec![b'b'; MAX_REMOTE_EDITOR_BYTES + 1],
+            );
+            s.files.insert(
+                "/fixture/bomcrlf".into(),
+                b"\xef\xbb\xbfline1\r\nline2\r\n".to_vec(),
+            );
+        }
+
+        let empty = client
+            .read_only_file_bytes("/fixture/empty", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(empty.bytes.is_empty());
+
+        let exact = client
+            .read_only_file_bytes("/fixture/exact1m", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(exact.bytes.len(), MAX_REMOTE_EDITOR_BYTES);
+
+        let bom = client
+            .read_only_file_bytes("/fixture/bomcrlf", CancellationToken::new())
+            .await
+            .unwrap();
+        let (text, newline, has_bom) = crate::decode_text(&bom.bytes).unwrap();
+        assert_eq!(text, "line1\nline2\n");
+        assert_eq!(newline, ubgops_model::TextNewline::CrLf);
+        assert!(has_bom);
+
+        let over = client
+            .read_only_file_bytes("/fixture/over1m", CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(over.code, ErrorCode::FilePolicy);
+
+        let pre_cancel = CancellationToken::new();
+        pre_cancel.cancel();
+        let cancelled = client
+            .read_only_file_bytes("/fixture/empty", pre_cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(cancelled.code, ErrorCode::Cancelled);
+
+        for (fault, expected_code) in [
+            (Fault::EditorSymlink, ErrorCode::FilePolicy),
+            (Fault::EditorDirectory, ErrorCode::FilePolicy),
+            (Fault::EditorSpecial, ErrorCode::FilePolicy),
+            (Fault::EditorUnknown, ErrorCode::FilePolicy),
+            (Fault::DeclaredSmall, ErrorCode::Conflict),
+        ] {
+            let (fault_client, fault_state) = matrix_client(fault).await;
+            fault_state
+                .lock()
+                .unwrap()
+                .files
+                .insert("/fixture/editor".into(), b"hello world".to_vec());
+            let err = fault_client
+                .read_only_file_bytes("/fixture/editor", CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, expected_code, "fault yielded unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_cancel_during_in_flight_open_closes_late_returned_handle() {
+        struct StalledOpenHandler {
+            open_entered: Arc<tokio::sync::Notify>,
+            open_release: Arc<tokio::sync::Notify>,
+            close_done: Arc<tokio::sync::Notify>,
+            close_count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Handler for StalledOpenHandler {
+            type Error = StatusCode;
+
+            fn unimplemented(&self) -> Self::Error {
+                StatusCode::OpUnsupported
+            }
+
+            async fn init(
+                &mut self,
+                _: u32,
+                _: HashMap<String, String>,
+            ) -> Result<Version, Self::Error> {
+                Ok(Version::new())
+            }
+
+            async fn realpath(&mut self, id: u32, _: String) -> Result<Name, Self::Error> {
+                Ok(Name {
+                    id,
+                    files: vec![File::dummy("/fixture")],
+                })
+            }
+
+            async fn lstat(&mut self, id: u32, _: String) -> Result<Attrs, Self::Error> {
+                Ok(Attrs {
+                    id,
+                    attrs: FileAttributes {
+                        permissions: Some(0o100644),
+                        size: Some(5),
+                        uid: Some(1000),
+                        gid: Some(1000),
+                        mtime: Some(1),
+                        ..FileAttributes::default()
+                    },
+                })
+            }
+
+            async fn open(
+                &mut self,
+                id: u32,
+                _: String,
+                _: OpenFlags,
+                _: FileAttributes,
+            ) -> Result<Handle, Self::Error> {
+                self.open_entered.notify_one();
+                self.open_release.notified().await;
+                Ok(Handle {
+                    id,
+                    handle: "late-handle-1".into(),
+                })
+            }
+
+            async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+                assert_eq!(handle, "late-handle-1");
+                self.close_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.close_done.notify_one();
+                Ok(ok(id))
+            }
+        }
+
+        let open_entered = Arc::new(tokio::sync::Notify::new());
+        let open_release = Arc::new(tokio::sync::Notify::new());
+        let close_done = Arc::new(tokio::sync::Notify::new());
+        let close_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        server::run(
+            server_stream,
+            StalledOpenHandler {
+                open_entered: open_entered.clone(),
+                open_release: open_release.clone(),
+                close_done: close_done.clone(),
+                close_count: close_count.clone(),
+            },
+        )
+        .await;
+        let client = RawSftpClient::connect(client_stream, HostId::new(), HostSessionId::new())
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let client_clone = client.clone();
+        let task = tokio::spawn(async move {
+            client_clone
+                .read_only_file_bytes("/fixture/slow.txt", cancel_clone)
+                .await
+        });
+
+        open_entered.notified().await;
+        cancel.cancel();
+        // Give the task a moment to process cancel while server still stalls OPEN:
+        // supervised ownership keeps the task active rather than leaking a detached task.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+
+        // Now allow the remote SFTP server to finish the stalled OPEN; supervised cleanup
+        // must send CLOSE and return Cancelled cleanly.
+        open_release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+        tokio::time::timeout(std::time::Duration::from_secs(3), close_done.notified())
+            .await
+            .expect("late OPEN handle must be closed during supervised cleanup");
+        assert_eq!(close_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Unrelated calls on the same session remain healthy.
+        let listed = client.identity("/fixture/slow.txt").await.unwrap();
+        assert!(listed.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_only_open_timeout_and_close_failure_retire_channel_without_leaving_reusable_capacity()
+     {
+        struct FaultyLifecycleHandler {
+            never_reply_open: bool,
+            fail_close: bool,
+        }
+
+        impl Handler for FaultyLifecycleHandler {
+            type Error = StatusCode;
+
+            fn unimplemented(&self) -> Self::Error {
+                StatusCode::OpUnsupported
+            }
+
+            async fn init(
+                &mut self,
+                _: u32,
+                _: HashMap<String, String>,
+            ) -> Result<Version, Self::Error> {
+                Ok(Version::new())
+            }
+
+            async fn realpath(&mut self, id: u32, _: String) -> Result<Name, Self::Error> {
+                Ok(Name {
+                    id,
+                    files: vec![File::dummy("/fixture")],
+                })
+            }
+
+            async fn lstat(&mut self, id: u32, _: String) -> Result<Attrs, Self::Error> {
+                Ok(Attrs {
+                    id,
+                    attrs: FileAttributes {
+                        permissions: Some(0o100644),
+                        size: Some(4),
+                        uid: Some(1000),
+                        gid: Some(1000),
+                        mtime: Some(1),
+                        ..FileAttributes::default()
+                    },
+                })
+            }
+
+            async fn open(
+                &mut self,
+                id: u32,
+                _: String,
+                _: OpenFlags,
+                _: FileAttributes,
+            ) -> Result<Handle, Self::Error> {
+                if self.never_reply_open {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Ok(Handle {
+                    id,
+                    handle: "h-1".into(),
+                })
+            }
+
+            async fn fstat(&mut self, id: u32, _: String) -> Result<Attrs, Self::Error> {
+                self.lstat(id, String::new()).await
+            }
+
+            async fn read(
+                &mut self,
+                id: u32,
+                _: String,
+                offset: u64,
+                _: u32,
+            ) -> Result<Data, Self::Error> {
+                if offset == 0 {
+                    Ok(Data {
+                        id,
+                        data: b"abcd".to_vec(),
+                    })
+                } else {
+                    Err(StatusCode::Eof)
+                }
+            }
+
+            async fn close(&mut self, id: u32, _: String) -> Result<Status, Self::Error> {
+                if self.fail_close {
+                    Err(StatusCode::Failure)
+                } else {
+                    Ok(ok(id))
+                }
+            }
+        }
+
+        // Case 1: OPEN exceeds timeout -> SFTP channel is retired locally.
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        server::run(
+            server_stream,
+            FaultyLifecycleHandler {
+                never_reply_open: true,
+                fail_close: false,
+            },
+        )
+        .await;
+        let client_timeout = RawSftpClient::connect_with_read_only_timeouts(
+            client_stream,
+            HostId::new(),
+            HostSessionId::new(),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+        )
+        .await
+        .unwrap();
+        let err = client_timeout
+            .read_only_file_bytes("/fixture/hung.txt", CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SftpProtocol);
+        assert!(client_timeout.is_retired());
+        assert_eq!(
+            client_timeout
+                .read_only_file_bytes("/fixture/next.txt", CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::SftpUnavailable
+        );
+
+        // Case 2: Cancel after OPEN hits CLOSE failure -> channel retires cleanly.
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        server::run(
+            server_stream,
+            FaultyLifecycleHandler {
+                never_reply_open: false,
+                fail_close: true,
+            },
+        )
+        .await;
+        let client_close_fail = RawSftpClient::connect_with_read_only_timeouts(
+            client_stream,
+            HostId::new(),
+            HostSessionId::new(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        let err2 = client_close_fail
+            .read_only_file_bytes("/fixture/close-fail.txt", CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(client_close_fail.is_retired());
+        assert!(matches!(
+            err2.code,
+            ErrorCode::SftpProtocol | ErrorCode::Transfer
+        ));
     }
 }

@@ -22,6 +22,8 @@ export function CommandPalette({
   activeSection,
   sidebarCollapsed,
   terminalFocus,
+  editorFocus = false,
+  canEditorFocus = false,
   unifiedConnected = false,
   systemInfoOpen = false,
   terminalMonitoringOpen = false,
@@ -30,6 +32,7 @@ export function CommandPalette({
   onAddHost,
   onToggleSidebar,
   onToggleTerminalFocus,
+  onToggleEditorFocus,
   onToggleSystemInfo,
   onToggleTerminalMonitoring,
 }: {
@@ -40,6 +43,8 @@ export function CommandPalette({
   activeSection: WorkspaceSection;
   sidebarCollapsed: boolean;
   terminalFocus: boolean;
+  editorFocus?: boolean;
+  canEditorFocus?: boolean;
   unifiedConnected?: boolean;
   systemInfoOpen?: boolean;
   terminalMonitoringOpen?: boolean;
@@ -48,6 +53,7 @@ export function CommandPalette({
   onAddHost: () => void;
   onToggleSidebar: () => void;
   onToggleTerminalFocus: () => void;
+  onToggleEditorFocus?: () => void;
   onToggleSystemInfo?: () => void;
   onToggleTerminalMonitoring?: () => void;
 }) {
@@ -159,6 +165,18 @@ export function CommandPalette({
       });
     }
 
+    if (selectedHost && activeSection === 'files' && canEditorFocus && onToggleEditorFocus) {
+      items.push({
+        id: 'action:editor-focus',
+        category: 'Files & Viewer',
+        label: editorFocus ? 'Exit editor focus mode' : 'Enter editor focus mode',
+        detail: editorFocus ? 'Restore workspace navigation and header' : 'Expand read-only Monaco viewer',
+        icon: editorFocus ? 'minimize' : 'maximize',
+        keywords: 'focus maximize editor monaco fullscreen files',
+        run: onToggleEditorFocus,
+      });
+    }
+
     if (selectedHost && activeSection === 'terminal' && onToggleTerminalMonitoring) {
       items.push({
         id: 'action:terminal-monitoring',
@@ -198,10 +216,13 @@ export function CommandPalette({
     return items;
   }, [
     activeSection,
+    canEditorFocus,
+    editorFocus,
     hosts,
     onAddHost,
     onSelectHost,
     onSelectSection,
+    onToggleEditorFocus,
     onToggleSidebar,
     onToggleSystemInfo,
     onToggleTerminalFocus,

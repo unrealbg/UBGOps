@@ -9,12 +9,21 @@ import { hostKeys } from '../../api/queries';
 import { connected, disconnected, host } from '../../test/fixtures';
 import { FilesWorkspace } from './FilesWorkspace';
 
+vi.mock('../editor/MonacoViewerSurface', () => ({
+  default: ({ documentId, text, ariaLabel }: { documentId: string; text: string; ariaLabel: string }) => (
+    <div data-testid="mock-monaco-surface" data-doc-id={documentId}>
+      <textarea readOnly aria-label={ariaLabel} value={text} />
+    </div>
+  ),
+}));
+
 vi.mock('../../api/client', async (original) => ({
   ...(await original<typeof import('../../api/client')>()),
   hostApi: { session: vi.fn() },
   filesApi: {
     open: vi.fn(), list: vi.fn(), properties: vi.fn(), chooseUploadFiles: vi.fn(),
-    openText: vi.fn(), planTextSave: vi.fn(), discardTextDocument: vi.fn(),
+    openText: vi.fn(), openReadOnly: vi.fn(), cancelReadOnlyOpen: vi.fn(),
+    planTextSave: vi.fn(), discardTextDocument: vi.fn(),
     chooseDownloadDirectory: vi.fn(), planUpload: vi.fn(), planDownload: vi.fn(),
     planCreateDirectory: vi.fn(), planRename: vi.fn(), planDelete: vi.fn(),
     execute: vi.fn(), discardPlan: vi.fn(), discardGrant: vi.fn(),
@@ -686,5 +695,231 @@ describe('Files workspace boundaries', () => {
     fireEvent.keyDown(nav, { key: 'Escape' });
     expect(within(nav).queryByRole('menu', { name: 'Ancestor directories' })).not.toBeInTheDocument();
     expect(filesApi.open).toHaveBeenCalledOnce();
+  });
+
+  it('L-05 keeps committed history index intact across permission failures, rapid Back/Forward, and out-of-order responses', async () => {
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+
+    const pathInput = screen.getByLabelText('Remote path');
+    await userEvent.clear(pathInput);
+    await userEvent.type(pathInput, '/etc{Enter}');
+    await screen.findByDisplayValue('/etc');
+
+    await userEvent.clear(pathInput);
+    await userEvent.type(pathInput, '/var/log{Enter}');
+    await screen.findByDisplayValue('/var/log');
+
+    const back = screen.getByRole('button', { name: 'Back' });
+    const forward = screen.getByRole('button', { name: 'Forward' });
+    expect(back).toBeEnabled();
+    expect(forward).toBeDisabled();
+
+    // 1. Failed history Back (deleted or permission denied) leaves committed directory and Back/Forward unchanged.
+    vi.mocked(filesApi.list).mockRejectedValueOnce({
+      code: 'fileTransfer',
+      message: 'Permission denied for /etc',
+      hostKey: null,
+    });
+    await userEvent.click(back);
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Permission denied for /etc'));
+    expect(screen.getByLabelText('Remote path')).toHaveValue('/var/log');
+    expect(back).toBeEnabled();
+    expect(forward).toBeDisabled();
+
+    // 2. Rapid Back + Forward with out-of-order responses only commits the latest generation.
+    // Navigate Back cleanly to /etc first so both Back (/home/test) and Forward (/var/log) are enabled.
+    vi.mocked(filesApi.list).mockResolvedValueOnce(listing('/etc'));
+    await userEvent.click(back);
+    await screen.findByDisplayValue('/etc');
+    expect(back).toBeEnabled();
+    expect(forward).toBeEnabled();
+
+    const slowBack = deferred<DirectoryListing>();
+    const fastForward = deferred<DirectoryListing>();
+    vi.mocked(filesApi.list)
+      .mockReturnValueOnce(slowBack.promise)
+      .mockReturnValueOnce(fastForward.promise);
+
+    await userEvent.click(back);
+    await userEvent.click(forward);
+
+    await act(async () => {
+      fastForward.resolve(listing('/var/log'));
+    });
+    await screen.findByDisplayValue('/var/log');
+
+    await act(async () => {
+      slowBack.resolve(listing('/home/test'));
+    });
+    expect(screen.getByLabelText('Remote path')).toHaveValue('/var/log');
+    expect(screen.getByRole('button', { name: 'Forward' })).toBeDisabled();
+  });
+
+  it('exposes read-only Monaco viewing without mutation IPC while keeping Goal 02C Edit intact', async () => {
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'ro-doc-1',
+      hostId: host.id,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path: '/home/test/данни.bin',
+      displayName: '/home/test/данни.bin',
+      text: 'readonly preview\n',
+      originalBytes: 17,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+    const selection = await screen.findByRole('checkbox', { name: 'Select данни.bin' });
+    await userEvent.click(selection);
+
+    await userEvent.click(screen.getByRole('button', { name: 'View (Read-only)' }));
+    const surface = await screen.findByTestId('mock-monaco-surface');
+    expect(surface).toHaveAttribute('data-doc-id', 'ro-doc-1');
+    expect(screen.getByTestId('readonly-status-badge')).toHaveTextContent('Read-Only');
+    expect(filesApi.openReadOnly).toHaveBeenCalledTimes(1);
+    expect(filesApi.openText).not.toHaveBeenCalled();
+    expect(filesApi.planTextSave).not.toHaveBeenCalled();
+    expect(filesApi.execute).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Save / review' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Browse files' }));
+    await screen.findByRole('button', { name: 'Open viewer (1)' });
+  });
+
+  it('omits empty Transfer queue chrome, supports opening additional files via +, and shows active transfers when queued', async () => {
+    vi.mocked(filesApi.openReadOnly).mockImplementation(async (ownerSession, _reqId, path) => ({
+      id: `doc-${path}`,
+      hostId: host.id,
+      hostSessionId: ownerSession.hostSessionId,
+      sftpSessionId: ownerSession.id,
+      path,
+      displayName: path,
+      text: path.endsWith('.cs') ? 'Console.WriteLine("ok");\n' : 'worker_processes auto;\n',
+      originalBytes: 24,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    }));
+
+    vi.mocked(filesApi.list).mockResolvedValueOnce({
+      hostId: host.id,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path: '/home/test',
+      partial: false,
+      entryCap: 5000,
+      entries: [
+        {
+          name: 'Program.cs',
+          displayName: 'Program.cs',
+          path: '/home/test/Program.cs',
+          kind: 'file',
+          sizeBytes: '24',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+        {
+          name: 'nginx.conf',
+          displayName: 'nginx.conf',
+          path: '/home/test/nginx.conf',
+          kind: 'file',
+          sizeBytes: '23',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+      ],
+    });
+
+    renderFiles();
+    await screen.findByDisplayValue('/home/test');
+    expect(screen.queryByRole('region', { name: 'Transfer queue' })).not.toBeInTheDocument();
+
+    const rowProgram = (await screen.findByText(/Program\.cs/)).closest('tr')!;
+    await userEvent.click(within(rowProgram).getByRole('button', { name: 'View' }));
+    await screen.findByTestId('mock-monaco-surface');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open another remote file' }));
+    await userEvent.click(screen.getByRole('button', { name: /nginx\.conf/ }));
+    await waitFor(() => expect(filesApi.openReadOnly).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('2 / 8 open')).toBeInTheDocument();
+
+    // Browse directories… preserves all opened tabs.
+    await userEvent.click(screen.getByRole('button', { name: 'Open another remote file' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Browse directories…' }));
+    await screen.findByRole('button', { name: 'Open viewer (2)' });
+  });
+
+  it('shows active Transfers toggle during Editor Focus and exits focus cleanly on close or Browse files', async () => {
+    vi.mocked(filesApi.transfers).mockResolvedValue([
+      {
+        id: 'job-focus-1',
+        hostId: host.id,
+        hostSessionId: session.hostSessionId,
+        sftpSessionId: session.id,
+        direction: 'download',
+        sourceDisplay: '/home/test/archive.tar.gz',
+        destinationDisplay: 'archive.tar.gz',
+        state: 'transferring',
+        confirmedBytes: '512',
+        totalBytes: '1024',
+        error: null,
+        retryable: false,
+      },
+    ]);
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'focus-tx-doc',
+      hostId: host.id,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path: '/home/test/данни.bin',
+      displayName: '/home/test/данни.bin',
+      text: 'focus transfer test\n',
+      originalBytes: 20,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+
+    const onExitFocus = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={client}>
+        <FilesWorkspace
+          host={host}
+          visible
+          editorFocused
+          onToggleEditorFocus={vi.fn()}
+          onExitEditorFocus={onExitFocus}
+          onShowOverview={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByDisplayValue('/home/test');
+    await userEvent.click(await screen.findByRole('button', { name: 'View' }));
+    await screen.findByTestId('mock-monaco-surface');
+
+    const transfersBtn = await screen.findByRole('button', { name: 'Transfers (1)' });
+    expect(screen.queryByRole('region', { name: 'Transfer queue' })).not.toBeInTheDocument();
+    await userEvent.click(transfersBtn);
+    expect(await screen.findByRole('region', { name: 'Transfer queue' })).toBeInTheDocument();
+    expect(screen.getByText('512 / 1024 bytes (50%)')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /Close данни\.bin/ }));
+    expect(onExitFocus).toHaveBeenCalled();
   });
 });

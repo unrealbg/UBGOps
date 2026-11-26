@@ -354,10 +354,11 @@ fn setup(stall: bool) -> (tempfile::TempDir, Arc<Application>, Arc<TestProvider>
         provider: provider.clone(),
         audit: Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).expect("audit")),
         terminals: Arc::new(ubgops_terminal::TerminalManager::new()),
-        sftp_sessions: Mutex::new(HashMap::new()),
+        sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
         sftp_startups: Mutex::new(HashMap::new()),
         file_plans: ubgops_sftp::FilePlanStore::default(),
         transfers: ubgops_sftp::TransferManager::new(),
+        read_only_ops: crate::application::readonly_ops::ReadOnlyOpenSupervisor::default(),
         monitor_baselines: Mutex::new(HashMap::new()),
         monitor_gates: Mutex::new(HashMap::new()),
         service_gates: Mutex::new(HashMap::new()),
@@ -2757,6 +2758,8 @@ struct LifecycleSftpClient {
     stall_plan_identity: AtomicBool,
     stall_plan_stat: AtomicBool,
     stall_editor_read: AtomicBool,
+    stall_readonly_read: AtomicBool,
+    readonly_payload: std::sync::Mutex<Result<Vec<u8>, AppError>>,
     plan_remote_started: Notify,
     plan_remote_release: Notify,
     closed: Notify,
@@ -2806,6 +2809,8 @@ impl LifecycleSftpClient {
             stall_plan_identity: AtomicBool::new(false),
             stall_plan_stat: AtomicBool::new(false),
             stall_editor_read: AtomicBool::new(false),
+            stall_readonly_read: AtomicBool::new(false),
+            readonly_payload: std::sync::Mutex::new(Ok(b"\xef\xbb\xbfhello\r\n".to_vec())),
             plan_remote_started: Notify::new(),
             plan_remote_release: Notify::new(),
             closed: Notify::new(),
@@ -2894,6 +2899,31 @@ impl ubgops_sftp::SftpClient for LifecycleSftpClient {
             self.plan_remote_release.notified().await;
         }
         Ok(b"data".to_vec())
+    }
+    async fn read_only_file_bytes(
+        &self,
+        _path: &str,
+        cancel: CancellationToken,
+    ) -> Result<ubgops_sftp::ReadOnlyFileBytes, AppError> {
+        if self.stall_readonly_read.swap(false, Ordering::SeqCst) {
+            self.plan_remote_started.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(AppError::new(
+                        ErrorCode::Cancelled,
+                        "Read-only file loading was cancelled.",
+                    ));
+                }
+                _ = self.plan_remote_release.notified() => {}
+            }
+        }
+        let bytes = self.readonly_payload.lock().unwrap().clone()?;
+        Ok(ubgops_sftp::ReadOnlyFileBytes {
+            bytes,
+            modified_at: Some("2026-11-25T12:00:00Z".into()),
+            permissions: Some("-rw-r--r--".into()),
+        })
     }
     async fn preserve_editor_metadata(
         &self,
@@ -4218,4 +4248,511 @@ async fn core_retry_boundary_releases_authority_and_requires_new_selection() {
             .code,
         ErrorCode::Policy
     );
+}
+
+#[tokio::test]
+async fn readonly_document_enforces_session_utf8_cancellation_and_no_write_authority() {
+    let (profile, app, _) = setup(false);
+    let host = app.save_host(input(), Some(credential())).await.unwrap();
+    app.connect_host(host.id).await.unwrap();
+    let session_id = app
+        .slot(host.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let client = LifecycleSftpClient::new(host.id, session_id);
+    let sftp_id = client.info.id;
+    app.sftp_sessions
+        .lock()
+        .await
+        .insert(host.id, client.clone());
+
+    let request_id = ReadOnlyDocumentId::new();
+    let doc = app
+        .open_remote_readonly_document(
+            host.id,
+            session_id,
+            sftp_id,
+            request_id,
+            "/etc/test\n.conf".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(doc.text, "hello\n");
+    assert_eq!(doc.newline, TextNewline::CrLf);
+    assert!(doc.bom);
+    assert_eq!(doc.display_name, "/etc/test\\u{000A}.conf");
+
+    // Read-only document IDs allocate no save authority in FilePlanStore.
+    let save_err = app
+        .plan_remote_text_save(
+            host.id,
+            session_id,
+            sftp_id,
+            EditorDocumentId(doc.id.0),
+            "mutated".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(save_err.code, ErrorCode::FilePolicy);
+
+    // Reject NUL and invalid UTF-8 bytes.
+    *client.readonly_payload.lock().unwrap() = Ok(b"abc\0def".to_vec());
+    assert_eq!(
+        app.open_remote_readonly_document(
+            host.id,
+            session_id,
+            sftp_id,
+            ReadOnlyDocumentId::new(),
+            "/tmp/bin".into(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::FilePolicy
+    );
+    *client.readonly_payload.lock().unwrap() = Ok(vec![0xff, 0xfe]);
+    assert_eq!(
+        app.open_remote_readonly_document(
+            host.id,
+            session_id,
+            sftp_id,
+            ReadOnlyDocumentId::new(),
+            "/tmp/badutf8".into(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::FilePolicy
+    );
+
+    // Reject stale session IDs.
+    *client.readonly_payload.lock().unwrap() = Ok(b"ok".to_vec());
+    assert_eq!(
+        app.open_remote_readonly_document(
+            host.id,
+            HostSessionId::new(),
+            sftp_id,
+            ReadOnlyDocumentId::new(),
+            "/tmp/a.txt".into(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Connection
+    );
+
+    // Explicit cancellation cancels an in-flight read-only open.
+    client.stall_readonly_read.store(true, Ordering::SeqCst);
+    let cancel_id = ReadOnlyDocumentId::new();
+    let app_clone = app.clone();
+    let pending = tokio::spawn(async move {
+        app_clone
+            .open_remote_readonly_document(
+                host.id,
+                session_id,
+                sftp_id,
+                cancel_id,
+                "/tmp/slow.txt".into(),
+            )
+            .await
+    });
+    client.plan_remote_started.notified().await;
+    assert!(
+        !app.cancel_remote_readonly_open(host.id, HostSessionId::new(), sftp_id, cancel_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        app.cancel_remote_readonly_open(host.id, session_id, sftp_id, cancel_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        pending.await.unwrap().unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+
+    // Disconnect cancels active read-only opens.
+    client.stall_readonly_read.store(true, Ordering::SeqCst);
+    let app_clone = app.clone();
+    let pending_dc = tokio::spawn(async move {
+        app_clone
+            .open_remote_readonly_document(
+                host.id,
+                session_id,
+                sftp_id,
+                ReadOnlyDocumentId::new(),
+                "/tmp/dc.txt".into(),
+            )
+            .await
+    });
+    client.plan_remote_started.notified().await;
+    app.disconnect_host(host.id).await.unwrap();
+    assert_eq!(
+        pending_dc.await.unwrap().unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+
+    // No read-only audit records or file content leaked to audit log.
+    let audit = std::fs::read_to_string(profile.path().join("audit.jsonl")).unwrap_or_default();
+    assert!(!audit.contains("hello"));
+    assert!(!audit.contains("readonly"));
+}
+
+#[tokio::test]
+async fn readonly_document_enforces_fail_fast_admission_and_cleans_up_aborted_futures() {
+    let (_profile, app, _) = setup(false);
+    let host1 = app.save_host(input(), Some(credential())).await.unwrap();
+    let mut second_input = input();
+    second_input.display_name = "Healthy peer host".into();
+    second_input.connection.hostname = "peer.example.test".into();
+    let host2 = app
+        .save_host(second_input, Some(credential()))
+        .await
+        .unwrap();
+
+    app.connect_host(host1.id).await.unwrap();
+    app.connect_host(host2.id).await.unwrap();
+    let session1 = app
+        .slot(host1.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let session2 = app
+        .slot(host2.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+
+    let client1 = LifecycleSftpClient::new(host1.id, session1);
+    let client2 = LifecycleSftpClient::new(host2.id, session2);
+    let sftp1 = client1.info.id;
+    let sftp2 = client2.info.id;
+    {
+        let mut sessions = app.sftp_sessions.lock().await;
+        sessions.insert(host1.id, client1.clone());
+        sessions.insert(host2.id, client2.clone());
+    }
+
+    let mut handles = Vec::new();
+    for index in 0..crate::application::MAX_CONCURRENT_READONLY_OPENS {
+        client1.stall_readonly_read.store(true, Ordering::SeqCst);
+        let app_clone = app.clone();
+        handles.push(tokio::spawn(async move {
+            app_clone
+                .open_remote_readonly_document(
+                    host1.id,
+                    session1,
+                    sftp1,
+                    ReadOnlyDocumentId::new(),
+                    format!("/tmp/stall-{index}.txt"),
+                )
+                .await
+        }));
+        client1.plan_remote_started.notified().await;
+    }
+
+    assert_eq!(
+        app.read_only_open_metrics().registered_requests,
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+
+    // 9th request fails fast BEFORE entering registered_requests.
+    let overflow = app
+        .open_remote_readonly_document(
+            host1.id,
+            session1,
+            sftp1,
+            ReadOnlyDocumentId::new(),
+            "/tmp/overflow.txt".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(overflow.code, ErrorCode::Conflict);
+    assert_eq!(
+        app.read_only_open_metrics().registered_requests,
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+
+    // Unrelated active host session stays healthy.
+    let peer_doc = app
+        .open_remote_readonly_document(
+            host2.id,
+            session2,
+            sftp2,
+            ReadOnlyDocumentId::new(),
+            "/etc/peer.conf".into(),
+        )
+        .await;
+    assert_eq!(peer_doc.unwrap_err().code, ErrorCode::Conflict);
+    app.validate_sftp_session(host2.id, session2, sftp2)
+        .await
+        .unwrap();
+
+    // Aborting all 8 stalled futures triggers CallerDropGuard cancellation and settles
+    // supervised cleanup before releasing permits.
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.read_only_open_metrics().live_supervised_tasks > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervised tasks must settle after abort");
+    let metrics = app.read_only_open_metrics();
+    assert_eq!(metrics.registered_requests, 0);
+    assert_eq!(
+        metrics.available_permits,
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+
+    client1.stall_readonly_read.store(false, Ordering::SeqCst);
+    let recovered = app
+        .open_remote_readonly_document(
+            host1.id,
+            session1,
+            sftp1,
+            ReadOnlyDocumentId::new(),
+            "/etc/recovered.conf".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.text, "hello\n");
+    assert_eq!(app.read_only_open_metrics().registered_requests, 0);
+    assert_eq!(app.read_only_open_metrics().live_supervised_tasks, 0);
+    app.validate_sftp_session(host2.id, session2, sftp2)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn readonly_supervisor_holds_permits_through_cleanup_protects_reused_request_ids_and_quiesces_shutdown()
+ {
+    let (_profile, app, _) = setup(false);
+    let host1 = app.save_host(input(), Some(credential())).await.unwrap();
+    let mut second_input = input();
+    second_input.display_name = "Peer host".into();
+    second_input.connection.hostname = "peer.example.test".into();
+    let host2 = app
+        .save_host(second_input, Some(credential()))
+        .await
+        .unwrap();
+
+    app.connect_host(host1.id).await.unwrap();
+    app.connect_host(host2.id).await.unwrap();
+    let session1 = app
+        .slot(host1.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let session2 = app
+        .slot(host2.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+
+    // Verify request-ID reuse safety and shutdown quiescing with a custom SFTP client that
+    // simulates slow post-cancel settlement before exiting.
+    struct SlowCleanupSftp {
+        info: SftpSessionInfo,
+        entered: Notify,
+        release_cleanup: Notify,
+        retired: AtomicBool,
+    }
+    #[async_trait]
+    impl ubgops_sftp::SftpClient for SlowCleanupSftp {
+        fn info(&self) -> SftpSessionInfo {
+            self.info.clone()
+        }
+        async fn list(&self, _: &str, _: CancellationToken) -> Result<DirectoryListing, AppError> {
+            Err(unused_sftp())
+        }
+        async fn stat(&self, _: &str) -> Result<RemoteEntry, AppError> {
+            Err(unused_sftp())
+        }
+        async fn identity(&self, _: &str) -> Result<Option<ubgops_sftp::EntryIdentity>, AppError> {
+            Err(unused_sftp())
+        }
+        async fn read_only_file_bytes(
+            &self,
+            _path: &str,
+            cancel: CancellationToken,
+        ) -> Result<ubgops_sftp::ReadOnlyFileBytes, AppError> {
+            self.entered.notify_one();
+            cancel.cancelled().await;
+            let release = self.release_cleanup.notified();
+            if !self.retired.load(Ordering::Acquire) {
+                release.await;
+            }
+            Err(AppError::new(ErrorCode::Cancelled, "cancelled"))
+        }
+        async fn create_dir(&self, _: &str) -> Result<(), AppError> {
+            Err(unused_sftp())
+        }
+        async fn remove_file(&self, _: &str) -> Result<(), AppError> {
+            Err(unused_sftp())
+        }
+        async fn remove_dir(&self, _: &str) -> Result<(), AppError> {
+            Err(unused_sftp())
+        }
+        async fn rename_noclobber(&self, _: &str, _: &str) -> Result<(), AppError> {
+            Err(unused_sftp())
+        }
+        async fn upload_staged(
+            &self,
+            _: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _: &str,
+            _: ubgops_sftp::StagingOwnership,
+            _: CancellationToken,
+            _: ubgops_sftp::Progress,
+        ) -> ubgops_sftp::StagedUploadResult {
+            Err(ubgops_sftp::StagedUploadFailure::NotCreated(unused_sftp()))
+        }
+        async fn download(
+            &self,
+            _: &str,
+            _: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            _: CancellationToken,
+            _: ubgops_sftp::Progress,
+        ) -> Result<u64, AppError> {
+            Err(unused_sftp())
+        }
+        async fn commit_new(&self, _: &str, _: &str) -> Result<(), AppError> {
+            Err(unused_sftp())
+        }
+        async fn commit_replace(&self, _: &str, _: &str) -> Result<(), AppError> {
+            Err(unused_sftp())
+        }
+        async fn remove_owned_staging(
+            &self,
+            _: &str,
+        ) -> Result<ubgops_sftp::StagingCleanup, AppError> {
+            Err(unused_sftp())
+        }
+        fn is_retired(&self) -> bool {
+            self.retired.load(Ordering::Acquire)
+        }
+        async fn retire_channel(&self) {
+            self.retired.store(true, Ordering::Release);
+            self.release_cleanup.notify_waiters();
+        }
+        async fn close(&self) {
+            self.retire_channel().await;
+        }
+    }
+
+    let slow = Arc::new(SlowCleanupSftp {
+        info: SftpSessionInfo {
+            id: SftpSessionId::new(),
+            host_id: host1.id,
+            host_session_id: session1,
+            protocol_version: 3,
+            extensions: Vec::new(),
+            limits: SftpLimits {
+                max_packet_bytes: None,
+                max_read_bytes: None,
+                max_write_bytes: None,
+                max_open_handles: None,
+                client_chunk_bytes: "65536".into(),
+                listing_entry_cap: 5000,
+            },
+            root_path: "/".into(),
+        },
+        entered: Notify::new(),
+        release_cleanup: Notify::new(),
+        retired: AtomicBool::new(false),
+    });
+    let sftp1 = slow.info.id;
+    let peer = LifecycleSftpClient::new(host2.id, session2);
+    let sftp2 = peer.info.id;
+    {
+        let mut sessions = app.sftp_sessions.lock().await;
+        sessions.insert(host1.id, slow.clone());
+        sessions.insert(host2.id, peer.clone());
+    }
+
+    let reused_id = ReadOnlyDocumentId::new();
+    let app_c = app.clone();
+    let first_task = tokio::spawn(async move {
+        app_c
+            .open_remote_readonly_document(host1.id, session1, sftp1, reused_id, "/slow".into())
+            .await
+    });
+    slow.entered.notified().await;
+    assert!(
+        app.cancel_remote_readonly_open(host1.id, session1, sftp1, reused_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        first_task.await.unwrap().unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+
+    // Permit MUST remain held while supervised cleanup is still unsettled.
+    let mid = app.read_only_open_metrics();
+    assert_eq!(mid.live_supervised_tasks, 1);
+    assert_eq!(mid.held_permits, 1);
+    assert_eq!(mid.registered_requests, 0);
+
+    // Reusing the exact same `reused_id` while the first supervised task is settling must NOT
+    // have its newer registration cleared when the first task exits!
+    let app_c2 = app.clone();
+    let second_task = tokio::spawn(async move {
+        app_c2
+            .open_remote_readonly_document(host1.id, session1, sftp1, reused_id, "/slow-2".into())
+            .await
+    });
+    slow.entered.notified().await;
+    assert_eq!(app.read_only_open_metrics().held_permits, 2);
+    assert_eq!(app.read_only_open_metrics().registered_requests, 1);
+
+    // Release ONLY the first waiting task (notify_one) -> second registration stays intact!
+    slow.release_cleanup.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.read_only_open_metrics().live_supervised_tasks != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first cleanup finishes");
+    assert_eq!(app.read_only_open_metrics().held_permits, 1);
+    assert_eq!(app.read_only_open_metrics().registered_requests, 1);
+
+    // Peer session remains unaffected and healthy throughout.
+    assert!(
+        app.validate_sftp_session(host2.id, session2, sftp2)
+            .await
+            .is_ok()
+    );
+
+    // Application shutdown cleanly cancels and quiesces unresolved supervised operations.
+    app.shutdown().await.unwrap();
+    assert_eq!(
+        second_task.await.unwrap().unwrap_err().code,
+        ErrorCode::Cancelled
+    );
+    let end = app.read_only_open_metrics();
+    assert_eq!(end.live_supervised_tasks, 0);
+    assert_eq!(end.held_permits, 0);
+    assert_eq!(end.registered_requests, 0);
 }

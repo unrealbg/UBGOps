@@ -116,6 +116,13 @@ impl SftpClient for PausedEditorClient {
     async fn read_editor_bytes(&self, path: &str) -> Result<Vec<u8>, ubgops_model::AppError> {
         self.inner.read_editor_bytes(path).await
     }
+    async fn read_only_file_bytes(
+        &self,
+        path: &str,
+        cancel: CancellationToken,
+    ) -> Result<ubgops_sftp::ReadOnlyFileBytes, ubgops_model::AppError> {
+        self.inner.read_only_file_bytes(path, cancel).await
+    }
     async fn preserve_editor_metadata(
         &self,
         staging: &str,
@@ -870,4 +877,203 @@ async fn openssh_sftp_streaming_interoperability() {
     client.close().await;
     transport.disconnect().await.expect("SSH disconnect");
     assert!(!fs::exists(local_path).expect("local evidence metadata") || checked == large_bytes);
+}
+
+#[tokio::test]
+#[ignore = "requires tools/openssh-fixture disposable real OpenSSH server"]
+async fn openssh_readonly_document_interoperability() {
+    let fixture = Fixture::from_env();
+    let known_hosts = Arc::new(KnownHosts::open(&fixture.pin_db).expect("known hosts"));
+    let transport = SshProvider::new(known_hosts)
+        .connect(
+            &fixture.host,
+            fixture.credential(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("SSH");
+    let client = transport
+        .open_sftp(fixture.host.id, HostSessionId::new())
+        .await
+        .expect("SFTP");
+    let root = join_remote(
+        &client.info().root_path,
+        &format!("ro-02b1-{}", uuid::Uuid::new_v4().simple()),
+    )
+    .unwrap();
+    client.create_dir(&root).await.expect("mkdir");
+
+    let empty_path = join_remote(&root, "empty.txt").unwrap();
+    let bom_crlf_path = join_remote(&root, "config.toml").unwrap();
+    let nul_path = join_remote(&root, "binary.bin").unwrap();
+    let bad_utf8_path = join_remote(&root, "badutf8.bin").unwrap();
+    let over_path = join_remote(&root, "oversize.txt").unwrap();
+    let denied_path = join_remote(&root, "secret.conf").unwrap();
+
+    let upload_raw = |path: String, bytes: Vec<u8>, mode: Option<u32>| {
+        let client = client.clone();
+        let root = root.clone();
+        async move {
+            let stage =
+                join_remote(&root, &format!(".ubgops-{}.part", uuid::Uuid::new_v4())).unwrap();
+            client
+                .upload_staged(
+                    &mut std::io::Cursor::new(bytes),
+                    &stage,
+                    StagingOwnership::new(),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                )
+                .await
+                .unwrap();
+            if let Some(m) = mode {
+                let rev = client.editor_revision(&stage).await.unwrap();
+                client
+                    .preserve_editor_metadata(
+                        &stage,
+                        &ubgops_sftp::EditorRevision { raw_mode: m, ..rev },
+                    )
+                    .await
+                    .unwrap();
+            }
+            client.commit_new(&stage, &path).await.unwrap();
+        }
+    };
+
+    upload_raw(empty_path.clone(), Vec::new(), None).await;
+    upload_raw(
+        bom_crlf_path.clone(),
+        b"\xef\xbb\xbf[service]\r\nport = 8080\r\n".to_vec(),
+        None,
+    )
+    .await;
+    upload_raw(nul_path.clone(), b"abc\0def".to_vec(), None).await;
+    upload_raw(bad_utf8_path.clone(), vec![0xff, 0xfe, 0x80], None).await;
+    upload_raw(
+        over_path.clone(),
+        vec![b'x'; ubgops_model::MAX_REMOTE_EDITOR_BYTES + 1],
+        None,
+    )
+    .await;
+    upload_raw(denied_path.clone(), b"secret".to_vec(), Some(0o100000)).await;
+
+    // Symlink & chmod creation via non-interactive command execution check? No, inspect via PTY command on fixture.
+    let terminal = transport
+        .open_terminal(
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("pty");
+    let link_path = join_remote(&root, "link.txt").unwrap();
+    terminal
+        .write(
+            format!(
+                "ln -s \"{bom_crlf_path}\" \"{link_path}\" && chmod 000 \"{denied_path}\" && exit\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("ln+chmod");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while matches!(
+            terminal.read().await,
+            Ok(ubgops_terminal::TerminalRead::Data(_))
+        ) {}
+    })
+    .await;
+
+    let empty = client
+        .read_only_file_bytes(&empty_path, CancellationToken::new())
+        .await
+        .expect("empty");
+    let (empty_text, _, empty_bom) = decode_text(&empty.bytes).unwrap();
+    assert!(empty_text.is_empty() && !empty_bom);
+
+    let toml = client
+        .read_only_file_bytes(&bom_crlf_path, CancellationToken::new())
+        .await
+        .expect("toml");
+    let (toml_text, toml_nl, toml_bom) = decode_text(&toml.bytes).unwrap();
+    assert_eq!(toml_text, "[service]\nport = 8080\n");
+    assert_eq!(toml_nl, ubgops_model::TextNewline::CrLf);
+    assert!(toml_bom);
+
+    assert_eq!(
+        decode_text(
+            &client
+                .read_only_file_bytes(&nul_path, CancellationToken::new())
+                .await
+                .unwrap()
+                .bytes
+        )
+        .unwrap_err()
+        .code,
+        ubgops_model::ErrorCode::FilePolicy
+    );
+    assert_eq!(
+        decode_text(
+            &client
+                .read_only_file_bytes(&bad_utf8_path, CancellationToken::new())
+                .await
+                .unwrap()
+                .bytes
+        )
+        .unwrap_err()
+        .code,
+        ubgops_model::ErrorCode::FilePolicy
+    );
+    assert_eq!(
+        client
+            .read_only_file_bytes(&over_path, CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        ubgops_model::ErrorCode::FilePolicy
+    );
+    assert_eq!(
+        client
+            .read_only_file_bytes(&link_path, CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        ubgops_model::ErrorCode::FilePolicy
+    );
+    let pre_cancel = CancellationToken::new();
+    pre_cancel.cancel();
+    assert_eq!(
+        client
+            .read_only_file_bytes(&bom_crlf_path, pre_cancel)
+            .await
+            .unwrap_err()
+            .code,
+        ubgops_model::ErrorCode::Cancelled
+    );
+    let denied_meta = client.stat(&denied_path).await.expect("stat denied_path");
+    assert_eq!(denied_meta.permissions.as_deref(), Some("---------"));
+    let denied_err = client
+        .read_only_file_bytes(&denied_path, CancellationToken::new())
+        .await
+        .expect_err("non-readable mode 0000 file must fail closed with SftpDenied");
+    assert_eq!(denied_err.code, ubgops_model::ErrorCode::SftpDenied);
+
+    for p in [
+        &link_path,
+        &empty_path,
+        &bom_crlf_path,
+        &nul_path,
+        &bad_utf8_path,
+        &over_path,
+        &denied_path,
+    ] {
+        client.remove_file(p).await.expect("cleanup file");
+    }
+    client.remove_dir(&root).await.expect("cleanup dir");
+    client.close().await;
+    transport.disconnect().await.expect("disconnect");
 }

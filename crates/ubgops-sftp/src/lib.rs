@@ -5,8 +5,8 @@ mod policy;
 mod transfer;
 
 pub use client::{
-    EditorRevision, EntryIdentity, LISTING_ENTRY_CAP, Progress, RawSftpClient, SftpClient,
-    StagedUploadFailure, StagedUploadResult, StagingCleanup, StagingOwnership,
+    EditorRevision, EntryIdentity, LISTING_ENTRY_CAP, Progress, RawSftpClient, ReadOnlyFileBytes,
+    SftpClient, StagedUploadFailure, StagedUploadResult, StagingCleanup, StagingOwnership,
 };
 pub use editor::{decode_text, encode_text};
 pub use path::{

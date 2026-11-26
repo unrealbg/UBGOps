@@ -17,7 +17,8 @@ use ubgops_model::{
 };
 use ubgops_model::{
     ConflictPolicy, DirectoryListing, FileOperationPlan, FilePlanId, LocalGrantId,
-    LocalSelectionGrant, RemoteEntry, SftpSessionId, SftpSessionInfo, TransferJob, TransferJobId,
+    LocalSelectionGrant, ReadOnlyDocumentId, RemoteEntry, RemoteReadOnlyDocument, SftpSessionId,
+    SftpSessionInfo, TransferJob, TransferJobId,
 };
 use ubgops_secrets::CredentialInput;
 
@@ -729,6 +730,33 @@ pub async fn open_remote_text_file(
 ) -> Result<ubgops_model::RemoteTextDocument, AppError> {
     let _permit = lifecycle.admit()?;
     app.open_remote_text_file(host_id, host_session_id, sftp_session_id, path)
+        .await
+}
+#[tauri::command]
+pub async fn open_remote_readonly_document(
+    lifecycle: State<'_, LifecycleCoordinator>,
+    app: State<'_, Application>,
+    host_id: HostId,
+    host_session_id: HostSessionId,
+    sftp_session_id: SftpSessionId,
+    request_id: ReadOnlyDocumentId,
+    path: String,
+) -> Result<RemoteReadOnlyDocument, AppError> {
+    let _permit = lifecycle.admit()?;
+    app.open_remote_readonly_document(host_id, host_session_id, sftp_session_id, request_id, path)
+        .await
+}
+#[tauri::command]
+pub async fn cancel_remote_readonly_open(
+    lifecycle: State<'_, LifecycleCoordinator>,
+    app: State<'_, Application>,
+    host_id: HostId,
+    host_session_id: HostSessionId,
+    sftp_session_id: SftpSessionId,
+    request_id: ReadOnlyDocumentId,
+) -> Result<bool, AppError> {
+    let _permit = lifecycle.admit()?;
+    app.cancel_remote_readonly_open(host_id, host_session_id, sftp_session_id, request_id)
         .await
 }
 #[tauri::command]
