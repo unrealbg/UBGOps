@@ -54,6 +54,7 @@ function SshWorkspace({
   filesVisited,
   focused,
   editorFocused = false,
+  viewerOpen = false,
   embedded = false,
   showCompactMonitor = false,
   monitoringOpen = false,
@@ -62,6 +63,8 @@ function SshWorkspace({
   onToggleFocus,
   onToggleEditorFocus,
   onExitEditorFocus,
+  onViewerOpenChange,
+  onTextEditorOpenChange,
   onShowOverview,
   onShowFiles,
 }: {
@@ -71,6 +74,7 @@ function SshWorkspace({
   filesVisited: boolean;
   focused: boolean;
   editorFocused?: boolean;
+  viewerOpen?: boolean;
   embedded?: boolean;
   showCompactMonitor?: boolean;
   monitoringOpen?: boolean;
@@ -79,6 +83,8 @@ function SshWorkspace({
   onToggleFocus: () => void;
   onToggleEditorFocus?: () => void;
   onExitEditorFocus?: () => void;
+  onViewerOpenChange?: (open: boolean) => void;
+  onTextEditorOpenChange?: (open: boolean) => void;
   onShowOverview: () => void;
   onShowFiles: () => void;
 }) {
@@ -204,7 +210,10 @@ function SshWorkspace({
               host={host}
               visible={filesVisible}
               presentation={mode === 'files' ? 'full' : 'compact'}
+              viewerOpen={viewerOpen}
               editorFocused={mode === 'files' && editorFocused}
+              onViewerOpenChange={onViewerOpenChange}
+              onTextEditorOpenChange={onTextEditorOpenChange}
               onToggleEditorFocus={onToggleEditorFocus}
               onExitEditorFocus={onExitEditorFocus}
               onShowFull={onShowFiles}
@@ -321,7 +330,7 @@ function AppShellContent({
   initialSection?: WorkspaceSection;
   initialTerminalMonitoring?: boolean;
 }) {
-  const { purgeHost } = useReadOnlyEditor();
+  const { documents, purgeHost } = useReadOnlyEditor();
   const hostsQuery = useHosts();
   const queryClient = useQueryClient();
   const { hostId, select } = useSelection();
@@ -337,6 +346,8 @@ function AppShellContent({
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [terminalFocus, setTerminalFocus] = useState(false);
   const [editorFocus, setEditorFocus] = useState(false);
+  const [viewerOpenByHost, setViewerOpenByHost] = useState<Record<string, boolean>>({});
+  const [textEditorOpenByHost, setTextEditorOpenByHost] = useState<Record<string, boolean>>({});
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
   const [terminalMonitoringOpen, setTerminalMonitoringOpen] = useState(initialTerminalMonitoring);
 
@@ -347,13 +358,40 @@ function AppShellContent({
   const overviewUnifiedMode = Boolean(
     selectedHost && isSelectedConnected && section === 'overview',
   );
-  const activeTerminalFocus = Boolean(
-    terminalFocus && selectedHost && (section === 'terminal' || overviewUnifiedMode),
+  const selectedHostHasReadOnlyTabs = Boolean(
+    selectedHost && documents.some((doc) => doc.hostId === selectedHost.id),
   );
-  const activeEditorFocus = Boolean(editorFocus && selectedHost && section === 'files');
+  const canEditorFocus = Boolean(
+    selectedHost &&
+      section === 'files' &&
+      viewerOpenByHost[selectedHost.id] &&
+      selectedHostHasReadOnlyTabs &&
+      !textEditorOpenByHost[selectedHost.id],
+  );
+  const activeEditorFocus = Boolean(editorFocus && canEditorFocus);
+  const activeTerminalFocus = Boolean(
+    !activeEditorFocus && terminalFocus && selectedHost && (section === 'terminal' || overviewUnifiedMode),
+  );
   const terminalViewportLocked = Boolean(
     selectedHost && (section === 'terminal' || section === 'files' || overviewUnifiedMode),
   );
+
+  const toggleTerminalFocus = useCallback(() => {
+    setTerminalFocus((current) => {
+      const next = !current;
+      if (next) setEditorFocus(false);
+      return next;
+    });
+  }, []);
+
+  const toggleEditorFocus = useCallback(() => {
+    setEditorFocus((current) => {
+      if (current) return false;
+      if (!canEditorFocus) return false;
+      setTerminalFocus(false);
+      return true;
+    });
+  }, [canEditorFocus]);
 
   useEffect(() => {
     const handleGlobalKey = (event: KeyboardEvent) => {
@@ -421,6 +459,21 @@ function AppShellContent({
     try {
       await hostApi.delete(host.id);
       purgeHost(host.id);
+      if (hostId === host.id) {
+        setEditorFocus(false);
+      }
+      setViewerOpenByHost((current) => {
+        if (!(host.id in current)) return current;
+        const next = { ...current };
+        delete next[host.id];
+        return next;
+      });
+      setTextEditorOpenByHost((current) => {
+        if (!(host.id in current)) return current;
+        const next = { ...current };
+        delete next[host.id];
+        return next;
+      });
       queryClient.removeQueries({ queryKey: hostKeys.session(host.id) });
       await queryClient.invalidateQueries({ queryKey: hostKeys.all });
       if (hostId === host.id) select(null);
@@ -582,6 +635,7 @@ function AppShellContent({
                 filesVisited={fileHosts.includes(id)}
                 focused={activeTerminalFocus && isSelected}
                 editorFocused={activeEditorFocus && isSelected}
+                viewerOpen={Boolean(viewerOpenByHost[host.id])}
                 embedded={hostUnified}
                 showCompactMonitor={false}
                 monitoringOpen={terminalMonitoringOpen}
@@ -598,9 +652,19 @@ function AppShellContent({
                   ) : null
                 }
                 onToggleMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
-                onToggleFocus={() => setTerminalFocus((current) => !current)}
-                onToggleEditorFocus={() => setEditorFocus((current) => !current)}
+                onToggleFocus={toggleTerminalFocus}
+                onToggleEditorFocus={toggleEditorFocus}
                 onExitEditorFocus={() => setEditorFocus(false)}
+                onViewerOpenChange={(open) =>
+                  setViewerOpenByHost((current) =>
+                    Boolean(current[host.id]) === open ? current : { ...current, [host.id]: open },
+                  )
+                }
+                onTextEditorOpenChange={(open) =>
+                  setTextEditorOpenByHost((current) =>
+                    Boolean(current[host.id]) === open ? current : { ...current, [host.id]: open },
+                  )
+                }
                 onShowOverview={() => selectSection('overview')}
                 onShowFiles={() => selectSection('files')}
               />
@@ -666,6 +730,7 @@ function AppShellContent({
         sidebarCollapsed={sidebarCollapsed}
         terminalFocus={activeTerminalFocus}
         editorFocus={activeEditorFocus}
+        canEditorFocus={canEditorFocus}
         unifiedConnected={overviewUnifiedMode}
         systemInfoOpen={systemInfoOpen}
         terminalMonitoringOpen={terminalMonitoringOpen}
@@ -673,8 +738,8 @@ function AppShellContent({
         onSelectSection={selectSection}
         onAddHost={() => setDialog({ type: 'add' })}
         onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
-        onToggleTerminalFocus={() => setTerminalFocus((current) => !current)}
-        onToggleEditorFocus={() => setEditorFocus((current) => !current)}
+        onToggleTerminalFocus={toggleTerminalFocus}
+        onToggleEditorFocus={toggleEditorFocus}
         onToggleSystemInfo={() => setSystemInfoOpen((current) => !current)}
         onToggleTerminalMonitoring={() => setTerminalMonitoringOpen((current) => !current)}
       />

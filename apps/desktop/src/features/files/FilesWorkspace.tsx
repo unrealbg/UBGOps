@@ -32,6 +32,9 @@ export function FilesWorkspace(props: {
   onShowOverview: () => void;
   presentation?: 'full' | 'compact';
   editorFocused?: boolean;
+  viewerOpen?: boolean;
+  onViewerOpenChange?: (open: boolean) => void;
+  onTextEditorOpenChange?: (open: boolean) => void;
   onToggleEditorFocus?: () => void;
   onExitEditorFocus?: () => void;
   onShowFull?: () => void;
@@ -53,6 +56,9 @@ function FilesWorkspaceInner({
   onShowOverview,
   presentation = 'full',
   editorFocused = false,
+  viewerOpen: controlledViewerOpen,
+  onViewerOpenChange,
+  onTextEditorOpenChange,
   onToggleEditorFocus,
   onExitEditorFocus,
   onShowFull,
@@ -62,6 +68,9 @@ function FilesWorkspaceInner({
   onShowOverview: () => void;
   presentation?: 'full' | 'compact';
   editorFocused?: boolean;
+  viewerOpen?: boolean;
+  onViewerOpenChange?: (open: boolean) => void;
+  onTextEditorOpenChange?: (open: boolean) => void;
   onToggleEditorFocus?: () => void;
   onExitEditorFocus?: () => void;
   onShowFull?: () => void;
@@ -75,7 +84,17 @@ function FilesWorkspaceInner({
   const [historyIndex, setHistoryIndex] = useState(-1);
   const historyRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
-  const [viewerOpen, setViewerOpen] = useState(false);
+  const [internalViewerOpen, setInternalViewerOpen] = useState(false);
+  const viewerOpen = controlledViewerOpen !== undefined ? controlledViewerOpen : internalViewerOpen;
+  function updateViewerOpen(next: boolean) {
+    if (controlledViewerOpen === undefined) {
+      setInternalViewerOpen(next);
+    }
+    onViewerOpenChange?.(next);
+    if (!next) {
+      onExitEditorFocus?.();
+    }
+  }
   const [focusTransfersExpanded, setFocusTransfersExpanded] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState('');
@@ -384,7 +403,11 @@ function FilesWorkspaceInner({
       const document = await filesApi.openText(session, entry.path);
       if (mounted.current && visibleNow.current && isCurrent(session, generation) &&
           document.hostId === session.hostId && document.hostSessionId === session.hostSessionId &&
-          document.sftpSessionId === session.id) setEditor(document);
+          document.sftpSessionId === session.id) {
+        setEditor(document);
+        onTextEditorOpenChange?.(true);
+        onExitEditorFocus?.();
+      }
       else void filesApi.discardTextDocument({ hostId: document.hostId, hostSessionId: document.hostSessionId,
         id: document.sftpSessionId }, document.id).catch(() => undefined);
     } catch (reason) { if (mounted.current && session && isCurrent(session, generation)) setError(applicationError(reason).message); }
@@ -393,7 +416,7 @@ function FilesWorkspaceInner({
   async function viewReadOnly(entry: RemoteEntry) {
     if (entry.kind !== 'file' || editor || !sftp || !connected || !ownsConnection || stale) return;
     setError(null);
-    setViewerOpen(true);
+    updateViewerOpen(true);
     await registry.openDocument(sftp, entry.path);
   }
   async function retry(job: TransferJob) {
@@ -476,7 +499,7 @@ function FilesWorkspaceInner({
   );
   const showReadOnlyViewer =
     !compact && !editor && viewerOpen && (hostTabs.length > 0 || hostPending.length > 0 || hostViewerError !== null);
-  const viewerFocusedNow = showReadOnlyViewer && editorFocused;
+  const viewerFocusedNow = showReadOnlyViewer && hostTabs.length > 0 && editorFocused;
   const showTransfersQueue = transfers.length > 0 && (!viewerFocusedNow || focusTransfersExpanded);
 
   const maxVisibleCrumbs = compact ? 4 : 6;
@@ -665,7 +688,7 @@ function FilesWorkspaceInner({
         <label>Filter loaded entries <input value={filter} onChange={(event) => setFilter(event.target.value)} /></label>
         <span>{listing ? `${listing.entries.length}${listing.partial ? '+' : ''} loaded` : 'No listing'}</span>
         {!compact && !editor && !showReadOnlyViewer && (hostTabs.length > 0 || hostPending.length > 0) && (
-          <Button onClick={() => setViewerOpen(true)}>
+          <Button onClick={() => updateViewerOpen(true)}>
             Open viewer ({hostTabs.length})
           </Button>
         )}
@@ -674,7 +697,7 @@ function FilesWorkspaceInner({
       )}
       </div>
       )}
-      {editor ? <RemoteTextEditor initial={editor} host={host} session={sftp} connected={connected} visible={visible} transfers={transfers} onClose={() => setEditor(null)} /> : showReadOnlyViewer ? (
+      {editor ? <RemoteTextEditor initial={editor} host={host} session={sftp} connected={connected} visible={visible} transfers={transfers} onClose={() => { setEditor(null); onTextEditorOpenChange?.(false); }} /> : showReadOnlyViewer ? (
         <ReadOnlyEditorPanel
           hostDisplayName={host.displayName}
           tabs={hostTabs}
@@ -685,34 +708,35 @@ function FilesWorkspaceInner({
           onSelectTab={(documentId) => registry.selectDocument(host.id, documentId)}
           onChangeLanguage={registry.setDocumentLanguage}
           onCloseTab={(documentId) => {
+            const remainingTabs = hostTabs.filter((tab) => tab.id !== documentId);
             registry.closeDocument(documentId);
-            if (hostTabs.length <= 1 && hostPending.length === 0 && !hostViewerError) {
+            if (remainingTabs.length === 0) {
               onExitEditorFocus?.();
-              setViewerOpen(false);
+              if (hostPending.length === 0 && !hostViewerError) {
+                updateViewerOpen(false);
+              }
             }
           }}
           onCloseAllHostTabs={() => {
             registry.closeHostDocuments(host.id);
             registry.clearHostError(host.id);
+            onExitEditorFocus?.();
             if (hostPending.length === 0) {
-              onExitEditorFocus?.();
-              setViewerOpen(false);
+              updateViewerOpen(false);
             }
           }}
           onCancelPending={(requestId) => { void registry.cancelOpen(host.id, requestId); }}
           onDismissError={() => {
             registry.clearHostError(host.id);
             if (hostTabs.length === 0 && hostPending.length === 0) {
-              onExitEditorFocus?.();
-              setViewerOpen(false);
+              updateViewerOpen(false);
             }
           }}
           onBrowseFiles={() => {
-            onExitEditorFocus?.();
-            setViewerOpen(false);
+            updateViewerOpen(false);
           }}
           focused={viewerFocusedNow}
-          onToggleFocus={onToggleEditorFocus}
+          onToggleFocus={hostTabs.length > 0 ? onToggleEditorFocus : undefined}
           availableFiles={availableViewerFiles}
           currentDirectoryPath={currentPath}
           canOpenFiles={canMutate && !editor}

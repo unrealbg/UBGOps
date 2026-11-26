@@ -11,8 +11,9 @@ use ubgops_sftp::{FilePlanStore, SftpClient, TransferManager};
 use ubgops_ssh::{KnownHosts, SshProvider};
 use ubgops_terminal::TerminalManager;
 
+pub(crate) const MAX_CONCURRENT_READONLY_OPENS: usize = 8;
 pub(crate) type ReadOnlyOpenKey = (HostId, HostSessionId, SftpSessionId, ReadOnlyDocumentId);
-pub(crate) type ReadOnlyOpenMap = Mutex<HashMap<ReadOnlyOpenKey, CancellationToken>>;
+pub(crate) type ReadOnlyOpenMap = std::sync::Mutex<HashMap<ReadOnlyOpenKey, CancellationToken>>;
 
 /// Typed application facade. All connection mutations are serialized just long enough
 /// to update local state; network work never holds the metadata gate.
@@ -129,8 +130,8 @@ impl Application {
             sftp_startups: Mutex::new(HashMap::new()),
             file_plans: FilePlanStore::default(),
             transfers: TransferManager::new(),
-            read_only_opens: Mutex::new(HashMap::new()),
-            read_only_open_limit: Semaphore::new(8),
+            read_only_opens: std::sync::Mutex::new(HashMap::new()),
+            read_only_open_limit: Semaphore::new(MAX_CONCURRENT_READONLY_OPENS),
             monitor_baselines: Mutex::new(HashMap::new()),
             monitor_gates: Mutex::new(HashMap::new()),
             service_gates: Mutex::new(HashMap::new()),
@@ -236,7 +237,14 @@ impl Application {
             slots
         };
         self.transfers.shutdown();
-        for (_, cancel) in self.read_only_opens.lock().await.drain() {
+        let pending_read_only = {
+            let mut opens = self
+                .read_only_opens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            opens.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>()
+        };
+        for cancel in pending_read_only {
             cancel.cancel();
         }
         let sessions = self

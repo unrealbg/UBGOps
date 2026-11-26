@@ -164,7 +164,7 @@ pub trait SftpClient: Send + Sync {
 }
 
 pub struct RawSftpClient {
-    raw: RawSftpSession,
+    raw: Arc<RawSftpSession>,
     info: SftpSessionInfo,
     extension_map: HashMap<String, String>,
     read_chunk: u32,
@@ -257,7 +257,7 @@ impl RawSftpClient {
             .collect::<Vec<_>>();
         extensions.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Arc::new(Self {
-            raw,
+            raw: Arc::new(raw),
             info: SftpSessionInfo {
                 id: SftpSessionId::new(),
                 host_id,
@@ -535,11 +535,40 @@ impl SftpClient for RawSftpClient {
             value = self.raw.lstat(path) => value.map_err(map_error)?.attrs,
         };
         let expected = read_only_snapshot(&before)?;
+        let raw_open = Arc::clone(&self.raw);
+        let open_path = path.to_owned();
+        let mut open_task = tokio::spawn(async move {
+            raw_open
+                .open(open_path, OpenFlags::READ, FileAttributes::default())
+                .await
+        });
         let handle = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(cancelled()),
-            value = self.raw.open(path, OpenFlags::READ, FileAttributes::default()) => {
-                value.map_err(map_error)?.handle
+            _ = cancel.cancelled() => {
+                // Best-effort bounded cleanup if the remote server already processed OPEN
+                // and delivers a handle after local cancellation. Unrelated sessions remain untouched.
+                let raw_cleanup = Arc::clone(&self.raw);
+                tokio::spawn(async move {
+                    if let Ok(Ok(Ok(opened))) = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        open_task,
+                    )
+                    .await
+                    {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            raw_cleanup.close(opened.handle),
+                        )
+                        .await;
+                    }
+                });
+                return Err(cancelled());
+            }
+            joined = &mut open_task => {
+                joined
+                    .map_err(|_| AppError::new(ErrorCode::SftpProtocol, "The SFTP open task terminated unexpectedly."))?
+                    .map_err(map_error)?
+                    .handle
             }
         };
         let mut bytes = Vec::new();
@@ -2285,5 +2314,122 @@ mod fault_tests {
                 .unwrap_err();
             assert_eq!(err.code, expected_code, "fault yielded unexpected error");
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_cancel_during_in_flight_open_closes_late_returned_handle() {
+        struct StalledOpenHandler {
+            open_entered: Arc<tokio::sync::Notify>,
+            open_release: Arc<tokio::sync::Notify>,
+            close_done: Arc<tokio::sync::Notify>,
+            close_count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Handler for StalledOpenHandler {
+            type Error = StatusCode;
+
+            fn unimplemented(&self) -> Self::Error {
+                StatusCode::OpUnsupported
+            }
+
+            async fn init(
+                &mut self,
+                _: u32,
+                _: HashMap<String, String>,
+            ) -> Result<Version, Self::Error> {
+                Ok(Version::new())
+            }
+
+            async fn realpath(&mut self, id: u32, _: String) -> Result<Name, Self::Error> {
+                Ok(Name {
+                    id,
+                    files: vec![File::dummy("/fixture")],
+                })
+            }
+
+            async fn lstat(&mut self, id: u32, _: String) -> Result<Attrs, Self::Error> {
+                Ok(Attrs {
+                    id,
+                    attrs: FileAttributes {
+                        permissions: Some(0o100644),
+                        size: Some(5),
+                        uid: Some(1000),
+                        gid: Some(1000),
+                        mtime: Some(1),
+                        ..FileAttributes::default()
+                    },
+                })
+            }
+
+            async fn open(
+                &mut self,
+                id: u32,
+                _: String,
+                _: OpenFlags,
+                _: FileAttributes,
+            ) -> Result<Handle, Self::Error> {
+                self.open_entered.notify_one();
+                self.open_release.notified().await;
+                Ok(Handle {
+                    id,
+                    handle: "late-handle-1".into(),
+                })
+            }
+
+            async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+                assert_eq!(handle, "late-handle-1");
+                self.close_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.close_done.notify_one();
+                Ok(ok(id))
+            }
+        }
+
+        let open_entered = Arc::new(tokio::sync::Notify::new());
+        let open_release = Arc::new(tokio::sync::Notify::new());
+        let close_done = Arc::new(tokio::sync::Notify::new());
+        let close_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        server::run(
+            server_stream,
+            StalledOpenHandler {
+                open_entered: open_entered.clone(),
+                open_release: open_release.clone(),
+                close_done: close_done.clone(),
+                close_count: close_count.clone(),
+            },
+        )
+        .await;
+        let client = RawSftpClient::connect(client_stream, HostId::new(), HostSessionId::new())
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let client_clone = client.clone();
+        let task = tokio::spawn(async move {
+            client_clone
+                .read_only_file_bytes("/fixture/slow.txt", cancel_clone)
+                .await
+        });
+
+        open_entered.notified().await;
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+
+        // Now allow the remote SFTP server to finish the stalled OPEN; best-effort cleanup must CLOSE it.
+        open_release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), close_done.notified())
+            .await
+            .expect("late OPEN handle must be closed asynchronously");
+        assert_eq!(close_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Unrelated calls on the same session remain healthy.
+        let listed = client.identity("/fixture/slow.txt").await.unwrap();
+        assert!(listed.is_some());
     }
 }

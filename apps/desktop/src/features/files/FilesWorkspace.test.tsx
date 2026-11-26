@@ -860,4 +860,66 @@ describe('Files workspace boundaries', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Browse directories…' }));
     await screen.findByRole('button', { name: 'Open viewer (2)' });
   });
+
+  it('shows active Transfers toggle during Editor Focus and exits focus cleanly on close or Browse files', async () => {
+    vi.mocked(filesApi.transfers).mockResolvedValue([
+      {
+        id: 'job-focus-1',
+        hostId: host.id,
+        hostSessionId: session.hostSessionId,
+        sftpSessionId: session.id,
+        direction: 'download',
+        sourceDisplay: '/home/test/archive.tar.gz',
+        destinationDisplay: 'archive.tar.gz',
+        state: 'transferring',
+        confirmedBytes: '512',
+        totalBytes: '1024',
+        error: null,
+        retryable: false,
+      },
+    ]);
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'focus-tx-doc',
+      hostId: host.id,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path: '/home/test/данни.bin',
+      displayName: '/home/test/данни.bin',
+      text: 'focus transfer test\n',
+      originalBytes: 20,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+
+    const onExitFocus = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={client}>
+        <FilesWorkspace
+          host={host}
+          visible
+          editorFocused
+          onToggleEditorFocus={vi.fn()}
+          onExitEditorFocus={onExitFocus}
+          onShowOverview={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByDisplayValue('/home/test');
+    await userEvent.click(await screen.findByRole('button', { name: 'View' }));
+    await screen.findByTestId('mock-monaco-surface');
+
+    const transfersBtn = await screen.findByRole('button', { name: 'Transfers (1)' });
+    expect(screen.queryByRole('region', { name: 'Transfer queue' })).not.toBeInTheDocument();
+    await userEvent.click(transfersBtn);
+    expect(await screen.findByRole('region', { name: 'Transfer queue' })).toBeInTheDocument();
+    expect(screen.getByText('512 / 1024 bytes (50%)')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /Close данни\.bin/ }));
+    expect(onExitFocus).toHaveBeenCalled();
+  });
 });

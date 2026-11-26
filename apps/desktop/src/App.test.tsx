@@ -1016,6 +1016,16 @@ describe('workspace flows', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Files' }));
     await screen.findByDisplayValue('/synthetic');
+
+    // Command Palette must NOT offer Editor Focus when no viewer is open.
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const preOpenPalette = screen.getByRole('dialog', { name: 'Command palette' });
+    expect(
+      within(preOpenPalette).queryByRole('option', { name: /Enter editor focus mode/i }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(within(preOpenPalette).getByRole('button', { name: 'Close command palette' }));
+    expect(shellRoot).not.toHaveClass('app-shell--editor-focus');
+
     await userEvent.click(screen.getByRole('button', { name: 'View' }));
     await screen.findByTestId('mock-monaco-surface');
 
@@ -1027,10 +1037,146 @@ describe('workspace flows', () => {
     await userEvent.click(within(palette).getByRole('option', { name: /Exit editor focus mode/i }));
     expect(shellRoot).not.toHaveClass('app-shell--editor-focus');
 
-    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: 'Terminal' }));
+    // Closing the last document while focused restores the workspace and shell chrome.
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(shellRoot).toHaveClass('app-shell--editor-focus');
+    await userEvent.click(screen.getByRole('button', { name: 'Close Program.cs' }));
+    expect(shellRoot).not.toHaveClass('app-shell--editor-focus');
+
+    await userEvent.click(
+      within(screen.getByRole('navigation', { name: 'Host navigation' })).getByRole('button', {
+        name: 'Terminal',
+      }),
+    );
     expect(screen.getByRole('textbox', { name: 'Synthetic Shell' })).toHaveValue(
       'Synthetic local scrollback focus-ok',
     );
     expect(terminalApi.open).toHaveBeenCalledOnce();
+  });
+
+  it('keeps Exit focus available across disconnect/reconnect and disables focus on Browse files, host switch, or Goal 02C Edit', async () => {
+    const secondHost: Host = {
+      ...host,
+      id: 'host-2',
+      displayName: 'Secondary Lab',
+      connection: { ...host.connection, hostname: 'secondary.example.test' },
+    };
+    vi.mocked(hostApi.list).mockResolvedValue([host, secondHost]);
+    const sessionsByHost: Record<string, typeof connected> = {
+      [host.id]: connected,
+      [secondHost.id]: { ...connected, hostId: secondHost.id, hostSessionId: 'session-2' },
+    };
+    vi.mocked(hostApi.session).mockImplementation(async (id) => sessionsByHost[id] ?? disconnected);
+    vi.mocked(terminalApi.open).mockImplementation(async (id, size) => ({
+      id: `${id}-pty`,
+      hostId: id,
+      hostSessionId: sessionsByHost[id]?.hostSessionId ?? 'session-1',
+      label: 'Shell',
+      size,
+      state: 'open',
+      error: null,
+    }));
+    vi.mocked(filesApi.open).mockImplementation(async (id) => ({
+      id: `${id}-sftp`,
+      hostId: id,
+      hostSessionId: sessionsByHost[id]?.hostSessionId ?? 'session-1',
+      protocolVersion: 3,
+      rootPath: '/synthetic',
+      extensions: [],
+      limits: {
+        maxPacketBytes: '262144',
+        maxReadBytes: '65536',
+        maxWriteBytes: '65536',
+        maxOpenHandles: '64',
+        clientChunkBytes: '65536',
+        listingEntryCap: 5000,
+      },
+    }));
+    vi.mocked(filesApi.list).mockImplementation(async (session, path) => ({
+      hostId: session.hostId,
+      hostSessionId: session.hostSessionId,
+      sftpSessionId: session.id,
+      path,
+      partial: false,
+      entryCap: 5000,
+      entries: [
+        {
+          name: 'Program.cs',
+          displayName: 'Program.cs',
+          path: `${path}/Program.cs`,
+          kind: 'file',
+          sizeBytes: '24',
+          modifiedAt: null,
+          permissions: '-rw-r--r--',
+          uid: null,
+          gid: null,
+        },
+      ],
+    }));
+    vi.mocked(filesApi.openReadOnly).mockResolvedValue({
+      id: 'app-focus-ro-2',
+      hostId: host.id,
+      hostSessionId: connected.hostSessionId!,
+      sftpSessionId: `${host.id}-sftp`,
+      path: '/synthetic/Program.cs',
+      displayName: '/synthetic/Program.cs',
+      text: 'class Program {}\n',
+      originalBytes: 17,
+      newline: 'lf',
+      bom: false,
+      maxBytes: 1_048_576,
+      modifiedAt: null,
+      permissions: '-rw-r--r--',
+    });
+
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <App />
+      </QueryClientProvider>,
+    );
+    const shellRoot = view.container.querySelector('.app-shell')!;
+    await userEvent.click(await screen.findByRole('button', { name: `Open ${host.displayName}` }));
+    await userEvent.click(screen.getByRole('button', { name: 'Files' }));
+    await screen.findByDisplayValue('/synthetic');
+    await userEvent.click(screen.getByRole('button', { name: 'View' }));
+    await screen.findByTestId('mock-monaco-surface');
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(shellRoot).toHaveClass('app-shell--editor-focus');
+
+    // Disconnect and reconnect while focused: visible Exit focus control remains accessible.
+    sessionsByHost[host.id] = disconnected;
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ['sessions', host.id] });
+    });
+    expect(await screen.findByText(/Disconnected read-only snapshot/)).toBeInTheDocument();
+    expect(shellRoot).toHaveClass('app-shell--editor-focus');
+    expect(screen.getByRole('button', { name: 'Exit focus' })).toBeInTheDocument();
+
+    sessionsByHost[host.id] = { ...connected, hostSessionId: 'session-reconnected' };
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ['sessions', host.id] });
+    });
+    expect(screen.getByRole('button', { name: 'Exit focus' })).toBeInTheDocument();
+
+    // Clicking Browse files exits Editor Focus and restores chrome.
+    await userEvent.click(screen.getByRole('button', { name: 'Browse files' }));
+    expect(shellRoot).not.toHaveClass('app-shell--editor-focus');
+
+    // Switching hosts resets Editor Focus and hides Enter editor focus mode on host-2 without open viewer.
+    await userEvent.click(screen.getByRole('button', { name: 'Open viewer (1)' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Focus' }));
+    expect(shellRoot).toHaveClass('app-shell--editor-focus');
+    await userEvent.click(screen.getByRole('button', { name: 'Exit focus' }));
+    await userEvent.selectOptions(screen.getByLabelText('Select a host'), secondHost.id);
+    expect(shellRoot).not.toHaveClass('app-shell--editor-focus');
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    expect(
+      within(screen.getByRole('dialog', { name: 'Command palette' })).queryByRole('option', {
+        name: /Enter editor focus mode/i,
+      }),
+    ).not.toBeInTheDocument();
   });
 });

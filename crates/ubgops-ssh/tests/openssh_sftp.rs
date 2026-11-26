@@ -1054,12 +1054,13 @@ async fn openssh_readonly_document_interoperability() {
             .code,
         ubgops_model::ErrorCode::Cancelled
     );
-    if let Err(err) = client
+    let denied_meta = client.stat(&denied_path).await.expect("stat denied_path");
+    assert_eq!(denied_meta.permissions.as_deref(), Some("---------"));
+    let denied_err = client
         .read_only_file_bytes(&denied_path, CancellationToken::new())
         .await
-    {
-        assert_eq!(err.code, ubgops_model::ErrorCode::SftpDenied);
-    }
+        .expect_err("non-readable mode 0000 file must fail closed with SftpDenied");
+    assert_eq!(denied_err.code, ubgops_model::ErrorCode::SftpDenied);
 
     for p in [
         &link_path,

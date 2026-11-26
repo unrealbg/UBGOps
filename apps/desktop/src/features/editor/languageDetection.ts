@@ -223,15 +223,20 @@ export function detectRemoteFileLanguage(remotePath: string): DetectedLanguage {
   const exactMatch = BASENAME_MAP[lowerName];
   if (exactMatch) return exactMatch;
 
+  const dotIndex = lowerName.lastIndexOf('.');
+  const ext = dotIndex > 0 && dotIndex < lowerName.length - 1 ? lowerName.slice(dotIndex + 1) : '';
+  const extMatch = ext ? EXTENSION_MAP[ext] : undefined;
+  // Explicit non-.conf extensions (e.g. README.md, check.sh, script.py inside /etc/nginx)
+  // take precedence over generic Nginx/Apache directory context, while preserving .conf
+  // and extensionless vhost/unit files in those directories.
+  if (extMatch && ext !== 'conf') {
+    return extMatch;
+  }
+
   const contextMatch = detectFromDirectoryContext(normalizedPath, lowerName);
   if (contextMatch) return contextMatch;
 
-  const dotIndex = lowerName.lastIndexOf('.');
-  if (dotIndex > 0 && dotIndex < lowerName.length - 1) {
-    const ext = lowerName.slice(dotIndex + 1);
-    const extMatch = EXTENSION_MAP[ext];
-    if (extMatch) return extMatch;
-  }
+  if (extMatch) return extMatch;
 
   return { id: 'plaintext', label: 'Plain Text' };
 }

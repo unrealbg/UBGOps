@@ -23,6 +23,7 @@ export function CommandPalette({
   sidebarCollapsed,
   terminalFocus,
   editorFocus = false,
+  canEditorFocus = false,
   unifiedConnected = false,
   systemInfoOpen = false,
   terminalMonitoringOpen = false,
@@ -43,6 +44,7 @@ export function CommandPalette({
   sidebarCollapsed: boolean;
   terminalFocus: boolean;
   editorFocus?: boolean;
+  canEditorFocus?: boolean;
   unifiedConnected?: boolean;
   systemInfoOpen?: boolean;
   terminalMonitoringOpen?: boolean;
@@ -163,7 +165,7 @@ export function CommandPalette({
       });
     }
 
-    if (selectedHost && activeSection === 'files' && onToggleEditorFocus) {
+    if (selectedHost && activeSection === 'files' && canEditorFocus && onToggleEditorFocus) {
       items.push({
         id: 'action:editor-focus',
         category: 'Files & Viewer',
@@ -214,6 +216,7 @@ export function CommandPalette({
     return items;
   }, [
     activeSection,
+    canEditorFocus,
     editorFocus,
     hosts,
     onAddHost,

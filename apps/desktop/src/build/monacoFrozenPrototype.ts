@@ -81,7 +81,7 @@ export function verifyInstalledMonacoVersion(
 }
 
 export function applyPinnedMonacoPrototypePatch(source: string, id: string): string | undefined {
-  const normalized = id.replaceAll('\\', '/');
+  const normalized = id.split('?', 1)[0]!.replaceAll('\\', '/');
   const patch = MONACO_PROTOTYPE_PATCHES.find((entry) => normalized.endsWith(entry.suffix));
   if (!patch) return undefined;
   const occurrences = source.split(patch.target).length - 1;
@@ -109,7 +109,27 @@ export function monacoFrozenPrototypeCompatibility(): Plugin {
       versionVerified = true;
     },
     transform(source: string, id: string) {
-      const normalized = id.replaceAll('\\', '/');
+      const normalized = id.split('?', 1)[0]!.replaceAll('\\', '/');
+      if (!normalized.includes('/monaco-editor/')) return undefined;
+      if (!versionVerified) {
+        verifyInstalledMonacoVersion(resolveFromUrl);
+        versionVerified = true;
+      }
+      return applyPinnedMonacoPrototypePatch(source, normalized);
+    },
+  };
+}
+
+export function monacoFrozenPrototypeRolldownPlugin(resolveFromUrl: string = import.meta.url) {
+  let versionVerified = false;
+  return {
+    name: 'monaco-frozen-prototype-rolldown',
+    buildStart() {
+      verifyInstalledMonacoVersion(resolveFromUrl);
+      versionVerified = true;
+    },
+    transform(source: string, id: string) {
+      const normalized = id.split('?', 1)[0]!.replaceAll('\\', '/');
       if (!normalized.includes('/monaco-editor/')) return undefined;
       if (!versionVerified) {
         verifyInstalledMonacoVersion(resolveFromUrl);

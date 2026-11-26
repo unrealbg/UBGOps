@@ -358,8 +358,8 @@ fn setup(stall: bool) -> (tempfile::TempDir, Arc<Application>, Arc<TestProvider>
         sftp_startups: Mutex::new(HashMap::new()),
         file_plans: ubgops_sftp::FilePlanStore::default(),
         transfers: ubgops_sftp::TransferManager::new(),
-        read_only_opens: Mutex::new(HashMap::new()),
-        read_only_open_limit: Semaphore::new(8),
+        read_only_opens: std::sync::Mutex::new(HashMap::new()),
+        read_only_open_limit: Semaphore::new(crate::application::MAX_CONCURRENT_READONLY_OPENS),
         monitor_baselines: Mutex::new(HashMap::new()),
         monitor_gates: Mutex::new(HashMap::new()),
         service_gates: Mutex::new(HashMap::new()),
@@ -4402,4 +4402,129 @@ async fn readonly_document_enforces_session_utf8_cancellation_and_no_write_autho
     let audit = std::fs::read_to_string(profile.path().join("audit.jsonl")).unwrap_or_default();
     assert!(!audit.contains("hello"));
     assert!(!audit.contains("readonly"));
+}
+
+#[tokio::test]
+async fn readonly_document_enforces_fail_fast_admission_and_cleans_up_aborted_futures() {
+    let (_profile, app, _) = setup(false);
+    let host1 = app.save_host(input(), Some(credential())).await.unwrap();
+    let mut second_input = input();
+    second_input.display_name = "Healthy peer host".into();
+    second_input.connection.hostname = "peer.example.test".into();
+    let host2 = app
+        .save_host(second_input, Some(credential()))
+        .await
+        .unwrap();
+
+    app.connect_host(host1.id).await.unwrap();
+    app.connect_host(host2.id).await.unwrap();
+    let session1 = app
+        .slot(host1.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let session2 = app
+        .slot(host2.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+
+    let client1 = LifecycleSftpClient::new(host1.id, session1);
+    let client2 = LifecycleSftpClient::new(host2.id, session2);
+    let sftp1 = client1.info.id;
+    let sftp2 = client2.info.id;
+    {
+        let mut sessions = app.sftp_sessions.lock().await;
+        sessions.insert(host1.id, client1.clone());
+        sessions.insert(host2.id, client2.clone());
+    }
+
+    let mut handles = Vec::new();
+    for index in 0..crate::application::MAX_CONCURRENT_READONLY_OPENS {
+        client1.stall_readonly_read.store(true, Ordering::SeqCst);
+        let app_clone = app.clone();
+        handles.push(tokio::spawn(async move {
+            app_clone
+                .open_remote_readonly_document(
+                    host1.id,
+                    session1,
+                    sftp1,
+                    ReadOnlyDocumentId::new(),
+                    format!("/tmp/stall-{index}.txt"),
+                )
+                .await
+        }));
+        client1.plan_remote_started.notified().await;
+    }
+
+    assert_eq!(
+        app.read_only_opens.lock().unwrap().len(),
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+
+    // 9th request fails fast BEFORE entering read_only_opens.
+    let overflow = app
+        .open_remote_readonly_document(
+            host1.id,
+            session1,
+            sftp1,
+            ReadOnlyDocumentId::new(),
+            "/tmp/overflow.txt".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(overflow.code, ErrorCode::Conflict);
+    assert_eq!(
+        app.read_only_opens.lock().unwrap().len(),
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+
+    // Unrelated active host session stays healthy.
+    let peer_doc = app
+        .open_remote_readonly_document(
+            host2.id,
+            session2,
+            sftp2,
+            ReadOnlyDocumentId::new(),
+            "/etc/peer.conf".into(),
+        )
+        .await;
+    assert_eq!(peer_doc.unwrap_err().code, ErrorCode::Conflict);
+    app.validate_sftp_session(host2.id, session2, sftp2)
+        .await
+        .unwrap();
+
+    // Aborting all 8 stalled futures triggers deterministic Drop cleanup of pending entries and permits.
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    assert!(app.read_only_opens.lock().unwrap().is_empty());
+    assert_eq!(
+        app.read_only_open_limit.available_permits(),
+        crate::application::MAX_CONCURRENT_READONLY_OPENS
+    );
+
+    client1.stall_readonly_read.store(false, Ordering::SeqCst);
+    let recovered = app
+        .open_remote_readonly_document(
+            host1.id,
+            session1,
+            sftp1,
+            ReadOnlyDocumentId::new(),
+            "/etc/recovered.conf".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.text, "hello\n");
+    assert!(app.read_only_opens.lock().unwrap().is_empty());
+    app.validate_sftp_session(host2.id, session2, sftp2)
+        .await
+        .unwrap();
 }
