@@ -202,7 +202,27 @@ export function ensureReadOnlyModel(
   return ensureDocumentModel(documentId, text, languageId);
 }
 
+export interface RetainedDocumentMetadata {
+  appliedRevision?: number;
+  undoBytes: number;
+  undoSteps: number;
+  lastValidLf?: string;
+  viewState: monaco.editor.ICodeEditorViewState | null;
+}
+
+const retainedDocumentMetadata = new Map<string, RetainedDocumentMetadata>();
+
+export function getRetainedDocumentMetadata(documentId: string): RetainedDocumentMetadata {
+  let entry = retainedDocumentMetadata.get(documentId);
+  if (!entry) {
+    entry = { undoBytes: 0, undoSteps: 0, viewState: null };
+    retainedDocumentMetadata.set(documentId, entry);
+  }
+  return entry;
+}
+
 export function disposeReadOnlyModel(documentId: string): void {
+  retainedDocumentMetadata.delete(documentId);
   const uri = opaqueReadOnlyModelUri(documentId);
   monaco.editor.getModel(uri)?.dispose();
 }

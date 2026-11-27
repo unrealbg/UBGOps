@@ -411,7 +411,8 @@ function FilesWorkspaceInner({
   async function openEditor(entry: RemoteEntry) {
     if (entry.kind !== 'file' || editor || openingEditorGuard.current) return;
     const precheckSession = owner();
-    if (registry.hasActiveEditAuthority(precheckSession, entry.path)) {
+    const reservationId = registry.reserveExternalEdit(precheckSession, entry.path);
+    if (!reservationId) {
       setError('This file already has an active editable Monaco session. Close or save it before opening the modal editor.');
       return;
     }
@@ -419,13 +420,15 @@ function FilesWorkspaceInner({
     setOpeningEditor(true);
     let session: SftpSessionInfo | null = null;
     let generation = approvalGeneration.current;
+    let committed = false;
     try {
       session = owner(); generation = approvalGeneration.current;
       const document = await filesApi.openText(session, entry.path);
       if (mounted.current && visibleNow.current && isCurrent(session, generation) &&
           document.hostId === session.hostId && document.hostSessionId === session.hostSessionId &&
           document.sftpSessionId === session.id &&
-          registry.registerExternalEdit(session, entry.path, document.id)) {
+          registry.commitExternalEdit(reservationId, document.id)) {
+        committed = true;
         setEditor(document);
         onTextEditorOpenChange?.(true);
         onExitEditorFocus?.();
@@ -433,7 +436,13 @@ function FilesWorkspaceInner({
       else void filesApi.discardTextDocument({ hostId: document.hostId, hostSessionId: document.hostSessionId,
         id: document.sftpSessionId }, document.id).catch(() => undefined);
     } catch (reason) { if (mounted.current && session && isCurrent(session, generation)) setError(applicationError(reason).message); }
-    finally { openingEditorGuard.current = false; if (mounted.current) setOpeningEditor(false); }
+    finally {
+      if (!committed) {
+        registry.releaseExternalEdit(reservationId);
+      }
+      openingEditorGuard.current = false;
+      if (mounted.current) setOpeningEditor(false);
+    }
   }
   async function viewReadOnly(entry: RemoteEntry) {
     if (entry.kind !== 'file' || editor || !sftp || !connected || !ownsConnection || stale) return;

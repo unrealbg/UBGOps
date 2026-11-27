@@ -46,13 +46,22 @@ impl Application {
             return Err(cancelled());
         }
         drop(data);
-        let old = self
-            .sftp_sessions
-            .lock()
-            .await
-            .insert(host_id, client.clone());
+        let (old, old_receivers) = {
+            let mut sessions = self.sftp_sessions.lock().await;
+            let old = sessions.insert(host_id, client.clone());
+            let receivers = old
+                .as_ref()
+                .map(|prev| self.read_only_ops.cancel_sftp_channel(prev.info().id))
+                .unwrap_or_default();
+            (old, receivers)
+        };
         if let Some(old) = old {
             old.close().await;
+            let _ = crate::application::readonly_ops::ReadOnlyOpenSupervisor::quiesce(
+                old_receivers,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
         }
         Ok(client.info())
     }
@@ -95,6 +104,22 @@ impl Application {
         let client = self
             .owned_sftp(host_id, host_session_id, sftp_session_id)
             .await?;
+        if self.file_plans.has_active_editor_document(
+            host_id,
+            host_session_id,
+            sftp_session_id,
+            &path,
+        )? || self.transfers.has_active_editor_save(
+            host_id,
+            host_session_id,
+            sftp_session_id,
+            &path,
+        ) {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "An active editor authority or in-flight save already exists for this file in this SFTP session.",
+            ));
+        }
         let before = client.editor_revision(&path).await?;
         let bytes = client.read_editor_bytes(&path).await?;
         let after = client.editor_revision(&path).await?;
@@ -139,25 +164,81 @@ impl Application {
         request_id: ReadOnlyDocumentId,
         path: String,
     ) -> Result<RemoteReadOnlyDocument, AppError> {
-        self.read_only_ops
-            .ensure_admissible(host_id, host_session_id, sftp_session_id)?;
-        let client = self
-            .owned_sftp(host_id, host_session_id, sftp_session_id)
-            .await?;
         #[cfg(test)]
         self.read_only_ops.wait_before_register().await;
-        if client.is_retired() {
-            self.read_only_ops.seal_sftp_channel(sftp_session_id);
-            return Err(AppError::new(
-                ErrorCode::SftpUnavailable,
-                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
-            ));
-        }
-        let permit = self.read_only_ops.try_acquire_permit()?;
+
         let cancel = CancellationToken::new();
         let key = (host_id, host_session_id, sftp_session_id, request_id);
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-        let op_id = self.read_only_ops.register(key, cancel.clone(), done_rx)?;
+
+        // Linearizable critical section (strict lock order: slot.data -> sftp_sessions -> read_only_ops):
+        // validates live session & non-retired SFTP channel, acquires global permit, and registers op_id
+        // atomically without any FIFO tombstone race or permit leak.
+        let (client, op_id, permit) = {
+            if self.read_only_ops.is_shutdown() {
+                return Err(AppError::new(
+                    ErrorCode::Cancelled,
+                    "UBGOps is shutting down.",
+                ));
+            }
+            let slot = self.slot(host_id).await;
+            let data = slot.data.lock().await;
+            if data.view.state != ConnectionState::Connected {
+                return Err(AppError::new(
+                    ErrorCode::Cancelled,
+                    "The SSH connection for this file operation has disconnected.",
+                ));
+            }
+            if data.connection_id != Some(host_session_id) {
+                return Err(AppError::new(
+                    ErrorCode::Connection,
+                    "This file operation belongs to an old SSH connection.",
+                ));
+            }
+            let mut sessions = self.sftp_sessions.lock().await;
+            let Some(client) = sessions.get(&host_id).cloned() else {
+                if self.read_only_ops.is_sftp_sealed_channel(sftp_session_id) {
+                    return Err(AppError::new(
+                        ErrorCode::SftpUnavailable,
+                        "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+                    ));
+                }
+                return Err(AppError::new(
+                    ErrorCode::SftpUnavailable,
+                    "Open the Files workspace again to start SFTP.",
+                ));
+            };
+            if client.info().id != sftp_session_id
+                || client.info().host_session_id != host_session_id
+            {
+                if self.read_only_ops.is_sftp_sealed_channel(sftp_session_id) {
+                    return Err(AppError::new(
+                        ErrorCode::SftpUnavailable,
+                        "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+                    ));
+                }
+                return Err(AppError::new(
+                    ErrorCode::Policy,
+                    "This file operation belongs to an old SFTP session.",
+                ));
+            }
+            if client.is_retired() {
+                self.read_only_ops.cancel_sftp_channel(sftp_session_id);
+                if sessions
+                    .get(&host_id)
+                    .is_some_and(|session| session.info().id == sftp_session_id)
+                {
+                    sessions.remove(&host_id);
+                }
+                return Err(AppError::new(
+                    ErrorCode::SftpUnavailable,
+                    "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+                ));
+            }
+            let (op_id, permit) = self.read_only_ops.try_admit(key, cancel.clone(), done_rx)?;
+            (client, op_id, permit)
+        };
+
         let supervisor_state = self.read_only_ops.state_arc();
         let mut caller_guard = crate::application::readonly_ops::CallerDropGuard::new(
             Arc::clone(&supervisor_state),
@@ -186,7 +267,7 @@ impl Application {
                     .read_only_file_bytes(&task_path, task_cancel.clone())
                     .await;
                 if task_client.is_retired() {
-                    task_ops.seal_sftp_channel(sftp_session_id);
+                    task_ops.cancel_sftp_channel_except(sftp_session_id, Some(op_id));
                     let mut sessions = task_sessions.lock().await;
                     if sessions
                         .get(&host_id)

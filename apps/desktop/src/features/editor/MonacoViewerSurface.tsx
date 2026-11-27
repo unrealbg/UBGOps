@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useRef, type Ref } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useRef, type Ref } from 'react';
 import type { TextNewline } from '@ubgops/protocol';
 import {
   UBGOPS_MONACO_THEME,
@@ -8,6 +8,7 @@ import {
   getModelAlternativeVersionId,
   getModelUndoRedoState,
   getModelValueLf,
+  getRetainedDocumentMetadata,
   monaco,
   resetModelValueLf,
 } from './monacoSetup';
@@ -53,6 +54,12 @@ export interface MonacoViewerSurfaceProps {
   onUndoHistoryCompacted?: (reason: string) => void;
 }
 
+interface PendingDeferredAction {
+  timerId: number;
+  documentId: string;
+  modelRevision: number | undefined;
+}
+
 export default function MonacoViewerSurface({
   documentId,
   text,
@@ -72,12 +79,10 @@ export default function MonacoViewerSurface({
 }: MonacoViewerSurfaceProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
-  const viewStatesRef = useRef<Map<string, monaco.editor.ICodeEditorViewState | null>>(new Map());
   const activeDocumentIdRef = useRef<string | null>(null);
-  const appliedRevisionRef = useRef<Map<string, number>>(new Map());
-  const undoTrackerRef = useRef<Map<string, { bytes: number; steps: number }>>(new Map());
-  const lastValidLfRef = useRef<Map<string, string>>(new Map());
   const applyingGuardRef = useRef(false);
+  const pendingCompactionRef = useRef<PendingDeferredAction | null>(null);
+  const pendingRevertRef = useRef<PendingDeferredAction | null>(null);
 
   const latestPropsRef = useRef({
     editable,
@@ -101,30 +106,159 @@ export default function MonacoViewerSurface({
     };
   });
 
-  function compactActiveModelUndo(reason: string): boolean {
-    const editor = editorRef.current;
-    const model = editor?.getModel();
-    const activeDocId = activeDocumentIdRef.current;
-    if (!editor || !model || !activeDocId) return false;
-    const currentText = getModelValueLf(model);
-    const savedState = editor.saveViewState();
-    applyingGuardRef.current = true;
-    try {
-      resetModelValueLf(model, currentText);
-      if (savedState) {
-        editor.restoreViewState(savedState);
-      }
-      undoTrackerRef.current.set(activeDocId, { bytes: 0, steps: 0 });
-    } finally {
-      applyingGuardRef.current = false;
+  const clearPendingDeferredActions = useCallback(() => {
+    if (pendingCompactionRef.current !== null) {
+      window.clearTimeout(pendingCompactionRef.current.timerId);
+      pendingCompactionRef.current = null;
     }
-    latestPropsRef.current.onUndoHistoryCompacted?.(reason);
-    latestPropsRef.current.onContentChange?.(
-      currentText,
-      getModelAlternativeVersionId(model),
-      getModelUndoRedoState(model),
-    );
-    return true;
+    if (pendingRevertRef.current !== null) {
+      window.clearTimeout(pendingRevertRef.current.timerId);
+      pendingRevertRef.current = null;
+    }
+  }, []);
+
+  const compactModelUndoNow = useCallback(
+    (
+      targetDocId: string,
+      expectedRevision: number | undefined,
+      reason: string,
+    ): boolean => {
+      const editor = editorRef.current;
+      const model = editor?.getModel();
+      const meta = getRetainedDocumentMetadata(targetDocId);
+      if (
+        !editor ||
+        !model ||
+        activeDocumentIdRef.current !== targetDocId ||
+        (expectedRevision !== undefined && meta.appliedRevision !== expectedRevision)
+      ) {
+        return false;
+      }
+      const currentText = getModelValueLf(model);
+      const savedState = editor.saveViewState();
+      applyingGuardRef.current = true;
+      try {
+        resetModelValueLf(model, currentText);
+        if (savedState) {
+          editor.restoreViewState(savedState);
+        }
+        meta.undoBytes = 0;
+        meta.undoSteps = 0;
+        meta.lastValidLf = currentText;
+      } finally {
+        applyingGuardRef.current = false;
+      }
+      latestPropsRef.current.onUndoHistoryCompacted?.(reason);
+      latestPropsRef.current.onContentChange?.(
+        currentText,
+        getModelAlternativeVersionId(model),
+        getModelUndoRedoState(model),
+      );
+      return true;
+    },
+    [],
+  );
+
+  const compactActiveModelUndo = useCallback(
+    (reason: string): boolean => {
+      const activeDocId = activeDocumentIdRef.current;
+      if (!activeDocId) return false;
+      clearPendingDeferredActions();
+      return compactModelUndoNow(activeDocId, undefined, reason);
+    },
+    [clearPendingDeferredActions, compactModelUndoNow],
+  );
+
+  function scheduleDeferredUndoCompaction(
+    targetDocId: string,
+    targetModel: monaco.editor.ITextModel,
+    expectedRevision: number | undefined,
+    reason: string,
+  ) {
+    const existing = pendingCompactionRef.current;
+    if (
+      existing &&
+      existing.documentId === targetDocId &&
+      existing.modelRevision === expectedRevision
+    ) {
+      return;
+    }
+    if (existing !== null) {
+      window.clearTimeout(existing.timerId);
+    }
+    const timerId = window.setTimeout(() => {
+      pendingCompactionRef.current = null;
+      const editor = editorRef.current;
+      if (!editor || editor.getModel() !== targetModel) return;
+      compactModelUndoNow(targetDocId, expectedRevision, reason);
+    }, 0);
+    pendingCompactionRef.current = {
+      timerId,
+      documentId: targetDocId,
+      modelRevision: expectedRevision,
+    };
+  }
+
+  function scheduleDeferredInvalidRevert(
+    targetDocId: string,
+    targetModel: monaco.editor.ITextModel,
+    expectedRevision: number | undefined,
+    reason: string | null,
+  ) {
+    if (pendingCompactionRef.current !== null) {
+      window.clearTimeout(pendingCompactionRef.current.timerId);
+      pendingCompactionRef.current = null;
+    }
+    const existing = pendingRevertRef.current;
+    if (
+      existing &&
+      existing.documentId === targetDocId &&
+      existing.modelRevision === expectedRevision
+    ) {
+      return;
+    }
+    if (existing !== null) {
+      window.clearTimeout(existing.timerId);
+    }
+    const timerId = window.setTimeout(() => {
+      pendingRevertRef.current = null;
+      const editor = editorRef.current;
+      const meta = getRetainedDocumentMetadata(targetDocId);
+      if (
+        !editor ||
+        editor.getModel() !== targetModel ||
+        activeDocumentIdRef.current !== targetDocId ||
+        meta.appliedRevision !== expectedRevision
+      ) {
+        return;
+      }
+      const safeText = meta.lastValidLf ?? '';
+      const savedState = editor.saveViewState();
+      applyingGuardRef.current = true;
+      try {
+        resetModelValueLf(targetModel, safeText);
+        if (savedState) {
+          editor.restoreViewState(savedState);
+        }
+        meta.undoBytes = 0;
+        meta.undoSteps = 0;
+      } finally {
+        applyingGuardRef.current = false;
+      }
+      if (reason) {
+        latestPropsRef.current.onBufferGuardRejected?.(reason);
+      }
+      latestPropsRef.current.onContentChange?.(
+        safeText,
+        getModelAlternativeVersionId(targetModel),
+        getModelUndoRedoState(targetModel),
+      );
+    }, 0);
+    pendingRevertRef.current = {
+      timerId,
+      documentId: targetDocId,
+      modelRevision: expectedRevision,
+    };
   }
 
   useImperativeHandle(
@@ -166,7 +300,7 @@ export default function MonacoViewerSurface({
         return model ? getModelAlternativeVersionId(model) : null;
       },
     }),
-    [],
+    [compactActiveModelUndo],
   );
 
   useEffect(() => {
@@ -208,14 +342,13 @@ export default function MonacoViewerSurface({
       const rawPaste = event.clipboardData?.getData('text/plain');
       if (rawPaste === undefined) return;
       const selections = editor.getSelections() ?? [];
-      let replacedUtf16 = 0;
-      for (const selection of selections) {
-        replacedUtf16 += model.getValueLengthInRange(selection);
-      }
+      const replacedSelections = selections.map((selection) =>
+        model.getValueInRange(selection, monaco.editor.EndOfLinePreference.LF),
+      );
       const gate = isPasteAllowed(
         getModelValueLf(model),
         rawPaste,
-        replacedUtf16,
+        replacedSelections,
         currentProps.newline,
         currentProps.bom,
       );
@@ -251,43 +384,36 @@ export default function MonacoViewerSurface({
       const activeDocId = activeDocumentIdRef.current;
       if (!model || !activeDocId) return;
 
+      const meta = getRetainedDocumentMetadata(activeDocId);
       const valueLf = getModelValueLf(model);
       const validation = validateEditableText(valueLf, currentProps.newline, currentProps.bom);
       if (!validation.canHoldLocally) {
-        const previousSafe = lastValidLfRef.current.get(activeDocId);
-        applyingGuardRef.current = true;
-        try {
-          if (model.canUndo()) {
-            editor.trigger('ubgops-guard', 'undo', null);
-          } else if (previousSafe !== undefined && getModelValueLf(model) !== previousSafe) {
-            resetModelValueLf(model, previousSafe);
-          }
-        } finally {
-          applyingGuardRef.current = false;
-        }
-        if (validation.reason) {
-          currentProps.onBufferGuardRejected?.(validation.reason);
-        }
+        scheduleDeferredInvalidRevert(
+          activeDocId,
+          model,
+          meta.appliedRevision,
+          validation.reason,
+        );
         return;
       }
 
-      lastValidLfRef.current.set(activeDocId, valueLf);
+      meta.lastValidLf = valueLf;
 
       if (!event.isUndoing && !event.isRedoing) {
-        const tracker = undoTrackerRef.current.get(activeDocId) ?? { bytes: 0, steps: 0 };
         let deltaBytes = 0;
         for (const change of event.changes) {
           deltaBytes += utf8Encoder.encode(change.text).length + change.rangeLength * 2;
         }
-        tracker.bytes += deltaBytes;
-        tracker.steps += 1;
-        undoTrackerRef.current.set(activeDocId, tracker);
+        meta.undoBytes += deltaBytes;
+        meta.undoSteps += 1;
 
-        if (tracker.bytes > MAX_UNDO_HISTORY_BYTES || tracker.steps > MAX_UNDO_STEPS) {
-          compactActiveModelUndo(
+        if (meta.undoBytes > MAX_UNDO_HISTORY_BYTES || meta.undoSteps > MAX_UNDO_STEPS) {
+          scheduleDeferredUndoCompaction(
+            activeDocId,
+            model,
+            meta.appliedRevision,
             'Undo history exceeded local safety bounds and was compacted while preserving your current buffer.',
           );
-          return;
         }
       }
 
@@ -303,21 +429,18 @@ export default function MonacoViewerSurface({
     });
     observer.observe(container);
 
-    const viewStates = viewStatesRef.current;
-    const appliedRevisions = appliedRevisionRef.current;
-    const undoTrackers = undoTrackerRef.current;
-    const lastValids = lastValidLfRef.current;
     return () => {
+      clearPendingDeferredActions();
+      const currentDocId = activeDocumentIdRef.current;
+      if (currentDocId) {
+        getRetainedDocumentMetadata(currentDocId).viewState = editor.saveViewState();
+      }
       container.removeEventListener('paste', handleCapturePaste, true);
       keyDownDisposable.dispose();
       contentDisposable.dispose();
       observer.disconnect();
       editorRef.current = null;
       activeDocumentIdRef.current = null;
-      viewStates.clear();
-      appliedRevisions.clear();
-      undoTrackers.clear();
-      lastValids.clear();
       editor.setModel(null);
       editor.dispose();
     };
@@ -331,29 +454,41 @@ export default function MonacoViewerSurface({
 
     const previousDocId = activeDocumentIdRef.current;
     if (previousDocId && previousDocId !== documentId) {
-      viewStatesRef.current.set(previousDocId, editor.saveViewState());
+      getRetainedDocumentMetadata(previousDocId).viewState = editor.saveViewState();
+      clearPendingDeferredActions();
     }
 
     const existing = monaco.editor.getModel(
       monaco.Uri.parse(`ubgops-ro://document/${encodeURIComponent(documentId)}`),
     );
     const model = existing ?? ensureDocumentModel(documentId, text, languageId);
-    const prevRevision = appliedRevisionRef.current.get(documentId);
+    const meta = getRetainedDocumentMetadata(documentId);
+    const prevRevision = meta.appliedRevision;
 
-    if (prevRevision !== modelRevision || (!editable && getModelValueLf(model) !== text)) {
+    if (!existing) {
+      meta.appliedRevision = modelRevision;
+      meta.undoBytes = 0;
+      meta.undoSteps = 0;
+      meta.lastValidLf = text;
+    } else if (prevRevision !== modelRevision || (!editable && getModelValueLf(model) !== text)) {
+      clearPendingDeferredActions();
       applyingGuardRef.current = true;
       try {
         resetModelValueLf(model, text);
-        appliedRevisionRef.current.set(documentId, modelRevision);
-        undoTrackerRef.current.set(documentId, { bytes: 0, steps: 0 });
-        lastValidLfRef.current.set(documentId, text);
+        meta.appliedRevision = modelRevision;
+        meta.undoBytes = 0;
+        meta.undoSteps = 0;
+        meta.lastValidLf = text;
+        if (prevRevision !== undefined && prevRevision !== modelRevision) {
+          meta.viewState = null;
+        }
       } finally {
         applyingGuardRef.current = false;
       }
-    } else if (prevRevision === undefined) {
-      appliedRevisionRef.current.set(documentId, modelRevision);
-      if (!lastValidLfRef.current.has(documentId)) {
-        lastValidLfRef.current.set(documentId, getModelValueLf(model));
+    } else if (meta.appliedRevision === undefined) {
+      meta.appliedRevision = modelRevision;
+      if (meta.lastValidLf === undefined) {
+        meta.lastValidLf = getModelValueLf(model);
       }
     }
 
@@ -363,16 +498,15 @@ export default function MonacoViewerSurface({
 
     if (editor.getModel() !== model) {
       editor.setModel(model);
-      const savedViewState = viewStatesRef.current.get(documentId);
-      if (savedViewState) {
-        editor.restoreViewState(savedViewState);
+      if (meta.viewState) {
+        editor.restoreViewState(meta.viewState);
       } else {
         editor.setScrollTop(0);
         editor.setScrollLeft(0);
       }
     }
     activeDocumentIdRef.current = documentId;
-  }, [documentId, modelRevision, text, languageId, editable]);
+  }, [documentId, modelRevision, text, languageId, editable, clearPendingDeferredActions]);
 
   useEffect(() => {
     editorRef.current?.updateOptions({

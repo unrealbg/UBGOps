@@ -32,6 +32,7 @@ pub(crate) struct ActiveReadOnlyRegistration {
 pub(crate) struct SupervisedReadOnlyOp {
     pub host_id: HostId,
     pub host_session_id: HostSessionId,
+    pub sftp_session_id: SftpSessionId,
     pub cancel: CancellationToken,
     pub done: watch::Receiver<bool>,
 }
@@ -98,44 +99,19 @@ impl ReadOnlyOpenSupervisor {
         Arc::clone(&self.state)
     }
 
-    pub fn try_acquire_permit(&self) -> Result<OwnedSemaphorePermit, AppError> {
-        Arc::clone(&self.limit).try_acquire_owned().map_err(|_| {
-            AppError::new(
-                ErrorCode::Conflict,
-                "Too many read-only file loads are already in progress.",
-            )
-        })
+    pub fn is_shutdown(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown
     }
 
-    pub fn ensure_admissible(
-        &self,
-        host_id: HostId,
-        host_session_id: HostSessionId,
-        sftp_session_id: SftpSessionId,
-    ) -> Result<(), AppError> {
-        let state = self
-            .state
+    pub fn is_sftp_sealed_channel(&self, sftp_session_id: SftpSessionId) -> bool {
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.shutdown {
-            return Err(AppError::new(
-                ErrorCode::Cancelled,
-                "UBGOps is shutting down.",
-            ));
-        }
-        if state.sealed_sessions.contains(&(host_id, host_session_id)) {
-            return Err(AppError::new(
-                ErrorCode::Cancelled,
-                "The SSH connection for this file operation has disconnected.",
-            ));
-        }
-        if state.sealed_sftp_channels.contains(&sftp_session_id) {
-            return Err(AppError::new(
-                ErrorCode::SftpUnavailable,
-                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
-            ));
-        }
-        Ok(())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sealed_sftp_channels
+            .contains(&sftp_session_id)
     }
 
     pub fn seal_sftp_channel(&self, sftp_session_id: SftpSessionId) {
@@ -146,9 +122,132 @@ impl ReadOnlyOpenSupervisor {
         state.seal_sftp_locked(sftp_session_id);
     }
 
+    /// Atomically seals `sftp_session_id`, clears pending key registrations for that
+    /// exact SFTP channel generation, and signals all matching supervised tasks without
+    /// touching unrelated hosts, newer SFTP channels, or SSH/PTY sessions.
+    pub fn cancel_sftp_channel(
+        &self,
+        sftp_session_id: SftpSessionId,
+    ) -> Vec<watch::Receiver<bool>> {
+        self.cancel_sftp_channel_except(sftp_session_id, None)
+    }
+
+    /// Seals `sftp_session_id` and cancels any sibling in-flight operations on that
+    /// retired channel without masking `except_op_id`'s own protocol error behind `Cancelled`.
+    pub fn cancel_sftp_channel_except(
+        &self,
+        sftp_session_id: SftpSessionId,
+        except_op_id: Option<u64>,
+    ) -> Vec<watch::Receiver<bool>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.seal_sftp_locked(sftp_session_id);
+        let active_keys = state
+            .active_by_key
+            .iter()
+            .filter(|((_, _, sftp, _), entry)| {
+                *sftp == sftp_session_id && except_op_id != Some(entry.op_id)
+            })
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
+        for key in active_keys {
+            if let Some(entry) = state.active_by_key.remove(&key) {
+                entry.cancel.cancel();
+            }
+        }
+        let mut receivers = Vec::new();
+        for (&op_id, op) in &state.supervised_ops {
+            if op.sftp_session_id == sftp_session_id && except_op_id != Some(op_id) {
+                op.cancel.cancel();
+                receivers.push(op.done.clone());
+            }
+        }
+        receivers
+    }
+
+    /// Atomically checks admission state, acquires one global permit, and registers the
+    /// supervised read-only operation. Callers hold the live session & SFTP map locks
+    /// across this synchronous call so disconnect/channel replacement linearizes cleanly.
+    pub fn try_admit(
+        &self,
+        key: ReadOnlyOpenKey,
+        cancel: CancellationToken,
+        done_rx: watch::Receiver<bool>,
+    ) -> Result<(u64, OwnedSemaphorePermit), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "UBGOps is shutting down.",
+            ));
+        }
+        if state.sealed_sessions.contains(&(key.0, key.1)) {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "The SSH connection for this file operation has disconnected.",
+            ));
+        }
+        if state.sealed_sftp_channels.contains(&key.2) {
+            return Err(AppError::new(
+                ErrorCode::SftpUnavailable,
+                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+            ));
+        }
+        if state.active_by_key.contains_key(&key) {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "A read-only open with this request identity is already in progress.",
+            ));
+        }
+        if state.active_by_key.len() >= MAX_CONCURRENT_READONLY_OPENS
+            || state.supervised_ops.len() >= MAX_CONCURRENT_READONLY_OPENS
+        {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "Too many read-only file loads are already in progress.",
+            ));
+        }
+        let permit = Arc::clone(&self.limit).try_acquire_owned().map_err(|_| {
+            AppError::new(
+                ErrorCode::Conflict,
+                "Too many read-only file loads are already in progress.",
+            )
+        })?;
+        state.next_op_id = state.next_op_id.wrapping_add(1).max(1);
+        let op_id = state.next_op_id;
+        state.active_by_key.insert(
+            key,
+            ActiveReadOnlyRegistration {
+                op_id,
+                cancel: cancel.clone(),
+            },
+        );
+        state.supervised_ops.insert(
+            op_id,
+            SupervisedReadOnlyOp {
+                host_id: key.0,
+                host_session_id: key.1,
+                sftp_session_id: key.2,
+                cancel,
+                done: done_rx,
+            },
+        );
+        state.peak_registered_requests = state
+            .peak_registered_requests
+            .max(state.active_by_key.len());
+        state.peak_supervised_tasks = state.peak_supervised_tasks.max(state.supervised_ops.len());
+        Ok((op_id, permit))
+    }
+
     /// Registers a newly admitted supervised read-only operation. The returned `op_id`
     /// identifies this exact execution instance so overlapping cancellation or drop guards
     /// never remove a newer registration under a reused `request_id`.
+    #[cfg(test)]
     pub fn register(
         &self,
         key: ReadOnlyOpenKey,
@@ -205,6 +304,7 @@ impl ReadOnlyOpenSupervisor {
             SupervisedReadOnlyOp {
                 host_id: key.0,
                 host_session_id: key.1,
+                sftp_session_id: key.2,
                 cancel,
                 done: done_rx,
             },

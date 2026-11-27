@@ -354,7 +354,7 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
       makeRemoteTextDoc('ed-1b', '/etc/app.conf', 'v1\n', session),
     );
     await act(async () => {
-      await result.current.reloadDocument(tabId, session);
+      await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
     });
     await act(async () => {
       result.current.updateEditableBuffer(tabId, 'v3\n');
@@ -482,7 +482,7 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
     });
 
     await act(async () => {
-      await result.current.reloadDocument(tabId, session);
+      await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
     });
     expect(result.current.documents[0]).toMatchObject({
       editState: 'editableClean',
@@ -514,7 +514,7 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
 
     // TransferJob returning state: 'outcomeUnknown' settles strictly as outcomeUnknown
     await act(async () => {
-      await result.current.reloadDocument(tabId, session);
+      await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
     });
     vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
       makePlan('plan-job-unk', '/etc/app.conf', session),
@@ -548,7 +548,7 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
 
     // Raw IPC error / connection loss during execute -> STRICT outcomeUnknown!
     await act(async () => {
-      await result.current.reloadDocument(tabId, session);
+      await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
     });
     vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
       makePlan('plan-ipc', '/etc/app.conf', session),
@@ -569,7 +569,7 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
       draftText: 'ambiguous-edit\n',
     });
 
-    // Normal close refused during outcomeUnknown; force close allowed
+    // Normal close refused during outcomeUnknown; explicit discard confirmation allowed
     let closedNormal = true;
     await act(async () => {
       closedNormal = result.current.closeDocument(tabId);
@@ -577,7 +577,7 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
     expect(closedNormal).toBe(false);
     expect(result.current.documents).toHaveLength(1);
     await act(async () => {
-      expect(result.current.closeDocument(tabId, { force: true })).toBe(true);
+      expect(result.current.closeDocument(tabId, { confirmDiscard: true })).toBe(true);
     });
     expect(result.current.documents).toHaveLength(0);
   });
@@ -694,5 +694,149 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
       unlockedEdit = await result.current.openEditableDocument(session2, '/etc/modal.conf');
     });
     expect(unlockedEdit).not.toBeNull();
+  });
+
+  it('8. hardens ownership, save state mutual exclusion, 7-point verification, bounded polling, and discard guards (F-02..F-06)', async () => {
+    const session = makeSession('host-8', 'hs-8', 'sftp-8');
+    const { result } = renderHook(() => useReadOnlyEditor(), { wrapper });
+
+    // F-02: concurrent openDocument + openEditableDocument cancels RO open and yields 1 tab
+    let resolveRo!: (doc: RemoteReadOnlyDocument) => void;
+    vi.mocked(filesApi.openReadOnly).mockImplementationOnce(
+      () => new Promise((r) => { resolveRo = r; }),
+    );
+    let resolveEd!: (doc: RemoteTextDocument) => void;
+    vi.mocked(filesApi.openText).mockImplementationOnce(
+      () => new Promise((r) => { resolveEd = r; }),
+    );
+    let roPromise!: Promise<unknown>;
+    let edPromise!: Promise<unknown>;
+    await act(async () => {
+      roPromise = result.current.openDocument(session, '/etc/concurrent.conf');
+      edPromise = result.current.openEditableDocument(session, '/etc/concurrent.conf');
+    });
+    resolveEd(makeRemoteTextDoc('ed-win', '/etc/concurrent.conf', 'v1\n', session));
+    resolveRo(makeReadOnlyDoc('ro-lose', '/etc/concurrent.conf', 'v1\n', session));
+    await act(async () => {
+      await Promise.all([roPromise, edPromise]);
+    });
+    expect(result.current.documents).toHaveLength(1);
+    expect(result.current.documents[0]?.editable).toBe(true);
+
+    // F-02: synchronous reserveExternalEdit blocks concurrent openEditableDocument on same path
+    const resId = result.current.reserveExternalEdit(session, '/etc/ext-sync.conf');
+    expect(resId).not.toBeNull();
+    let blocked!: unknown;
+    await act(async () => {
+      blocked = await result.current.openEditableDocument(session, '/etc/ext-sync.conf');
+    });
+    expect(blocked).toBeNull();
+    act(() => {
+      result.current.releaseExternalEdit(resId!);
+    });
+
+    // F-03: equal-text updateEditableBuffer preserves savePlan; cancelSavePreparation enters cancellingSave and blocks concurrent executeSave
+    const tabId = result.current.documents[0]!.id;
+    vi.mocked(filesApi.planTextSave).mockResolvedValue(makePlan('plan-8', '/etc/concurrent.conf', session));
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'v2\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    vi.mocked(filesApi.discardEditorPlan).mockClear();
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'v2\n');
+    });
+    expect(filesApi.discardEditorPlan).not.toHaveBeenCalled();
+    expect(result.current.documents[0]?.savePlan?.plan.id).toBe('plan-8');
+
+    let resolveDiscard!: (v: boolean) => void;
+    vi.mocked(filesApi.discardEditorPlan).mockImplementationOnce(
+      () => new Promise((r) => { resolveDiscard = r; }),
+    );
+    let cancelPromise!: Promise<boolean>;
+    let execWhileCancelling: TransferJob | null = null;
+    await act(async () => {
+      cancelPromise = result.current.cancelSavePreparation(tabId);
+      execWhileCancelling = await result.current.executeSave(tabId, session);
+    });
+    expect(result.current.documents[0]?.editState).toBe('cancellingSave');
+    expect(execWhileCancelling).toBeNull();
+    expect(result.current.closeDocument(tabId, { confirmDiscard: true })).toBe(false);
+    resolveDiscard(true);
+    await act(async () => {
+      expect(await cancelPromise).toBe(true);
+    });
+
+    // F-06: reloadDocument refuses dirty buffer unless allowDirtyDiscard is explicitly true
+    expect(result.current.documents[0]?.dirty).toBe(true);
+    let dirtyReloadResult: unknown = 'unset';
+    await act(async () => {
+      dirtyReloadResult = await result.current.reloadDocument(tabId, session);
+    });
+    expect(dirtyReloadResult).toBeNull();
+    expect(result.current.documents[0]?.draftText).toBe('v2\n');
+
+    // F-04/F-05: 7-point verification rejects mismatched refreshed text without overwriting draftText
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    vi.mocked(filesApi.execute).mockResolvedValueOnce([makeJob('job-8a', 'completed', session)]);
+    vi.mocked(filesApi.openText).mockResolvedValueOnce(
+      makeRemoteTextDoc('ed-8b-mismatch', '/etc/concurrent.conf', 'EXTERNAL_WRITE\n', session),
+    );
+    vi.mocked(filesApi.discardTextDocument).mockClear();
+    await act(async () => {
+      await result.current.executeSave(tabId, session);
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      draftText: 'v2\n',
+      editState: 'conflictDetected',
+      lastSaveOutcome: 'confirmed',
+      staleRevision: true,
+      editDocumentId: null,
+    });
+    expect(filesApi.discardTextDocument).toHaveBeenCalledWith(expect.anything(), 'ed-8b-mismatch');
+
+    // F-04/F-05/F-06: bounded polling exhaustion -> outcomeUnknown, preserved on discardChanges & disconnect,
+    // blocked from purgeHost until resolved or confirmed discard
+    vi.useFakeTimers();
+    vi.mocked(filesApi.openText).mockResolvedValueOnce(
+      makeRemoteTextDoc('ed-poll', '/etc/concurrent.conf', 'base\n', session),
+    );
+    await act(async () => {
+      await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+    });
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(makePlan('plan-poll', '/etc/concurrent.conf', session));
+    vi.mocked(filesApi.execute).mockResolvedValueOnce([makeJob('job-evicted', 'transferring', session)]);
+    vi.mocked(filesApi.transfers).mockResolvedValue([]);
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'saved-edit\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    await act(async () => {
+      await result.current.executeSave(tabId, session);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(result.current.documents[0]?.editState).toBe('outcomeUnknown');
+    expect(result.current.canPurgeHost('host-8').allowed).toBe(false);
+
+    act(() => {
+      result.current.syncHostConnection('host-8', false, null, null);
+    });
+    await act(async () => {
+      await result.current.discardChanges(tabId);
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      editState: 'outcomeUnknown',
+      lastSaveOutcome: 'outcomeUnknown',
+      dirty: false,
+    });
+    vi.useRealTimers();
   });
 });

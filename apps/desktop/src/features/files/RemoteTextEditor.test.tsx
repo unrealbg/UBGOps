@@ -348,4 +348,23 @@ describe('remote text editor authority and interaction', () => {
     result.rerender(<RemoteTextEditor {...result.props} transfers={[job('completed')]} />);
     await waitFor(() => expect(screen.getByText('No unsaved changes')).toBeInTheDocument());
   });
+
+  it('discards pending authority before reload openText and retains buffer when reload openText fails', async () => {
+    const order: string[] = [];
+    vi.mocked(filesApi.discardTextDocument).mockImplementation(async (_s, id) => {
+      order.push(`discardDoc:${id}`);
+    });
+    vi.mocked(filesApi.openText).mockImplementationOnce(async () => {
+      order.push('openText');
+      throw { code: 'connection', message: 'Network drop during reload', hostKey: null };
+    });
+
+    view();
+    await userEvent.click(screen.getByRole('button', { name: 'Reload remote' }));
+
+    await screen.findByText(/Network drop during reload/i);
+    expect(order).toEqual([`discardDoc:${document.id}`, 'openText']);
+    expect(screen.getByRole('textbox', { name: 'Remote text' })).toHaveValue(document.text);
+    expect(screen.getByRole('button', { name: 'Save / review' })).toBeDisabled();
+  });
 });

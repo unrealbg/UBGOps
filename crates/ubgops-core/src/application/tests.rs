@@ -2774,6 +2774,7 @@ struct LifecycleSftpClient {
     complete_upload: AtomicBool,
     commit_started: Notify,
     commit_release: Notify,
+    retired: AtomicBool,
 }
 
 impl LifecycleSftpClient {
@@ -2825,6 +2826,7 @@ impl LifecycleSftpClient {
             complete_upload: AtomicBool::new(false),
             commit_started: Notify::new(),
             commit_release: Notify::new(),
+            retired: AtomicBool::new(false),
         })
     }
 }
@@ -2876,7 +2878,10 @@ impl ubgops_sftp::SftpClient for LifecycleSftpClient {
         )
     }
     async fn editor_revision(&self, path: &str) -> Result<ubgops_sftp::EditorRevision, AppError> {
-        if path != "/tmp/editor.txt" {
+        if !matches!(
+            path,
+            "/tmp/editor.txt" | "/tmp/editor-second.txt" | "/tmp/single.txt"
+        ) {
             return Err(unused_sftp());
         }
         Ok(ubgops_sftp::EditorRevision {
@@ -2891,7 +2896,10 @@ impl ubgops_sftp::SftpClient for LifecycleSftpClient {
         })
     }
     async fn read_editor_bytes(&self, path: &str) -> Result<Vec<u8>, AppError> {
-        if path != "/tmp/editor.txt" {
+        if !matches!(
+            path,
+            "/tmp/editor.txt" | "/tmp/editor-second.txt" | "/tmp/single.txt"
+        ) {
             return Err(unused_sftp());
         }
         if self.stall_editor_read.swap(false, Ordering::SeqCst) {
@@ -3021,7 +3029,14 @@ impl ubgops_sftp::SftpClient for LifecycleSftpClient {
             Ok(ubgops_sftp::StagingCleanup::Removed)
         }
     }
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+    async fn retire_channel(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
     async fn close(&self) {
+        self.retired.store(true, Ordering::Release);
         self.closes.fetch_add(1, Ordering::SeqCst);
         self.closed.notify_one();
     }
@@ -3142,7 +3157,12 @@ async fn editor_document_and_save_plan_are_revoked_after_reconnect() {
         .await
         .unwrap();
     let still_open = app
-        .open_remote_text_file(host, connection, client.info.id, "/tmp/editor.txt".into())
+        .open_remote_text_file(
+            host,
+            connection,
+            client.info.id,
+            "/tmp/editor-second.txt".into(),
+        )
         .await
         .unwrap();
     app.disconnect_host(host).await.unwrap();
@@ -4899,4 +4919,172 @@ async fn readonly_open_passing_owned_sftp_before_disconnect_cannot_register_or_s
     app.close_terminal(host2.id, session2, peer_terminal.id)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn readonly_admission_survives_sealed_fifo_eviction_and_open_sftp_replaces_channel_safely() {
+    let (_profile, app, _) = setup(false);
+    let host1 = app.save_host(input(), Some(credential())).await.unwrap();
+    let mut second_input = input();
+    second_input.display_name = "Peer channel replacement host".into();
+    second_input.connection.hostname = "peer-channel.example.test".into();
+    let host2 = app
+        .save_host(second_input, Some(credential()))
+        .await
+        .unwrap();
+
+    app.connect_host(host1.id).await.unwrap();
+    app.connect_host(host2.id).await.unwrap();
+    let session1 = app
+        .slot(host1.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+    let session2 = app
+        .slot(host2.id)
+        .await
+        .data
+        .lock()
+        .await
+        .connection_id
+        .unwrap();
+
+    let client1 = LifecycleSftpClient::new(host1.id, session1);
+    let client2_old = LifecycleSftpClient::new(host2.id, session2);
+    let sftp1 = client1.info.id;
+    let sftp2_old = client2_old.info.id;
+    {
+        let mut sessions = app.sftp_sessions.lock().await;
+        sessions.insert(host1.id, client1.clone());
+        sessions.insert(host2.id, client2_old.clone());
+    }
+    let peer_terminal = app.open_terminal(host2.id, terminal_size()).await.unwrap();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    app.read_only_ops
+        .set_before_register_barrier(Some((Arc::clone(&entered), Arc::clone(&barrier))));
+
+    let app_req = app.clone();
+    let inflight = tokio::spawn(async move {
+        app_req
+            .open_remote_readonly_document(
+                host1.id,
+                session1,
+                sftp1,
+                ReadOnlyDocumentId::new(),
+                "/etc/evicted.conf".into(),
+            )
+            .await
+    });
+
+    entered.notified().await;
+    app.read_only_ops.set_before_register_barrier(None);
+    app.disconnect_host(host1.id).await.unwrap();
+
+    // Evict (host1.id, session1) completely from the bounded sealed_sessions FIFO.
+    for _ in 0..(crate::application::readonly_ops::MAX_SEALED_SESSIONS + 50) {
+        app.read_only_ops
+            .cancel_session(HostId::new(), HostSessionId::new());
+    }
+    assert!(!app.read_only_ops.is_session_sealed(host1.id, session1));
+
+    // Even after FIFO eviction, live session/SFTP state under try_admit MUST reject Request A.
+    barrier.wait().await;
+    let err = inflight.await.unwrap().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Cancelled);
+    let metrics = app.read_only_open_metrics();
+    assert_eq!(metrics.held_permits, 0);
+    assert_eq!(metrics.live_supervised_tasks, 0);
+    assert_eq!(metrics.registered_requests, 0);
+
+    // Replacing a retired SFTP channel on host2 seals only the old SFTP channel while keeping SSH/PTY alive.
+    let transport2 = LifecycleTransport::new();
+    install_lifecycle_transport(&app, host2.id, transport2.clone()).await;
+    client2_old.retire_channel().await;
+    let open_fut = app.open_sftp(host2.id);
+    let release_fut = async {
+        transport2.open_started.notified().await;
+        transport2.release_open.notify_one();
+    };
+    let (open_res, _) = tokio::join!(open_fut, release_fut);
+    let client2_new = open_res.unwrap();
+    assert_ne!(client2_new.id, sftp2_old);
+    assert_eq!(client2_new.host_session_id, session2);
+    assert!(app.read_only_ops.is_sftp_sealed_channel(sftp2_old));
+    assert!(
+        app.list_terminals(host2.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.id == peer_terminal.id)
+    );
+    app.close_terminal(host2.id, session2, peer_terminal.id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn editor_single_authority_rejects_duplicate_and_allows_reload_after_discard_or_execute() {
+    let (_profile, app, host, connection, client) = setup_editor_lifecycle().await;
+    let first = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap();
+    let dup = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap_err();
+    assert_eq!(dup.code, ErrorCode::Conflict);
+
+    // Discarding allows clean reopen.
+    app.discard_remote_text_document(host, connection, client.info.id, first.id)
+        .unwrap();
+    let second = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap();
+    let plan = app
+        .plan_remote_text_save(
+            host,
+            connection,
+            client.info.id,
+            second.id,
+            "updated-data".into(),
+        )
+        .await
+        .unwrap();
+
+    // Active SavePlan also blocks duplicate open.
+    let dup_during_plan = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap_err();
+    assert_eq!(dup_during_plan.code, ErrorCode::Conflict);
+
+    let jobs = app
+        .execute_file_plan(host, connection, client.info.id, plan.id)
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    for _ in 0..50 {
+        let current = app.list_transfers(Some(host));
+        if current
+            .iter()
+            .any(|j| j.id == jobs[0].id && j.state == TransferState::Completed)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Post-completion reload opens a fresh authority cleanly.
+    let after_save = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap();
+    assert_ne!(after_save.id, second.id);
 }

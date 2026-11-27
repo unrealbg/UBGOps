@@ -48,6 +48,7 @@ impl Application {
             self.clear_monitor(id).await;
         }
         if let Some(connection_id) = closed_connection {
+            self.read_only_ops.cancel_session(id, connection_id);
             self.remote_operations.revoke_session(id, connection_id)?;
             self.service_observations
                 .revoke_session(id, connection_id)?;
