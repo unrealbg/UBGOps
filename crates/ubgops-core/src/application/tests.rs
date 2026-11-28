@@ -2775,6 +2775,7 @@ struct LifecycleSftpClient {
     commit_started: Notify,
     commit_release: Notify,
     retired: AtomicBool,
+    editor_bytes_override: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl LifecycleSftpClient {
@@ -2827,6 +2828,7 @@ impl LifecycleSftpClient {
             commit_started: Notify::new(),
             commit_release: Notify::new(),
             retired: AtomicBool::new(false),
+            editor_bytes_override: std::sync::Mutex::new(None),
         })
     }
 }
@@ -2905,6 +2907,9 @@ impl ubgops_sftp::SftpClient for LifecycleSftpClient {
         if self.stall_editor_read.swap(false, Ordering::SeqCst) {
             self.plan_remote_started.notify_one();
             self.plan_remote_release.notified().await;
+        }
+        if let Some(override_bytes) = self.editor_bytes_override.lock().unwrap().clone() {
+            return Ok(override_bytes);
         }
         Ok(b"data".to_vec())
     }
@@ -5087,4 +5092,86 @@ async fn editor_single_authority_rejects_duplicate_and_allows_reload_after_disca
         .await
         .unwrap();
     assert_ne!(after_save.id, second.id);
+}
+
+#[tokio::test]
+async fn editor_plan_conflict_and_active_transfer_lockout_recovery_preserves_single_authority() {
+    let (_profile, app, host, connection, client) = setup_editor_lifecycle().await;
+    let first = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap();
+
+    // Simulate remote file change between open and plan -> Conflict returns authority to Ready.
+    *client.editor_bytes_override.lock().unwrap() = Some(b"external-write".to_vec());
+    let plan_err = app
+        .plan_remote_text_save(
+            host,
+            connection,
+            client.info.id,
+            first.id,
+            "local-draft".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(plan_err.code, ErrorCode::Conflict);
+
+    // Without discarding first.id, reopening fails immediately with Conflict (would persist 60m).
+    let locked_err = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap_err();
+    assert_eq!(locked_err.code, ErrorCode::Conflict);
+
+    // Discarding the retained first.id unlocks reload immediately without waiting for DOCUMENT_LIFETIME.
+    app.discard_remote_text_document(host, connection, client.info.id, first.id)
+        .unwrap();
+    *client.editor_bytes_override.lock().unwrap() = None;
+    let second = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id);
+
+    // Stale discard of first.id is an idempotent no-op and must NOT release newly acquired second.id.
+    app.discard_remote_text_document(host, connection, client.info.id, first.id)
+        .unwrap();
+    let second_still_active = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap_err();
+    assert_eq!(second_still_active.code, ErrorCode::Conflict);
+
+    // Active executing transfer continues blocking concurrent open until upload completes.
+    client.stall_owned_upload.store(true, Ordering::SeqCst);
+    let plan = app
+        .plan_remote_text_save(
+            host,
+            connection,
+            client.info.id,
+            second.id,
+            "updated-data".into(),
+        )
+        .await
+        .unwrap();
+    let jobs = app
+        .execute_file_plan(host, connection, client.info.id, plan.id)
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    client.upload_started.notified().await;
+
+    let err_during_transfer = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap_err();
+    assert_eq!(err_during_transfer.code, ErrorCode::Conflict);
+    // Discarding consumed second.id must not release active transfer protection either.
+    app.discard_remote_text_document(host, connection, client.info.id, second.id)
+        .unwrap();
+    let still_blocked = app
+        .open_remote_text_file(host, connection, client.info.id, "/tmp/single.txt".into())
+        .await
+        .unwrap_err();
+    assert_eq!(still_blocked.code, ErrorCode::Conflict);
 }

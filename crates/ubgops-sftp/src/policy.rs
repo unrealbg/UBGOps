@@ -2567,5 +2567,79 @@ mod tests {
             )
             .unwrap();
         assert_ne!(doc2, doc3);
+
+        // Expired pending plan: consume rejects with Policy ("expired"), releases doc3 to Ready,
+        // leaving doc3 active until explicit discard_editor_document unlocks re-registration.
+        let plan_exp = store
+            .plan_editor_save(client.clone(), doc3, "v-exp".into())
+            .await
+            .unwrap();
+        store
+            .plans
+            .lock()
+            .unwrap()
+            .get_mut(&plan_exp.id)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        let Err(exp_err) = store.consume(
+            plan_exp.id,
+            plan_exp.host_id,
+            plan_exp.host_session_id,
+            plan_exp.sftp_session_id,
+        ) else {
+            panic!("expected expired plan consume to fail");
+        };
+        assert_eq!(exp_err.code, ErrorCode::FilePolicy);
+
+        // Authority doc3 still blocks new registration until discarded.
+        let blocked = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                crate::EditorRevision {
+                    identity: EntryIdentity {
+                        kind: RemoteEntryKind::File,
+                        size: Some(4),
+                        modified: Some(1),
+                    },
+                    raw_mode: 0o100644,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(blocked.code, ErrorCode::Conflict);
+
+        store
+            .discard_editor_document(
+                doc3,
+                plan_exp.host_id,
+                plan_exp.host_session_id,
+                plan_exp.sftp_session_id,
+            )
+            .unwrap();
+        let doc4 = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                crate::EditorRevision {
+                    identity: EntryIdentity {
+                        kind: RemoteEntryKind::File,
+                        size: Some(4),
+                        modified: Some(1),
+                    },
+                    raw_mode: 0o100644,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        assert_ne!(doc3, doc4);
     }
 }

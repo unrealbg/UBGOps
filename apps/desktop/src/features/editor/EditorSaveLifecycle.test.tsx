@@ -155,11 +155,15 @@ const wrapper = ({ children }: { children: ReactNode }) => (
 describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(filesApi.discardPlan).mockResolvedValue(undefined);
-    vi.mocked(filesApi.discardEditorPlan).mockResolvedValue(true);
-    vi.mocked(filesApi.discardTextDocument).mockResolvedValue(undefined);
-    vi.mocked(filesApi.cancelReadOnlyOpen).mockResolvedValue(true);
-    vi.mocked(filesApi.transfers).mockResolvedValue([]);
+    vi.mocked(filesApi.openReadOnly).mockReset();
+    vi.mocked(filesApi.openText).mockReset();
+    vi.mocked(filesApi.planTextSave).mockReset();
+    vi.mocked(filesApi.execute).mockReset();
+    vi.mocked(filesApi.discardPlan).mockReset().mockResolvedValue(undefined);
+    vi.mocked(filesApi.discardEditorPlan).mockReset().mockResolvedValue(true);
+    vi.mocked(filesApi.discardTextDocument).mockReset().mockResolvedValue(undefined);
+    vi.mocked(filesApi.cancelReadOnlyOpen).mockReset().mockResolvedValue(true);
+    vi.mocked(filesApi.transfers).mockReset().mockResolvedValue([]);
     registerReadOnlyModelDisposer(null);
   });
 
@@ -836,6 +840,475 @@ describe('textCodec & Editor Save Lifecycle (02B.2B)', () => {
       editState: 'outcomeUnknown',
       lastSaveOutcome: 'outcomeUnknown',
       dirty: false,
+    });
+    vi.useRealTimers();
+  });
+
+  it('9. preserves retainedAuthority for fail-closed cleanup across all 4 lockout paths without 60m Conflict lockout (FINDING-02)', async () => {
+    const session = makeSession('host-9', 'hs-9', 'sftp-9');
+    const activeAuthorities = new Map<string, string>();
+    const pendingPlans = new Map<string, string>();
+    let seq = 0;
+
+    vi.mocked(filesApi.openText).mockImplementation(async (s, path) => {
+      const k = `${s.hostId}:${s.hostSessionId}:${s.id}:${path}`;
+      if (activeAuthorities.has(k)) {
+        throw {
+          code: 'conflict',
+          message: 'An active editor authority already exists for this file in this SFTP session.',
+          hostKey: null,
+        };
+      }
+      const id = `auth-${++seq}`;
+      activeAuthorities.set(k, id);
+      return makeRemoteTextDoc(id, path, `rev-${seq}\n`, { ...session, ...s });
+    });
+    vi.mocked(filesApi.discardTextDocument).mockImplementation(async (s, docId) => {
+      for (const [k, v] of activeAuthorities.entries()) {
+        if (v === docId && k.startsWith(`${s.hostId}:${s.hostSessionId}:${s.id}:`)) {
+          activeAuthorities.delete(k);
+        }
+      }
+    });
+    vi.mocked(filesApi.discardEditorPlan).mockImplementation(async (_s, planId) => {
+      return pendingPlans.delete(planId);
+    });
+
+    const { result } = renderHook(() => useReadOnlyEditor(), { wrapper });
+    await act(async () => {
+      await result.current.openEditableDocument(session, '/etc/lockout.conf');
+    });
+    const tabId = result.current.documents[0]!.id;
+    expect(result.current.documents[0]?.retainedAuthority?.documentId).toBe('auth-1');
+
+    // Path 1: prepareSave revision Conflict leaves backend Ready -> reload MUST discard auth-1 cleanly
+    vi.mocked(filesApi.planTextSave).mockRejectedValueOnce({
+      code: 'conflict',
+      message: 'Remote file changed since open.',
+      hostKey: null,
+    });
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'edit-1\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      editDocumentId: null,
+      editState: 'conflictDetected',
+      retainedAuthority: expect.objectContaining({
+        documentId: 'auth-1',
+        usable: false,
+        ownershipState: 'staleCleanupRequired',
+      }),
+    });
+    await act(async () => {
+      const reloaded = await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+      expect(reloaded?.editDocumentId).toBe('auth-2');
+    });
+    expect(activeAuthorities.get('host-9:hs-9:sftp-9:/etc/lockout.conf')).toBe('auth-2');
+
+    // Path 2: executeSave pre-dispatch expired plan failure preserves authority for reload recovery
+    pendingPlans.set('plan-exp', 'auth-2');
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(makePlan('plan-exp', '/etc/lockout.conf', session));
+    vi.mocked(filesApi.execute).mockRejectedValueOnce({
+      code: 'policy',
+      message: 'The file-operation plan expired.',
+      hostKey: null,
+    });
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'edit-2\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    await act(async () => {
+      await result.current.executeSave(tabId, session);
+    });
+    expect(result.current.documents[0]?.retainedAuthority).toMatchObject({
+      documentId: 'auth-2',
+      usable: false,
+      ownershipState: 'staleCleanupRequired',
+    });
+    await act(async () => {
+      const reloaded = await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+      expect(reloaded?.editDocumentId).toBe('auth-3');
+    });
+
+    // Path 3: cancelSavePreparation returning false retains authority for reload recovery
+    pendingPlans.set('plan-cancel-false', 'auth-3');
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
+      makePlan('plan-cancel-false', '/etc/lockout.conf', session),
+    );
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'edit-3\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    vi.mocked(filesApi.discardEditorPlan).mockResolvedValueOnce(false);
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation(tabId)).toBe(false);
+    });
+    expect(result.current.documents[0]?.retainedAuthority?.documentId).toBe('auth-3');
+    await act(async () => {
+      const reloaded = await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+      expect(reloaded?.editDocumentId).toBe('auth-4');
+    });
+
+    // Path 4: updateEditableBuffer superseded plan discard rejects/false retains auth-4 AND stale reject cannot clobber auth-5
+    let resolveSlowDiscard!: (v: boolean) => void;
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
+      makePlan('plan-superseded', '/etc/lockout.conf', session),
+    );
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'edit-4\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    vi.mocked(filesApi.discardEditorPlan).mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          resolveSlowDiscard = r;
+        }),
+    );
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'edit-4-superseded\n');
+    });
+    // Recover via reload acquiring auth-5 while slow discard of auth-4's plan is still pending
+    vi.mocked(filesApi.discardEditorPlan).mockImplementation(async (_s, planId) =>
+      pendingPlans.delete(planId),
+    );
+    await act(async () => {
+      const reloaded = await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+      expect(reloaded?.editDocumentId).toBe('auth-5');
+    });
+    resolveSlowDiscard(false);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // Late false from auth-4's plan discard MUST NOT clobber newly acquired auth-5
+    expect(result.current.documents[0]?.editDocumentId).toBe('auth-5');
+    expect(result.current.documents[0]?.staleRevision).toBe(false);
+
+    // Fail-closed: if discardTextDocument throws during reload, reload MUST fail closed without calling openText
+    const callsBeforeFailClosed = vi.mocked(filesApi.openText).mock.calls.length;
+    vi.mocked(filesApi.discardTextDocument).mockRejectedValueOnce(new Error('IPC lost during discard'));
+    await act(async () => {
+      const blockedReload = await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+      expect(blockedReload).toBeNull();
+    });
+    expect(vi.mocked(filesApi.openText).mock.calls.length).toBe(callsBeforeFailClosed);
+    expect(result.current.documents[0]?.retainedAuthority?.documentId).toBe('auth-5');
+    // While retained authority is unusable after failed discard, prepareSave remains blocked (staleRevision: true)
+    await act(async () => {
+      expect(await result.current.prepareSave(tabId, session)).toBeNull();
+    });
+
+    // Recover cleanly via reload (now discardTextDocument succeeds -> auth-6), then test ambiguous execute loss
+    await act(async () => {
+      const recovered = await result.current.reloadDocument(tabId, session, { allowDirtyDiscard: true });
+      expect(recovered?.editDocumentId).toBe('auth-6');
+    });
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(makePlan('plan-ambig', '/etc/lockout.conf', session));
+    vi.mocked(filesApi.execute).mockRejectedValueOnce(new Error('Lost execute reply'));
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'edit-ambig\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    await act(async () => {
+      await result.current.executeSave(tabId, session);
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      editState: 'outcomeUnknown',
+      retainedAuthority: expect.objectContaining({
+        documentId: 'auth-6',
+        usable: false,
+        ownershipState: 'executionAmbiguous',
+      }),
+    });
+    vi.mocked(filesApi.discardTextDocument).mockClear();
+    await act(async () => {
+      expect(result.current.closeDocument(tabId, { confirmDiscard: true })).toBe(true);
+    });
+    // Must NOT release destination ownership while unresolved mutation could still be executing
+    expect(filesApi.discardTextDocument).not.toHaveBeenCalled();
+    expect(result.current.hasActiveEditAuthority(session, '/etc/lockout.conf')).toBe(true);
+    expect(result.current.canPurgeHost('host-9').allowed).toBe(false);
+
+    // Reconnect under new session generation retires old unresolved session fence cleanly
+    const sessionNew = makeSession('host-9', 'hs-9b', 'sftp-9b');
+    act(() => {
+      result.current.syncHostConnection('host-9', true, sessionNew.hostSessionId, sessionNew.id);
+    });
+    expect(result.current.hasActiveEditAuthority(sessionNew, '/etc/lockout.conf')).toBe(false);
+    expect(result.current.canPurgeHost('host-9').allowed).toBe(true);
+  });
+
+  it('10. enforces strict cancelSavePreparation state guard across all 9 DocumentEditStates (FINDING-05)', async () => {
+    const session = makeSession('host-10', 'hs-10', 'sftp-10');
+    const { result } = renderHook(() => useReadOnlyEditor(), { wrapper });
+
+    vi.mocked(filesApi.openReadOnly).mockResolvedValueOnce(
+      makeReadOnlyDoc('ro-10', '/etc/ro-10.conf', 'ro\n', session),
+    );
+    await act(async () => {
+      await result.current.openDocument(session, '/etc/ro-10.conf');
+    });
+    // readOnly
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation('ro-10')).toBe(false);
+    });
+    expect(result.current.documents[0]?.editState).toBe('readOnly');
+
+    // Promote to editableClean
+    vi.mocked(filesApi.openText).mockResolvedValueOnce(
+      makeRemoteTextDoc('ed-10', '/etc/ro-10.conf', 'ro\n', session),
+    );
+    await act(async () => {
+      await result.current.promoteToEditable('ro-10', session);
+    });
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation('ro-10')).toBe(false);
+    });
+    expect(result.current.documents[0]?.editState).toBe('editableClean');
+
+    // editableModified
+    await act(async () => {
+      result.current.updateEditableBuffer('ro-10', 'mod\n');
+    });
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation('ro-10')).toBe(false);
+    });
+    expect(result.current.documents[0]?.editState).toBe('editableModified');
+
+    // savePreparation -> cancellingSave -> mutual exclusion with cancel/execute
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
+      makePlan('plan-10a', '/etc/ro-10.conf', session),
+    );
+    await act(async () => {
+      await result.current.prepareSave('ro-10', session);
+    });
+    let resolveDiscard!: (v: boolean) => void;
+    vi.mocked(filesApi.discardEditorPlan).mockImplementationOnce(
+      () => new Promise((r) => { resolveDiscard = r; }),
+    );
+    let cancel1!: Promise<boolean>;
+    let cancel2!: Promise<boolean>;
+    let execWhileCancelling!: TransferJob | null;
+    await act(async () => {
+      cancel1 = result.current.cancelSavePreparation('ro-10');
+      cancel2 = result.current.cancelSavePreparation('ro-10');
+      execWhileCancelling = await result.current.executeSave('ro-10', session);
+    });
+    expect(result.current.documents[0]?.editState).toBe('cancellingSave');
+    expect(execWhileCancelling).toBeNull();
+    resolveDiscard(true);
+    await act(async () => {
+      expect(await cancel1).toBe(true);
+      expect(await cancel2).toBe(false);
+    });
+
+    // saving
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
+      makePlan('plan-10b', '/etc/ro-10.conf', session),
+    );
+    vi.mocked(filesApi.execute).mockResolvedValueOnce([makeJob('job-10', 'transferring', session)]);
+    await act(async () => {
+      await result.current.prepareSave('ro-10', session);
+      await result.current.executeSave('ro-10', session);
+    });
+    expect(result.current.documents[0]?.editState).toBe('saving');
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation('ro-10')).toBe(false);
+    });
+    expect(result.current.documents[0]?.editState).toBe('saving');
+
+    // conflictDetected
+    await act(async () => {
+      result.current.syncTransfers([
+        makeJob('job-10', 'failed', session, {
+          code: 'conflict',
+          message: 'Remote file changed since open.',
+          hostKey: null,
+        }),
+      ]);
+    });
+    expect(result.current.documents[0]?.editState).toBe('conflictDetected');
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation('ro-10')).toBe(false);
+    });
+    expect(result.current.documents[0]?.editState).toBe('conflictDetected');
+
+    // outcomeUnknown
+    vi.mocked(filesApi.openText).mockResolvedValueOnce(
+      makeRemoteTextDoc('ed-10b', '/etc/ro-10.conf', 'fresh\n', session),
+    );
+    await act(async () => {
+      await result.current.reloadDocument('ro-10', session, { allowDirtyDiscard: true });
+    });
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(
+      makePlan('plan-10c', '/etc/ro-10.conf', session),
+    );
+    vi.mocked(filesApi.execute).mockRejectedValueOnce(new Error('IPC dropped'));
+    await act(async () => {
+      result.current.updateEditableBuffer('ro-10', 'mod2\n');
+      await result.current.prepareSave('ro-10', session);
+      await result.current.executeSave('ro-10', session);
+    });
+    expect(result.current.documents[0]?.editState).toBe('outcomeUnknown');
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation('ro-10')).toBe(false);
+    });
+    expect(result.current.documents[0]?.editState).toBe('outcomeUnknown');
+
+    // disconnected
+    act(() => {
+      result.current.syncHostConnection('host-10', false, null, null);
+    });
+    const dcSession = makeSession('host-10b', 'hs-10b', 'sftp-10b');
+    vi.mocked(filesApi.openText).mockResolvedValueOnce(
+      makeRemoteTextDoc('ed-10d', '/etc/dc-10.conf', 'base\n', dcSession),
+    );
+    await act(async () => {
+      await result.current.openEditableDocument(dcSession, '/etc/dc-10.conf');
+    });
+    const dcTabId = result.current.documents[1]!.id;
+    act(() => {
+      result.current.syncHostConnection('host-10b', false, null, null);
+    });
+    expect(result.current.documents[1]?.editState).toBe('disconnected');
+    await act(async () => {
+      expect(await result.current.cancelSavePreparation(dcTabId)).toBe(false);
+    });
+    expect(result.current.documents[1]?.editState).toBe('disconnected');
+  });
+
+  it('11. maintains monotonic confirmed-save settlement across slow refresh, >5 poll errors, >3 missing polls, out-of-order/superseded responses, and disconnects (FINDING-06)', async () => {
+    vi.useFakeTimers();
+    const session = makeSession('host-11', 'hs-11', 'sftp-11');
+    const { result } = renderHook(() => useReadOnlyEditor(), { wrapper });
+
+    // Scenario A: completed save + slow openText + >5 poll errors + >3 missing polls + out-of-order non-terminal poll
+    vi.mocked(filesApi.openText).mockResolvedValueOnce(
+      makeRemoteTextDoc('ed-11a', '/etc/m.conf', 'T0\n', session),
+    );
+    await act(async () => {
+      await result.current.openEditableDocument(session, '/etc/m.conf');
+    });
+    const tabId = result.current.documents[0]!.id;
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'T1\n');
+    });
+    let resolveSlowRefresh!: (doc: RemoteTextDocument) => void;
+    vi.mocked(filesApi.openText).mockImplementationOnce(
+      () => new Promise((r) => { resolveSlowRefresh = r; }),
+    );
+
+    // Out-of-order poll: seq 1 resolves slowly with 'transferring' AFTER seq 2 resolves with 'completed'
+    // Register transfers mock BEFORE executeSave triggers initial immediate poll on effect mount!
+    let resolveStalePoll!: (jobs: TransferJob[]) => void;
+    vi.mocked(filesApi.transfers)
+      .mockImplementationOnce(() => new Promise((r) => { resolveStalePoll = r; }))
+      .mockResolvedValueOnce([makeJob('job-11a', 'completed', session)])
+      .mockRejectedValue(new Error('Poll failure'));
+
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(makePlan('plan-11a', '/etc/m.conf', session));
+    vi.mocked(filesApi.execute).mockResolvedValueOnce([makeJob('job-11a', 'transferring', session)]);
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+      await result.current.executeSave(tabId, session);
+    });
+
+    // Advance 400ms so seq 2 runs and completes the job synchronously while openText is still pending
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      lastSaveOutcome: 'confirmed',
+      editState: 'saveConfirmed',
+      baselineText: 'T1\n',
+    });
+
+    // Stale non-terminal poll resolves after completion AND >5 poll errors fire while refresh awaits
+    resolveStalePoll([makeJob('job-11a', 'transferring', session)]);
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      expect(result.current.documents[0]?.lastSaveOutcome).toBe('confirmed');
+      expect(result.current.documents[0]?.editState).toBe('saveConfirmed');
+    }
+
+    // Missing job polls (>3) + concurrent T2 edit during slow refresh -> still confirmed
+    vi.mocked(filesApi.transfers).mockResolvedValue([]);
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'T2\n');
+    });
+    for (let i = 0; i < 4; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      expect(result.current.documents[0]?.lastSaveOutcome).toBe('confirmed');
+    }
+
+    resolveSlowRefresh(makeRemoteTextDoc('ed-11b', '/etc/m.conf', 'T1\n', session));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      lastSaveOutcome: 'confirmed',
+      baselineText: 'T1\n',
+      draftText: 'T2\n',
+      dirty: true,
+      editState: 'editableModified',
+      editDocumentId: 'ed-11b',
+    });
+
+    // Undo back to T1 -> clean while staying confirmed
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'T1\n');
+    });
+    expect(result.current.documents[0]).toMatchObject({
+      dirty: false,
+      editState: 'editableClean',
+      lastSaveOutcome: 'confirmed',
+    });
+
+    // Scenario B: Superseded slow refresh after host disconnect must keep lastSaveOutcome: 'confirmed'
+    vi.mocked(filesApi.planTextSave).mockResolvedValueOnce(makePlan('plan-11b', '/etc/m.conf', session));
+    vi.mocked(filesApi.execute).mockResolvedValueOnce([makeJob('job-11b', 'completed', session)]);
+    let resolveSuperseded!: (doc: RemoteTextDocument) => void;
+    vi.mocked(filesApi.openText).mockImplementationOnce(
+      () => new Promise((r) => { resolveSuperseded = r; }),
+    );
+    await act(async () => {
+      result.current.updateEditableBuffer(tabId, 'T3\n');
+    });
+    await act(async () => {
+      await result.current.prepareSave(tabId, session);
+    });
+    let execSuperseded!: Promise<TransferJob | null>;
+    await act(async () => {
+      execSuperseded = result.current.executeSave(tabId, session);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.documents[0]?.lastSaveOutcome).toBe('confirmed');
+    act(() => {
+      result.current.syncHostConnection('host-11', false, null, null);
+    });
+    resolveSuperseded(makeRemoteTextDoc('ed-late-discard', '/etc/m.conf', 'T3\n', session));
+    await act(async () => {
+      await execSuperseded;
+    });
+    expect(filesApi.discardTextDocument).toHaveBeenCalledWith(expect.anything(), 'ed-late-discard');
+    expect(result.current.documents[0]).toMatchObject({
+      lastSaveOutcome: 'confirmed',
+      editState: 'disconnected',
+      baselineText: 'T3\n',
     });
     vi.useRealTimers();
   });

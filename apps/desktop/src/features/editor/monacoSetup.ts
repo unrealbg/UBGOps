@@ -203,6 +203,7 @@ export function ensureReadOnlyModel(
 }
 
 export interface RetainedDocumentMetadata {
+  modelGeneration: number;
   appliedRevision?: number;
   undoBytes: number;
   undoSteps: number;
@@ -210,21 +211,96 @@ export interface RetainedDocumentMetadata {
   viewState: monaco.editor.ICodeEditorViewState | null;
 }
 
+let nextModelGeneration = 0;
 const retainedDocumentMetadata = new Map<string, RetainedDocumentMetadata>();
+
+function nextGenerationId(): number {
+  nextModelGeneration += 1;
+  return nextModelGeneration;
+}
+
+function getLiveModelById(documentId: string): monaco.editor.ITextModel | null {
+  const model = monaco.editor.getModel(opaqueReadOnlyModelUri(documentId));
+  if (!model) return null;
+  if (typeof (model as { isDisposed?: () => boolean }).isDisposed === 'function' && (model as { isDisposed: () => boolean }).isDisposed()) {
+    return null;
+  }
+  return model;
+}
+
+export function hasLiveDocumentModel(documentId: string): boolean {
+  return getLiveModelById(documentId) !== null;
+}
+
+export function peekRetainedDocumentMetadata(documentId: string): RetainedDocumentMetadata | undefined {
+  return retainedDocumentMetadata.get(documentId);
+}
+
+export function getRetainedMetadataCount(): number {
+  return retainedDocumentMetadata.size;
+}
 
 export function getRetainedDocumentMetadata(documentId: string): RetainedDocumentMetadata {
   let entry = retainedDocumentMetadata.get(documentId);
   if (!entry) {
-    entry = { undoBytes: 0, undoSteps: 0, viewState: null };
+    entry = { modelGeneration: nextGenerationId(), undoBytes: 0, undoSteps: 0, viewState: null };
     retainedDocumentMetadata.set(documentId, entry);
   }
   return entry;
 }
 
+export function saveRetainedViewStateIfLive(
+  documentId: string,
+  expectedModel: monaco.editor.ITextModel | null,
+  expectedModelGeneration: number | null,
+  viewState: monaco.editor.ICodeEditorViewState | null,
+): boolean {
+  const liveModel = getLiveModelById(documentId);
+  const entry = retainedDocumentMetadata.get(documentId);
+  if (!liveModel || !entry) {
+    return false;
+  }
+  if (expectedModel !== null && liveModel !== expectedModel) {
+    return false;
+  }
+  if (expectedModelGeneration !== null && entry.modelGeneration !== expectedModelGeneration) {
+    return false;
+  }
+  entry.viewState = viewState;
+  return true;
+}
+
+export function sanitizeModelUndoWithValidText(
+  model: monaco.editor.ITextModel,
+  preInvalidLf: string,
+  currentValidLf: string,
+): void {
+  if (preInvalidLf === currentValidLf) {
+    resetModelValueLf(model, currentValidLf);
+    return;
+  }
+  const fullRange =
+    typeof (model as { getFullModelRange?: () => monaco.IRange }).getFullModelRange === 'function'
+      ? (model as { getFullModelRange: () => monaco.IRange }).getFullModelRange()
+      : null;
+  if (fullRange && typeof model.pushEditOperations === 'function') {
+    model.setEOL(monaco.editor.EndOfLineSequence.LF);
+    model.setValue(preInvalidLf);
+    model.pushStackElement?.();
+    model.pushEditOperations([], [{ range: fullRange, text: currentValidLf }], () => null);
+    model.pushStackElement?.();
+    return;
+  }
+  resetModelValueLf(model, currentValidLf);
+}
+
 export function disposeReadOnlyModel(documentId: string): void {
   retainedDocumentMetadata.delete(documentId);
   const uri = opaqueReadOnlyModelUri(documentId);
-  monaco.editor.getModel(uri)?.dispose();
+  const model = monaco.editor.getModel(uri);
+  if (model && !(typeof (model as { isDisposed?: () => boolean }).isDisposed === 'function' && (model as { isDisposed: () => boolean }).isDisposed())) {
+    model.dispose();
+  }
 }
 
 export function getRetainedModelCount(): number {
