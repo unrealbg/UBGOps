@@ -270,28 +270,40 @@ export function saveRetainedViewStateIfLive(
   return true;
 }
 
+/**
+ * Rebuilds a clean Monaco undo step from `preInvalidLf` to `currentValidLf` after an
+ * invalid edit is superseded synchronously. This intentionally clears undo history prior
+ * to `preInvalidLf` via `setValue(preInvalidLf)` because Monaco cannot selectively excise
+ * tainted undo frames, ensuring invalid bytes can never be resurrected via Undo/Redo.
+ *
+ * Returns `true` when the live model text strictly equals `currentValidLf`.
+ */
 export function sanitizeModelUndoWithValidText(
   model: monaco.editor.ITextModel,
   preInvalidLf: string,
   currentValidLf: string,
-): void {
+): boolean {
   if (preInvalidLf === currentValidLf) {
     resetModelValueLf(model, currentValidLf);
-    return;
+    return getModelValueLf(model) === currentValidLf;
   }
-  const fullRange =
-    typeof (model as { getFullModelRange?: () => monaco.IRange }).getFullModelRange === 'function'
-      ? (model as { getFullModelRange: () => monaco.IRange }).getFullModelRange()
-      : null;
-  if (fullRange && typeof model.pushEditOperations === 'function') {
-    model.setEOL(monaco.editor.EndOfLineSequence.LF);
-    model.setValue(preInvalidLf);
+  model.setEOL(monaco.editor.EndOfLineSequence.LF);
+  model.setValue(preInvalidLf);
+  const hasRangeOps =
+    typeof (model as { getFullModelRange?: () => monaco.IRange }).getFullModelRange === 'function' &&
+    typeof model.pushEditOperations === 'function';
+  if (hasRangeOps) {
     model.pushStackElement?.();
+    // Compute replacement range AFTER restoring preInvalidLf so shorter valid edits replace all lines/cols.
+    const fullRange = (model as { getFullModelRange: () => monaco.IRange }).getFullModelRange();
     model.pushEditOperations([], [{ range: fullRange, text: currentValidLf }], () => null);
     model.pushStackElement?.();
-    return;
+    if (getModelValueLf(model) === currentValidLf) {
+      return true;
+    }
   }
   resetModelValueLf(model, currentValidLf);
+  return getModelValueLf(model) === currentValidLf;
 }
 
 export function disposeReadOnlyModel(documentId: string): void {

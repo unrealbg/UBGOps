@@ -170,20 +170,22 @@ export default function MonacoViewerSurface({
       const currentText = getModelValueLf(model);
       const savedState = editor.saveViewState();
       applyingGuardRef.current = true;
+      let finalLf: string;
       try {
         resetModelValueLf(model, currentText);
         if (savedState) {
           editor.restoreViewState(savedState);
         }
+        finalLf = getModelValueLf(model);
         meta.undoBytes = 0;
         meta.undoSteps = 0;
-        meta.lastValidLf = currentText;
+        meta.lastValidLf = finalLf;
       } finally {
         applyingGuardRef.current = false;
       }
       latestPropsRef.current.onUndoHistoryCompacted?.(reason);
       latestPropsRef.current.onContentChange?.(
-        currentText,
+        finalLf,
         getModelAlternativeVersionId(model),
         getModelUndoRedoState(model),
       );
@@ -286,19 +288,47 @@ export default function MonacoViewerSurface({
       }
       const savedState = editor.saveViewState();
       applyingGuardRef.current = true;
+      let rejectedMessage: string | null = null;
+      let finalLf: string;
       try {
-        sanitizeModelUndoWithValidText(targetModel, preInvalidLf, currentValidLf);
+        const sanitizedOk = sanitizeModelUndoWithValidText(targetModel, preInvalidLf, currentValidLf);
+        let verifiedLf = getModelValueLf(targetModel);
+        let verifiedValid = validateEditableText(
+          verifiedLf,
+          latestPropsRef.current.newline,
+          latestPropsRef.current.bom,
+        );
+        if (!sanitizedOk || verifiedLf !== currentValidLf || !verifiedValid.canHoldLocally) {
+          resetModelValueLf(targetModel, currentValidLf);
+          verifiedLf = getModelValueLf(targetModel);
+          verifiedValid = validateEditableText(
+            verifiedLf,
+            latestPropsRef.current.newline,
+            latestPropsRef.current.bom,
+          );
+          if (verifiedLf !== currentValidLf || !verifiedValid.canHoldLocally) {
+            const fallbackLf = meta.lastValidLf ?? '';
+            resetModelValueLf(targetModel, fallbackLf);
+            verifiedLf = getModelValueLf(targetModel);
+            rejectedMessage =
+              'Editor sanitization detected a buffer mismatch and restored the last verified content.';
+          }
+        }
         if (savedState) {
           editor.restoreViewState(savedState);
         }
-        meta.lastValidLf = currentValidLf;
-        meta.undoSteps = preInvalidLf === currentValidLf ? 0 : 1;
-        meta.undoBytes = preInvalidLf === currentValidLf ? 0 : utf8Encoder.encode(currentValidLf).length;
+        finalLf = verifiedLf;
+        meta.lastValidLf = finalLf;
+        meta.undoSteps = preInvalidLf === finalLf ? 0 : 1;
+        meta.undoBytes = preInvalidLf === finalLf ? 0 : utf8Encoder.encode(finalLf).length;
       } finally {
         applyingGuardRef.current = false;
       }
+      if (rejectedMessage) {
+        latestPropsRef.current.onBufferGuardRejected?.(rejectedMessage);
+      }
       latestPropsRef.current.onContentChange?.(
-        currentValidLf,
+        finalLf,
         getModelAlternativeVersionId(targetModel),
         getModelUndoRedoState(targetModel),
       );
@@ -368,12 +398,14 @@ export default function MonacoViewerSurface({
       }
       const savedState = editor.saveViewState();
       applyingGuardRef.current = true;
+      let revertedLf: string;
       try {
         resetModelValueLf(targetModel, preservedPreInvalidLf);
         if (savedState) {
           editor.restoreViewState(savedState);
         }
-        meta.lastValidLf = preservedPreInvalidLf;
+        revertedLf = getModelValueLf(targetModel);
+        meta.lastValidLf = revertedLf;
         meta.undoBytes = 0;
         meta.undoSteps = 0;
       } finally {
@@ -383,7 +415,7 @@ export default function MonacoViewerSurface({
         latestPropsRef.current.onBufferGuardRejected?.(reason);
       }
       latestPropsRef.current.onContentChange?.(
-        preservedPreInvalidLf,
+        revertedLf,
         getModelAlternativeVersionId(targetModel),
         getModelUndoRedoState(targetModel),
       );

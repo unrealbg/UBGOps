@@ -78,25 +78,64 @@ vi.mock('./monacoSetup', () => {
       getAlternativeVersionId: vi.fn(() => state.altVersion),
       canUndo: vi.fn(() => state.canUndo),
       canRedo: vi.fn(() => state.canRedo),
-      getFullModelRange: vi.fn(() => ({
-        startLineNumber: 1,
-        startColumn: 1,
-        endLineNumber: 999999,
-        endColumn: 999999,
-      })),
-      pushStackElement: vi.fn(),
-      pushEditOperations: vi.fn((_before: unknown, ops: Array<{ text: string }>) => {
-        const nextText = ops[0]?.text ?? '';
-        state.undoHistory = [state.value];
-        state.redoHistory = [];
-        modelText = nextText;
-        state.value = nextText;
-        state.canUndo = true;
-        state.canRedo = false;
-        state.versionId += 1;
-        state.altVersion += 1;
-        return null;
+      getFullModelRange: vi.fn(() => {
+        const current = attachedModel === model ? state.value : modelText;
+        const lines = current.split('\n');
+        const lastLine = lines.length;
+        const lastCol = (lines[lastLine - 1]?.length ?? 0) + 1;
+        return {
+          startLineNumber: 1,
+          startColumn: 1,
+          endLineNumber: lastLine,
+          endColumn: lastCol,
+        };
       }),
+      pushStackElement: vi.fn(),
+      pushEditOperations: vi.fn(
+        (
+          _before: unknown,
+          ops: Array<{
+            range?: {
+              startLineNumber: number;
+              startColumn: number;
+              endLineNumber: number;
+              endColumn: number;
+            };
+            text: string;
+          }>,
+        ) => {
+          const prevText = attachedModel === model ? state.value : modelText;
+          let nextText = prevText;
+          for (const op of ops) {
+            if (!op.range) {
+              nextText = op.text;
+            } else {
+              const lines = nextText.split('\n');
+              const toOffset = (ln: number, col: number) => {
+                const clampedLn = Math.max(1, Math.min(lines.length, ln));
+                let off = 0;
+                for (let i = 0; i < clampedLn - 1; i++) {
+                  off += lines[i]!.length + 1;
+                }
+                const len = lines[clampedLn - 1]!.length;
+                return off + Math.max(0, Math.min(len, col - 1));
+              };
+              const s = toOffset(op.range.startLineNumber, op.range.startColumn);
+              const e = toOffset(op.range.endLineNumber, op.range.endColumn);
+              nextText = nextText.slice(0, s) + op.text + nextText.slice(e);
+            }
+          }
+          state.undoHistory = [prevText];
+          state.redoHistory = [];
+          modelText = nextText;
+          state.value = nextText;
+          state.canUndo = true;
+          state.canRedo = false;
+          state.versionId += 1;
+          state.altVersion += 1;
+          return null;
+        },
+      ),
       getValueLengthInRange: vi.fn(() => 0),
       getValueInRange: vi.fn((_sel: unknown) => state.selectedText.shift() ?? ''),
     };
@@ -153,10 +192,15 @@ vi.mock('./monacoSetup', () => {
       (model: ReturnType<typeof createMockModel>, preInvalidLf: string, currentValidLf: string) => {
         if (preInvalidLf === currentValidLf) {
           model.setValue(currentValidLf);
-          return;
+          return model.getValue() === currentValidLf;
         }
+        model.setEOL(0);
         model.setValue(preInvalidLf);
-        model.pushEditOperations([], [{ text: currentValidLf }]);
+        model.pushStackElement();
+        const fullRange = model.getFullModelRange();
+        model.pushEditOperations([], [{ range: fullRange, text: currentValidLf }]);
+        model.pushStackElement();
+        return model.getValue() === currentValidLf;
       },
     ),
     disposeReadOnlyModel: vi.fn((docId: string) => {
@@ -693,5 +737,96 @@ describe('MonacoViewerSurface options & editable guards', () => {
 
     view.unmount();
     disposeReadOnlyModel('doc-race');
+  });
+
+  it('maintains exact model and coordinator equality across all CG-02 replacement shapes (shorter, longer, equal, empty, multiline, ASCII, Cyrillic, CJK, emoji)', async () => {
+    const matrix = [
+      { name: 'shorter-multiline-repro', pre: 'line1\nline2\nline3', next: 'ok' },
+      { name: 'shorter-singleline-repro', pre: 'abcdef', next: 'xy' },
+      { name: 'longer-multiline', pre: 'xy', next: 'longer-accepted-replacement\nline2' },
+      { name: 'equal-length', pre: 'abcdef', next: '123456' },
+      { name: 'empty', pre: 'line1\nline2', next: '' },
+      { name: 'multiline-to-multiline', pre: 'a\nb\nc', next: 'x\ny' },
+      { name: 'ascii', pre: 'hello world', next: 'ascii' },
+      { name: 'cyrillic', pre: 'Привет мир\nстрока', next: 'Да' },
+      { name: 'cjk', pre: '你好世界\n测试', next: '好' },
+      { name: 'emoji-surrogate', pre: '🚀🔥\n✨🎉', next: '✅' },
+    ];
+
+    for (let idx = 0; idx < matrix.length; idx += 1) {
+      const c = matrix[idx]!;
+      const docId = `cg02-${c.name}`;
+      const onBufferGuardRejected = vi.fn();
+      const onContentChange = vi.fn();
+      const ref = createRef<MonacoViewerHandle>();
+      const view = render(
+        <MonacoViewerSurface
+          viewerRef={ref}
+          documentId={docId}
+          text={c.pre}
+          languageId="plaintext"
+          fontSize={13}
+          wordWrap="off"
+          ariaLabel={`CG02 ${c.name}`}
+          editable
+          modelRevision={0}
+          onBufferGuardRejected={onBufferGuardRejected}
+          onContentChange={onContentChange}
+        />,
+      );
+
+      const handler = state.contentHandlers.at(-1)!;
+      // 1) Invalid NUL edit
+      state.value = `${c.pre}\0invalid`;
+      state.versionId += 1;
+      state.canUndo = true;
+      handler({
+        isUndoing: false,
+        isRedoing: false,
+        changes: [{ text: '\0invalid', rangeLength: 0 }],
+      });
+
+      // 2) Synchronous accepted valid edit superseding invalid edit
+      state.value = c.next;
+      state.versionId += 1;
+      state.canUndo = true;
+      handler({
+        isUndoing: false,
+        isRedoing: false,
+        changes: [{ text: c.next, rangeLength: c.pre.length + 8 }],
+      });
+
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+
+      expect(onBufferGuardRejected, `${c.name} spurious reject`).not.toHaveBeenCalled();
+      expect(state.value, `${c.name} model text`).toBe(c.next);
+      expect(ref.current?.getValueLf(), `${c.name} handle text`).toBe(c.next);
+      expect(onContentChange.mock.calls.at(-1)?.[0], `${c.name} coordinator draftText`).toBe(c.next);
+      expect(state.undoHistory, `${c.name} clean undo`).toEqual([c.pre]);
+      expect(state.redoHistory, `${c.name} empty redo`).toEqual([]);
+
+      // Simulate Undo & verify preInvalidLf restored without invalid content resurrection
+      state.value = state.undoHistory.pop()!;
+      state.redoHistory.push(c.next);
+      state.canUndo = false;
+      state.canRedo = true;
+      state.versionId += 1;
+      handler({ isUndoing: true, isRedoing: false, changes: [{ text: state.value, rangeLength: c.next.length }] });
+      expect(state.value, `${c.name} undo target`).toBe(c.pre);
+
+      // Simulate Redo & verify currentValidLf restored
+      state.value = state.redoHistory.pop()!;
+      state.undoHistory.push(c.pre);
+      state.canUndo = true;
+      state.canRedo = false;
+      state.versionId += 1;
+      handler({ isUndoing: false, isRedoing: true, changes: [{ text: state.value, rangeLength: c.pre.length }] });
+      expect(state.value, `${c.name} redo target`).toBe(c.next);
+
+      view.unmount();
+      disposeReadOnlyModel(docId);
+    }
   });
 });

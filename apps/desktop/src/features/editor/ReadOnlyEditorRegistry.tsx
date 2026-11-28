@@ -15,6 +15,21 @@ import type {
   TransferJob,
 } from '@ubgops/protocol';
 import { applicationError, filesApi } from '../../api/client';
+import {
+  type AuthorityFenceRecord,
+  type AuthorityOwnershipState,
+  BoundedSettledJobHistory,
+  type EditorAuthorityHandle,
+  type EditorLifecycleDiagnostics,
+  MAX_SETTLED_JOB_HISTORY,
+  MAX_UNRESOLVED_AUTHORITY_FENCES,
+  type PostSaveRefreshRecord,
+  type SaveAttemptOutcome,
+  type SaveAttemptRecord,
+  type SessionOwnerTuple,
+  authorityFenceKey,
+  isSessionOwnerMatching,
+} from './editorLifecycle';
 import { detectRemoteFileLanguage, getLanguageById } from './languageDetection';
 import { MAX_EDITOR_PAYLOAD_BYTES, validateEditableText } from './textCodec';
 
@@ -25,6 +40,13 @@ export const MAX_READONLY_BYTES = MAX_EDITOR_PAYLOAD_BYTES;
 const TRANSFER_POLL_INTERVAL_MS = 350;
 const MAX_CONSECUTIVE_POLL_ERRORS = 5;
 const MAX_MISSING_JOB_POLLS = 3;
+
+export type {
+  AuthorityOwnershipState,
+  EditorAuthorityHandle,
+  EditorLifecycleDiagnostics,
+  SessionOwnerTuple,
+};
 
 export type DocumentEditState =
   | 'readOnly'
@@ -41,17 +63,6 @@ export type DocumentEditState =
   | 'disconnected';
 
 export type SaveOutcomeStatus = 'none' | 'confirmed' | 'failed' | 'conflict' | 'outcomeUnknown';
-
-export type AuthorityOwnershipState = 'active' | 'staleCleanupRequired' | 'executionAmbiguous';
-
-export interface EditorAuthorityHandle {
-  readonly documentId: string;
-  readonly session: SessionOwnerTuple;
-  readonly path: string;
-  readonly authorityGeneration: number;
-  readonly usable: boolean;
-  readonly ownershipState: AuthorityOwnershipState;
-}
 
 export interface SavePlanState {
   readonly session: Pick<SftpSessionInfo, 'hostId' | 'hostSessionId' | 'id'>;
@@ -87,6 +98,8 @@ export interface ReadOnlyDocumentTab {
   readonly editable: boolean;
   readonly editState: DocumentEditState;
   readonly lastSaveOutcome: SaveOutcomeStatus;
+  readonly activeSaveOpId: number | null;
+  readonly refreshPending: boolean;
   readonly editDocumentId: string | null;
   readonly retainedAuthority: EditorAuthorityHandle | null;
   readonly baselineText: string;
@@ -111,8 +124,6 @@ export interface PendingReadOnlyOpen {
   readonly path: string;
 }
 
-export type SessionOwnerTuple = Pick<SftpSessionInfo, 'hostId' | 'hostSessionId' | 'id'>;
-
 type ModelDisposer = (documentId: string) => void;
 
 let registeredModelDisposer: ModelDisposer | null = null;
@@ -136,15 +147,6 @@ interface InternalPendingEditOpen {
   readonly session: SessionOwnerTuple;
   readonly path: string;
   cancelled: boolean;
-}
-
-interface InternalInFlightSave {
-  readonly session: SessionOwnerTuple;
-  readonly planId: string;
-  readonly jobId: string;
-  readonly snapshotText: string;
-  readonly snapshotGeneration: number;
-  readonly prevEditDocumentId: string | null;
 }
 
 interface RegistryApi {
@@ -198,6 +200,7 @@ interface RegistryApi {
   readonly canCloseTab: (documentId: string) => { allowed: boolean; reason: string | null };
   readonly canPurgeHost: (hostId: string) => { allowed: boolean; reason: string | null };
   readonly getUnsavedWorkSummary: () => UnsavedWorkSummary;
+  readonly getLifecycleDiagnostics: () => EditorLifecycleDiagnostics;
   readonly cancelOpen: (hostId: string, requestId: string) => Promise<void>;
   readonly selectDocument: (hostId: string, documentId: string) => void;
   readonly setDocumentLanguage: (documentId: string, languageId: string) => void;
@@ -285,8 +288,11 @@ function unbypassableCloseReason(doc: ReadOnlyDocumentTab): string | null {
   if (doc.editState === 'cancellingSave') {
     return 'Wait for save cancellation to settle before closing this tab.';
   }
-  if (doc.editState === 'saving') {
+  if (doc.editState === 'saving' || doc.activeSaveOpId !== null) {
     return 'A remote save transfer is currently in progress. Wait for it to settle before closing.';
+  }
+  if (doc.refreshPending) {
+    return 'Wait for post-save authority refresh to complete before closing this tab.';
   }
   return null;
 }
@@ -311,16 +317,14 @@ function isWriteAuthorityActiveOnTab(doc: ReadOnlyDocumentTab): boolean {
     !doc.disconnected &&
     (doc.editDocumentId !== null ||
       doc.editable ||
+      doc.refreshPending ||
+      doc.activeSaveOpId !== null ||
       doc.editState === 'openingForEdit' ||
       doc.editState === 'savePreparation' ||
       doc.editState === 'cancellingSave' ||
       doc.editState === 'saving' ||
       doc.editState === 'outcomeUnknown')
   );
-}
-
-function authorityKey(authority: Pick<EditorAuthorityHandle, 'session' | 'path' | 'documentId'>): string {
-  return `${authority.session.hostId}:${authority.session.hostSessionId}:${authority.session.id}:${authority.path}:${authority.documentId}`;
 }
 
 function effectiveTabAuthority(doc: ReadOnlyDocumentTab): EditorAuthorityHandle | null {
@@ -341,19 +345,22 @@ function effectiveTabAuthority(doc: ReadOnlyDocumentTab): EditorAuthorityHandle 
 }
 
 function classifyExecuteRejection(error: unknown): {
+  outcome: Exclude<SaveAttemptOutcome, 'pending' | 'confirmed'>;
   nextState: 'conflictDetected' | 'saveFailed' | 'outcomeUnknown';
-  staleRevision: boolean;
+  lastSaveOutcome: 'conflict' | 'failed' | 'outcomeUnknown';
+  ownershipState: 'staleCleanupRequired' | 'executionAmbiguous';
   message: string;
 } {
   const err = applicationError(error);
   if (err.code === 'conflict') {
     return {
+      outcome: 'conflict',
       nextState: 'conflictDetected',
-      staleRevision: true,
+      lastSaveOutcome: 'conflict',
+      ownershipState: 'staleCleanupRequired',
       message: err.message,
     };
   }
-  // Known synchronous pre-dispatch rejections rule out enqueue/mutation.
   if (
     err.code === 'policy' ||
     err.code === 'filePolicy' ||
@@ -361,16 +368,18 @@ function classifyExecuteRejection(error: unknown): {
     err.code === 'cancelled'
   ) {
     return {
+      outcome: 'failed',
       nextState: 'saveFailed',
-      staleRevision: false,
+      lastSaveOutcome: 'failed',
+      ownershipState: 'staleCleanupRequired',
       message: err.message,
     };
   }
-  // client.ts synthesizes raw/lost Tauri IPC errors as code 'connection', and
-  // TransferManager or storage failures can leave mutation settlement ambiguous.
   return {
+    outcome: 'outcomeUnknown',
     nextState: 'outcomeUnknown',
-    staleRevision: true,
+    lastSaveOutcome: 'outcomeUnknown',
+    ownershipState: 'executionAmbiguous',
     message:
       err.code === 'outcomeUnknown'
         ? err.message
@@ -391,19 +400,21 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
   const documentsRef = useRef<ReadOnlyDocumentTab[]>([]);
   const pendingRef = useRef<Map<string, InternalPendingOpen>>(new Map());
   const pendingEditOpenRef = useRef<Map<string, InternalPendingEditOpen>>(new Map());
-  const inFlightSaveRef = useRef<Map<string, InternalInFlightSave>>(new Map());
-  const pollTrackerRef = useRef<Map<string, { consecutiveErrors: number; missingPolls: number }>>(
-    new Map(),
+  const activeSaveAttemptByTabRef = useRef<Map<string, SaveAttemptRecord>>(new Map());
+  const activeRefreshByTabRef = useRef<Map<string, PostSaveRefreshRecord>>(new Map());
+  const settledJobHistoryRef = useRef<BoundedSettledJobHistory>(
+    new BoundedSettledJobHistory(MAX_SETTLED_JOB_HISTORY),
   );
+  const unreleasedAuthoritiesRef = useRef<Map<string, AuthorityFenceRecord>>(new Map());
+  const peakUnresolvedFencesRef = useRef<number>(0);
+
   const opGenByTabRef = useRef<Map<string, number>>(new Map());
   const nextAuthorityGenRef = useRef<number>(0);
-  const settlingJobIdsRef = useRef<Set<string>>(new Set());
-  const settledJobsRef = useRef<Map<string, 'completed' | 'failed' | 'cancelled' | 'outcomeUnknown'>>(
-    new Map(),
-  );
+  const nextSaveOpIdRef = useRef<number>(0);
+  const nextRefreshOpIdRef = useRef<number>(0);
   const pollSeqRef = useRef<number>(0);
   const lastAppliedPollSeqRef = useRef<number>(0);
-  const unreleasedAuthoritiesRef = useRef<Map<string, EditorAuthorityHandle>>(new Map());
+
   const externalReservationsRef = useRef<
     Map<string, { hostId: string; hostSessionId: string; sftpSessionId: string; path: string }>
   >(new Map());
@@ -474,41 +485,93 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  const releaseRetainedAuthority = useCallback(
-    (authority: EditorAuthorityHandle | null, allowDiscardForAmbiguous = false) => {
-      if (!authority) return;
-      if (!isSessionLive(authority.session)) {
-        unreleasedAuthoritiesRef.current.delete(authorityKey(authority));
+  const isFenceBudgetExhausted = useCallback((): boolean => {
+    let liveCount = 0;
+    for (const rec of unreleasedAuthoritiesRef.current.values()) {
+      if (isSessionLive(rec.authority.session)) {
+        liveCount += 1;
+      }
+    }
+    return liveCount >= MAX_UNRESOLVED_AUTHORITY_FENCES;
+  }, [isSessionLive]);
+
+  const recordAuthorityFence = useCallback(
+    (authority: EditorAuthorityHandle, cleanupInFlight: boolean): string => {
+      const key = authorityFenceKey(authority);
+      unreleasedAuthoritiesRef.current.set(key, {
+        key,
+        authority,
+        createdAtMs: Date.now(),
+        cleanupInFlight,
+      });
+      if (unreleasedAuthoritiesRef.current.size > peakUnresolvedFencesRef.current) {
+        peakUnresolvedFencesRef.current = unreleasedAuthoritiesRef.current.size;
+      }
+      return key;
+    },
+    [],
+  );
+
+  const removeFenceIfExactGeneration = useCallback((key: string, authorityGeneration: number) => {
+    const existing = unreleasedAuthoritiesRef.current.get(key);
+    if (existing && existing.authority.authorityGeneration === authorityGeneration) {
+      unreleasedAuthoritiesRef.current.delete(key);
+    }
+  }, []);
+
+  const fenceOrDiscardAbandonedAuthority = useCallback(
+    (
+      session: SessionOwnerTuple,
+      documentId: string,
+      path: string,
+      ownershipState: 'staleCleanupRequired' | 'executionAmbiguous',
+      existing?: EditorAuthorityHandle | null,
+    ) => {
+      const ownedSession = ownerTuple(session);
+      if (!isSessionLive(ownedSession)) {
+        if (ownershipState !== 'executionAmbiguous') {
+          void filesApi.discardTextDocument(ownedSession, documentId).catch(() => undefined);
+        }
         return;
       }
-      const key = authorityKey(authority);
-      if (authority.ownershipState === 'executionAmbiguous' && !allowDiscardForAmbiguous) {
-        // Keep destination fenced until session disconnect/retirement or explicit reload recovery.
-        unreleasedAuthoritiesRef.current.set(key, authority);
+      const handle: EditorAuthorityHandle =
+        existing && existing.authorityGeneration > 0
+          ? { ...existing, session: ownedSession, usable: false, ownershipState }
+          : {
+              ...allocateAuthority(documentId, ownedSession, path),
+              usable: false,
+              ownershipState,
+            };
+
+      if (ownershipState === 'executionAmbiguous') {
+        recordAuthorityFence(handle, false);
         return;
       }
-      unreleasedAuthoritiesRef.current.set(key, authority);
+
+      const key = recordAuthorityFence(handle, true);
       void filesApi
-        .discardTextDocument(authority.session, authority.documentId)
+        .discardTextDocument(handle.session, handle.documentId)
         .then(() => {
-          unreleasedAuthoritiesRef.current.delete(key);
+          removeFenceIfExactGeneration(key, handle.authorityGeneration);
         })
         .catch(() => {
-          // Keep ownership fenced on failed discard until session retirement or explicit retry.
+          const current = unreleasedAuthoritiesRef.current.get(key);
+          if (current && current.authority.authorityGeneration === handle.authorityGeneration) {
+            current.cleanupInFlight = false;
+          }
         });
     },
-    [isSessionLive],
+    [allocateAuthority, isSessionLive, recordAuthorityFence, removeFenceIfExactGeneration],
   );
 
   useEffect(() => {
     mountedRef.current = true;
     const pendingMap = pendingRef.current;
     const pendingEditMap = pendingEditOpenRef.current;
-    const inFlightMap = inFlightSaveRef.current;
-    const pollMap = pollTrackerRef.current;
+    const activeSaveMap = activeSaveAttemptByTabRef.current;
+    const activeRefreshMap = activeRefreshByTabRef.current;
+    const settledHistory = settledJobHistoryRef.current;
     const opGenMap = opGenByTabRef.current;
-    const settlingSet = settlingJobIdsRef.current;
-    const settledMap = settledJobsRef.current;
     const unreleasedMap = unreleasedAuthoritiesRef.current;
     const externalReservationsMap = externalReservationsRef.current;
     const externalMap = externalEditsRef.current;
@@ -522,6 +585,11 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         item.cancelled = true;
       }
       pendingEditMap.clear();
+      for (const refresh of activeRefreshMap.values()) {
+        refresh.superseded = true;
+      }
+      activeRefreshMap.clear();
+      activeSaveMap.clear();
       for (const doc of documentsRef.current) {
         if (doc.savePlan && doc.editState !== 'outcomeUnknown') {
           bestEffortDiscardPlan(doc.savePlan.session, doc.savePlan.plan.id);
@@ -534,11 +602,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         }
         disposeRetainedModel(doc.id);
       }
-      inFlightMap.clear();
-      pollMap.clear();
+      settledHistory.clear();
       opGenMap.clear();
-      settlingSet.clear();
-      settledMap.clear();
       unreleasedMap.clear();
       externalReservationsMap.clear();
       externalMap.clear();
@@ -582,65 +647,105 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
     setErrorsByHost((current) => (current[hostId] ? { ...current, [hostId]: null } : current));
   }, []);
 
-  const hasActiveEditAuthority = useCallback((owner: SessionOwnerTuple, path: string): boolean => {
-    const targetTuple = {
-      hostId: owner.hostId,
-      hostSessionId: owner.hostSessionId,
-      sftpSessionId: owner.id,
-    };
-    for (const res of externalReservationsRef.current.values()) {
-      if (sameSessionTuple(res, targetTuple) && res.path === path) {
-        return true;
+  const hasActiveEditAuthority = useCallback(
+    (owner: SessionOwnerTuple, path: string): boolean => {
+      const targetTuple = {
+        hostId: owner.hostId,
+        hostSessionId: owner.hostSessionId,
+        sftpSessionId: owner.id,
+      };
+      for (const res of externalReservationsRef.current.values()) {
+        if (sameSessionTuple(res, targetTuple) && res.path === path) {
+          return true;
+        }
       }
-    }
-    for (const ext of externalEditsRef.current.values()) {
-      if (sameSessionTuple(ext, targetTuple) && ext.path === path) {
-        return true;
+      for (const ext of externalEditsRef.current.values()) {
+        if (sameSessionTuple(ext, targetTuple) && ext.path === path) {
+          return true;
+        }
       }
-    }
-    for (const item of pendingEditOpenRef.current.values()) {
-      if (
-        !item.cancelled &&
-        sameSessionTuple(
-          {
-            hostId: item.session.hostId,
-            hostSessionId: item.session.hostSessionId,
-            sftpSessionId: item.session.id,
-          },
-          targetTuple,
-        ) &&
-        item.path === path
-      ) {
-        return true;
+      for (const item of pendingEditOpenRef.current.values()) {
+        if (
+          !item.cancelled &&
+          sameSessionTuple(
+            {
+              hostId: item.session.hostId,
+              hostSessionId: item.session.hostSessionId,
+              sftpSessionId: item.session.id,
+            },
+            targetTuple,
+          ) &&
+          item.path === path
+        ) {
+          return true;
+        }
       }
-    }
-    for (const auth of unreleasedAuthoritiesRef.current.values()) {
-      if (
-        isSessionLive(auth.session) &&
-        sameSessionTuple(
-          {
-            hostId: auth.session.hostId,
-            hostSessionId: auth.session.hostSessionId,
-            sftpSessionId: auth.session.id,
-          },
-          targetTuple,
-        ) &&
-        auth.path === path
-      ) {
-        return true;
+      for (const attempt of activeSaveAttemptByTabRef.current.values()) {
+        if (
+          isSessionLive(attempt.session) &&
+          sameSessionTuple(
+            {
+              hostId: attempt.session.hostId,
+              hostSessionId: attempt.session.hostSessionId,
+              sftpSessionId: attempt.session.id,
+            },
+            targetTuple,
+          ) &&
+          attempt.path === path
+        ) {
+          return true;
+        }
       }
-    }
-    return documentsRef.current.some(
-      (doc) =>
-        isWriteAuthorityActiveOnTab(doc) &&
-        sameSessionTuple(doc, targetTuple) &&
-        doc.path === path,
-    );
-  }, [isSessionLive]);
+      for (const refresh of activeRefreshByTabRef.current.values()) {
+        if (
+          !refresh.superseded &&
+          isSessionLive(refresh.session) &&
+          sameSessionTuple(
+            {
+              hostId: refresh.session.hostId,
+              hostSessionId: refresh.session.hostSessionId,
+              sftpSessionId: refresh.session.id,
+            },
+            targetTuple,
+          ) &&
+          refresh.path === path
+        ) {
+          return true;
+        }
+      }
+      for (const rec of unreleasedAuthoritiesRef.current.values()) {
+        if (
+          isSessionLive(rec.authority.session) &&
+          sameSessionTuple(
+            {
+              hostId: rec.authority.session.hostId,
+              hostSessionId: rec.authority.session.hostSessionId,
+              sftpSessionId: rec.authority.session.id,
+            },
+            targetTuple,
+          ) &&
+          rec.authority.path === path
+        ) {
+          return true;
+        }
+      }
+      return documentsRef.current.some(
+        (doc) =>
+          isWriteAuthorityActiveOnTab(doc) &&
+          sameSessionTuple(doc, targetTuple) &&
+          doc.path === path,
+      );
+    },
+    [isSessionLive],
+  );
 
   const reserveExternalEdit = useCallback(
     (owner: SessionOwnerTuple, path: string): string | null => {
-      if (!isSessionLive(owner) || hasActiveEditAuthority(owner, path)) {
+      if (
+        !isSessionLive(owner) ||
+        hasActiveEditAuthority(owner, path) ||
+        isFenceBudgetExhausted()
+      ) {
         return null;
       }
       const reservationId = nextRequestId();
@@ -652,7 +757,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       });
       return reservationId;
     },
-    [hasActiveEditAuthority, isSessionLive],
+    [hasActiveEditAuthority, isFenceBudgetExhausted, isSessionLive],
   );
 
   const commitExternalEdit = useCallback(
@@ -666,13 +771,17 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         hostSessionId: reserved.hostSessionId,
         id: reserved.sftpSessionId,
       };
-      if (!isSessionLive(owner) || hasActiveEditAuthority(owner, reserved.path)) {
+      if (
+        !isSessionLive(owner) ||
+        hasActiveEditAuthority(owner, reserved.path) ||
+        isFenceBudgetExhausted()
+      ) {
         return false;
       }
       externalEditsRef.current.set(externalDocumentId, reserved);
       return true;
     },
-    [hasActiveEditAuthority, isSessionLive],
+    [hasActiveEditAuthority, isFenceBudgetExhausted, isSessionLive],
   );
 
   const releaseExternalEdit = useCallback((id: string) => {
@@ -694,7 +803,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       ) {
         return true;
       }
-      if (hasActiveEditAuthority(owner, path)) {
+      if (hasActiveEditAuthority(owner, path) || isFenceBudgetExhausted()) {
         return false;
       }
       externalEditsRef.current.set(externalDocumentId, {
@@ -705,7 +814,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       });
       return true;
     },
-    [hasActiveEditAuthority],
+    [hasActiveEditAuthority, isFenceBudgetExhausted],
   );
 
   const unregisterExternalEdit = useCallback((externalDocumentId: string) => {
@@ -747,6 +856,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         hosts.add(doc.hostId);
       }
       if (
+        doc.activeSaveOpId !== null ||
+        doc.refreshPending ||
         doc.editState === 'saving' ||
         doc.editState === 'cancellingSave' ||
         doc.editState === 'savePreparation' ||
@@ -771,59 +882,130 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const canPurgeHost = useCallback((hostId: string): { allowed: boolean; reason: string | null } => {
-    for (const pending of pendingRef.current.values()) {
-      if (!pending.cancelled && pending.hostId === hostId) {
-        return {
-          allowed: false,
-          reason: 'Wait for pending file loads on this host to finish or cancel before deleting it.',
-        };
+  const getLifecycleDiagnostics = useCallback((): EditorLifecycleDiagnostics => {
+    return {
+      activeSaveAttempts: activeSaveAttemptByTabRef.current.size,
+      activeRefreshes: activeRefreshByTabRef.current.size,
+      unresolvedAuthorityFences: unreleasedAuthoritiesRef.current.size,
+      settledJobHistorySize: settledJobHistoryRef.current.size,
+      peakSettledJobHistorySize: settledJobHistoryRef.current.peakSize,
+      peakUnresolvedFences: peakUnresolvedFencesRef.current,
+    };
+  }, []);
+
+  const canPurgeHost = useCallback(
+    (hostId: string): { allowed: boolean; reason: string | null } => {
+      for (const pending of pendingRef.current.values()) {
+        if (!pending.cancelled && pending.hostId === hostId) {
+          return {
+            allowed: false,
+            reason: 'Wait for pending file loads on this host to finish or cancel before deleting it.',
+          };
+        }
       }
-    }
-    for (const pendingEdit of pendingEditOpenRef.current.values()) {
-      if (!pendingEdit.cancelled && pendingEdit.session.hostId === hostId) {
-        return {
-          allowed: false,
-          reason: 'Wait for active editor opens on this host to finish before deleting it.',
-        };
+      for (const pendingEdit of pendingEditOpenRef.current.values()) {
+        if (!pendingEdit.cancelled && pendingEdit.session.hostId === hostId) {
+          return {
+            allowed: false,
+            reason: 'Wait for active editor opens on this host to finish before deleting it.',
+          };
+        }
       }
-    }
-    for (const ext of externalEditsRef.current.values()) {
-      if (ext.hostId === hostId) {
-        return {
-          allowed: false,
-          reason: 'Close the active text editor on this host before deleting it.',
-        };
+      for (const attempt of activeSaveAttemptByTabRef.current.values()) {
+        if (attempt.session.hostId === hostId) {
+          return {
+            allowed: false,
+            reason: 'A remote save transfer is currently in progress. Wait for it to settle before deleting this host.',
+          };
+        }
       }
-    }
-    for (const res of externalReservationsRef.current.values()) {
-      if (res.hostId === hostId) {
-        return {
-          allowed: false,
-          reason: 'Wait for the text editor to finish opening before deleting this host.',
-        };
+      for (const refresh of activeRefreshByTabRef.current.values()) {
+        if (refresh.session.hostId === hostId && !refresh.superseded) {
+          return {
+            allowed: false,
+            reason: 'Wait for post-save authority refresh on this host to complete before deleting it.',
+          };
+        }
       }
-    }
-    for (const auth of unreleasedAuthoritiesRef.current.values()) {
-      if (auth.session.hostId === hostId && isSessionLive(auth.session)) {
-        return {
-          allowed: false,
-          reason:
-            auth.ownershipState === 'executionAmbiguous'
-              ? 'An unresolved remote save on this host could still be running. Disconnect before deleting the host.'
-              : 'Wait for editor write authority cleanup on this host before deleting it.',
-        };
+      for (const ext of externalEditsRef.current.values()) {
+        if (ext.hostId === hostId) {
+          return {
+            allowed: false,
+            reason: 'Close the active text editor on this host before deleting it.',
+          };
+        }
       }
-    }
-    const hostDocs = documentsRef.current.filter((doc) => doc.hostId === hostId);
-    for (const doc of hostDocs) {
-      const reason = closureGuardReason(doc);
-      if (reason) {
-        return { allowed: false, reason };
+      for (const res of externalReservationsRef.current.values()) {
+        if (res.hostId === hostId) {
+          return {
+            allowed: false,
+            reason: 'Wait for the text editor to finish opening before deleting this host.',
+          };
+        }
       }
-    }
-    return { allowed: true, reason: null };
-  }, [isSessionLive]);
+      for (const rec of unreleasedAuthoritiesRef.current.values()) {
+        if (rec.authority.session.hostId === hostId && isSessionLive(rec.authority.session)) {
+          return {
+            allowed: false,
+            reason:
+              rec.authority.ownershipState === 'executionAmbiguous'
+                ? 'An unresolved remote save on this host could still be running. Disconnect before deleting the host.'
+                : 'Wait for editor write authority cleanup on this host before deleting it.',
+          };
+        }
+      }
+      const hostDocs = documentsRef.current.filter((doc) => doc.hostId === hostId);
+      for (const doc of hostDocs) {
+        const reason = closureGuardReason(doc);
+        if (reason) {
+          return { allowed: false, reason };
+        }
+      }
+      return { allowed: true, reason: null };
+    },
+    [isSessionLive],
+  );
+
+  const releaseClosedTabResources = useCallback(
+    (target: ReadOnlyDocumentTab) => {
+      if (target.savePlan && target.editState !== 'outcomeUnknown') {
+        bestEffortDiscardPlan(target.savePlan.session, target.savePlan.plan.id);
+      }
+      const activeRefresh = activeRefreshByTabRef.current.get(target.id);
+      if (activeRefresh) {
+        activeRefresh.superseded = true;
+        activeRefreshByTabRef.current.delete(target.id);
+      }
+      const activeAttempt = activeSaveAttemptByTabRef.current.get(target.id);
+      if (activeAttempt) {
+        activeAttempt.phase = 'settled';
+        activeSaveAttemptByTabRef.current.delete(target.id);
+      }
+      const auth = effectiveTabAuthority(target);
+      if (auth) {
+        const fenceState: 'executionAmbiguous' | 'staleCleanupRequired' =
+          auth.ownershipState === 'executionAmbiguous' || target.editState === 'outcomeUnknown'
+            ? 'executionAmbiguous'
+            : 'staleCleanupRequired';
+        fenceOrDiscardAbandonedAuthority(
+          auth.session,
+          auth.documentId,
+          auth.path,
+          fenceState,
+          target.retainedAuthority,
+        );
+      }
+      for (const pendingEdit of pendingEditOpenRef.current.values()) {
+        if (pendingEdit.targetTabId === target.id) {
+          pendingEdit.cancelled = true;
+        }
+      }
+      bumpTabGen(target.id);
+      opGenByTabRef.current.delete(target.id);
+      disposeRetainedModel(target.id);
+    },
+    [bumpTabGen, fenceOrDiscardAbandonedAuthority],
+  );
 
   const closeDocument = useCallback(
     (documentId: string, options?: { confirmDiscard?: boolean }): boolean => {
@@ -846,21 +1028,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         return false;
       }
 
-      if (target.savePlan && target.editState !== 'outcomeUnknown') {
-        bestEffortDiscardPlan(target.savePlan.session, target.savePlan.plan.id);
-      }
-      releaseRetainedAuthority(effectiveTabAuthority(target));
-      for (const pendingEdit of pendingEditOpenRef.current.values()) {
-        if (pendingEdit.targetTabId === documentId) {
-          pendingEdit.cancelled = true;
-        }
-      }
-      bumpTabGen(documentId);
-      opGenByTabRef.current.delete(documentId);
-      pollTrackerRef.current.delete(documentId);
-      inFlightSaveRef.current.delete(documentId);
-
-      disposeRetainedModel(documentId);
+      releaseClosedTabResources(target);
       const nextDocs = documentsRef.current.filter((doc) => doc.id !== documentId);
       commitDocuments(nextDocs);
       if (mountedRef.current) {
@@ -872,7 +1040,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       }
       return true;
     },
-    [bumpTabGen, commitDocuments, releaseRetainedAuthority, updateTab],
+    [commitDocuments, releaseClosedTabResources, updateTab],
   );
 
   const removeHostDocumentsInternal = useCallback(
@@ -880,20 +1048,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       const hostDocs = documentsRef.current.filter((doc) => doc.hostId === hostId);
       if (hostDocs.length === 0) return;
       for (const doc of hostDocs) {
-        if (doc.savePlan && doc.editState !== 'outcomeUnknown') {
-          bestEffortDiscardPlan(doc.savePlan.session, doc.savePlan.plan.id);
-        }
-        releaseRetainedAuthority(effectiveTabAuthority(doc));
-        for (const pendingEdit of pendingEditOpenRef.current.values()) {
-          if (pendingEdit.targetTabId === doc.id) {
-            pendingEdit.cancelled = true;
-          }
-        }
-        bumpTabGen(doc.id);
-        opGenByTabRef.current.delete(doc.id);
-        pollTrackerRef.current.delete(doc.id);
-        inFlightSaveRef.current.delete(doc.id);
-        disposeRetainedModel(doc.id);
+        releaseClosedTabResources(doc);
       }
       const nextDocs = documentsRef.current.filter((doc) => doc.hostId !== hostId);
       commitDocuments(nextDocs);
@@ -901,7 +1056,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         setActiveByHost((current) => ({ ...current, [hostId]: null }));
       }
     },
-    [bumpTabGen, commitDocuments, releaseRetainedAuthority],
+    [commitDocuments, releaseClosedTabResources],
   );
 
   const closeHostDocuments = useCallback(
@@ -962,6 +1117,18 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           pendingEdit.cancelled = true;
         }
       }
+      for (const [tabId, attempt] of activeSaveAttemptByTabRef.current.entries()) {
+        if (attempt.session.hostId === hostId) {
+          attempt.phase = 'settled';
+          activeSaveAttemptByTabRef.current.delete(tabId);
+        }
+      }
+      for (const [tabId, refresh] of activeRefreshByTabRef.current.entries()) {
+        if (refresh.session.hostId === hostId) {
+          refresh.superseded = true;
+          activeRefreshByTabRef.current.delete(tabId);
+        }
+      }
       for (const [resId, res] of externalReservationsRef.current.entries()) {
         if (res.hostId === hostId) {
           externalReservationsRef.current.delete(resId);
@@ -972,8 +1139,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           externalEditsRef.current.delete(extId);
         }
       }
-      for (const [key, auth] of unreleasedAuthoritiesRef.current.entries()) {
-        if (auth.session.hostId === hostId) {
+      for (const [key, rec] of unreleasedAuthoritiesRef.current.entries()) {
+        if (rec.authority.session.hostId === hostId) {
           unreleasedAuthoritiesRef.current.delete(key);
         }
       }
@@ -992,222 +1159,56 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
     [removeHostDocumentsInternal, syncPendingState],
   );
 
-  const settleTransferJob = useCallback(
-    async (tabId: string, job: TransferJob) => {
-      if (settlingJobIdsRef.current.has(job.id) || settledJobsRef.current.has(job.id)) return;
-      settlingJobIdsRef.current.add(job.id);
+  const runPostSaveRefresh = useCallback(
+    async (refresh: PostSaveRefreshRecord, refreshGen: number) => {
       try {
-        const snapshot = inFlightSaveRef.current.get(tabId);
-        const tabBefore = documentsRef.current.find((doc) => doc.id === tabId);
-        if (
-          !tabBefore ||
-          tabBefore.activeTransferJobId !== job.id ||
-          (tabBefore.editState !== 'saving' && tabBefore.editState !== 'outcomeUnknown')
-        ) {
-          return;
-        }
+        const refreshed = await filesApi.openText(refresh.session, refresh.path);
+        const currentAfterRefresh = documentsRef.current.find((doc) => doc.id === refresh.tabId);
+        const refreshedOwner: SessionOwnerTuple = {
+          hostId: refreshed.hostId,
+          hostSessionId: refreshed.hostSessionId,
+          id: refreshed.sftpSessionId,
+        };
+        const activeRefresh = activeRefreshByTabRef.current.get(refresh.tabId);
+        const identityOk =
+          mountedRef.current &&
+          !refresh.superseded &&
+          activeRefresh?.refreshOpId === refresh.refreshOpId &&
+          Boolean(currentAfterRefresh) &&
+          opGenByTabRef.current.get(refresh.tabId) === refreshGen &&
+          !currentAfterRefresh!.disconnected &&
+          isSessionLive(refresh.session) &&
+          refreshed.hostId === refresh.session.hostId &&
+          refreshed.hostSessionId === refresh.session.hostSessionId &&
+          refreshed.sftpSessionId === refresh.session.id &&
+          refreshed.path === currentAfterRefresh!.path;
 
-        pollTrackerRef.current.delete(tabId);
-
-        if (job.state === 'completed') {
-          settledJobsRef.current.set(job.id, 'completed');
-          inFlightSaveRef.current.delete(tabId);
-          const session = snapshot?.session ?? tabSession(tabBefore);
-          const snapshotText = snapshot?.snapshotText ?? tabBefore.draftText;
-          const savedAt = new Date().toISOString();
-          const refreshGen = bumpTabGen(tabId);
-
-          if (!isSessionLive(session) || tabBefore.disconnected) {
-            updateTab(tabId, (doc) => ({
-              ...doc,
-              activeTransferJobId: null,
-              editDocumentId: null,
-              retainedAuthority: null,
-              savePlan: null,
-              baselineText: snapshotText,
-              text: snapshotText,
-              dirty: doc.draftText !== snapshotText,
-              editState: 'disconnected',
-              lastSaveOutcome: 'confirmed',
-              disconnected: true,
-              staleRevision: true,
-              lastSavedAt: savedAt,
-              editError:
-                'Saved remotely, but the session disconnected before refreshing edit authority.',
-            }));
-            return;
+        if (!identityOk) {
+          if (activeRefresh?.refreshOpId === refresh.refreshOpId) {
+            activeRefreshByTabRef.current.delete(refresh.tabId);
           }
-
-          // Commit confirmed settlement SYNCHRONOUSLY before refreshing authority so concurrent polls,
-          // network drops, or slow openText calls can never downgrade lastSaveOutcome from 'confirmed'.
-          updateTab(tabId, (doc) => {
-            const stillDirty = doc.draftText !== snapshotText;
-            return {
-              ...doc,
-              activeTransferJobId: null,
-              editDocumentId: null,
-              retainedAuthority: null,
-              savePlan: null,
-              baselineText: snapshotText,
-              text: snapshotText,
-              dirty: stillDirty,
-              editState: stillDirty ? 'editableModified' : 'saveConfirmed',
-              lastSaveOutcome: 'confirmed',
-              staleRevision: true,
-              lastSavedAt: savedAt,
-              editError: null,
-            };
-          });
-
-          try {
-            const refreshed = await filesApi.openText(session, tabBefore.path);
-            const currentAfterRefresh = documentsRef.current.find((doc) => doc.id === tabId);
-            const refreshedOwner: SessionOwnerTuple = {
-              hostId: refreshed.hostId,
-              hostSessionId: refreshed.hostSessionId,
-              id: refreshed.sftpSessionId,
-            };
-            const identityOk =
-              mountedRef.current &&
-              Boolean(currentAfterRefresh) &&
-              opGenByTabRef.current.get(tabId) === refreshGen &&
-              !currentAfterRefresh!.disconnected &&
-              isSessionLive(session) &&
-              refreshed.hostId === session.hostId &&
-              refreshed.hostSessionId === session.hostSessionId &&
-              refreshed.sftpSessionId === session.id &&
-              refreshed.path === currentAfterRefresh!.path;
-
-            if (!identityOk) {
-              const discardOk = await filesApi
-                .discardTextDocument(refreshedOwner, refreshed.id)
-                .then(() => true)
-                .catch(() => false);
-              if (mountedRef.current && currentAfterRefresh) {
-                const liveNow = isSessionLive(session) && !currentAfterRefresh.disconnected;
-                const staleAuth: EditorAuthorityHandle | null =
-                  !discardOk && isSessionLive(refreshedOwner)
-                    ? {
-                        ...allocateAuthority(refreshed.id, refreshedOwner, refreshed.path),
-                        usable: false,
-                        ownershipState: 'staleCleanupRequired',
-                      }
-                    : null;
-                updateTab(tabId, (doc) => {
-                  if (opGenByTabRef.current.get(tabId) !== refreshGen) {
-                    return doc;
-                  }
-                  const stillDirty = doc.draftText !== doc.baselineText;
-                  return {
-                    ...doc,
-                    activeTransferJobId: null,
-                    editDocumentId: null,
-                    retainedAuthority: staleAuth,
-                    savePlan: null,
-                    editState: !liveNow
-                      ? 'disconnected'
-                      : stillDirty
-                        ? 'editableModified'
-                        : 'saveConfirmed',
-                    lastSaveOutcome: 'confirmed',
-                    disconnected: !liveNow,
-                    staleRevision: true,
-                    lastSavedAt: savedAt,
-                    editError:
-                      'Saved remotely, but the refreshed document identity did not match the current session. Reload before saving again.',
-                  };
-                });
-              }
-              return;
-            }
-
-            const fidelityOk =
-              refreshed.newline === tabBefore.newline &&
-              refreshed.bom === tabBefore.bom &&
-              refreshed.text === snapshotText;
-
-            if (!fidelityOk) {
-              const discardOk = await filesApi
-                .discardTextDocument(refreshedOwner, refreshed.id)
-                .then(() => true)
-                .catch(() => false);
-              const fallbackAuthority: EditorAuthorityHandle | null = !discardOk
-                ? {
-                    ...allocateAuthority(refreshed.id, refreshedOwner, refreshed.path),
-                    usable: false,
-                    ownershipState: 'staleCleanupRequired',
-                  }
-                : null;
-              updateTab(tabId, (doc) => {
-                if (opGenByTabRef.current.get(tabId) !== refreshGen) {
-                  return doc;
-                }
-                return {
-                  ...doc,
-                  activeTransferJobId: null,
-                  editDocumentId: null,
-                  retainedAuthority: fallbackAuthority,
-                  savePlan: null,
-                  baselineText: snapshotText,
-                  dirty: doc.draftText !== snapshotText,
-                  editState: 'conflictDetected',
-                  lastSaveOutcome: 'confirmed',
-                  staleRevision: true,
-                  lastSavedAt: savedAt,
-                  editError:
-                    'Saved remotely, but the remote file contents or encoding changed before authority refreshed. Your editor buffer was preserved; reload or resolve before saving again.',
-                };
-              });
-              return;
-            }
-
-            const refreshedAuthority = allocateAuthority(
-              refreshed.id,
-              refreshedOwner,
-              refreshed.path,
-            );
-            // All checks passed; never overwrite user's live draftText (e.g. concurrent T1 -> T2 edits).
-            updateTab(tabId, (doc) => {
-              if (opGenByTabRef.current.get(tabId) !== refreshGen) {
+          // Retain/discard returned backend authority even if superseded, closed, or mismatched.
+          fenceOrDiscardAbandonedAuthority(
+            refreshedOwner,
+            refreshed.id,
+            refreshed.path,
+            'staleCleanupRequired',
+          );
+          if (mountedRef.current && currentAfterRefresh) {
+            const liveNow = isSessionLive(refresh.session) && !currentAfterRefresh.disconnected;
+            updateTab(refresh.tabId, (doc) => {
+              if (opGenByTabRef.current.get(refresh.tabId) !== refreshGen) {
                 return doc;
               }
-              const stillDirty = doc.draftText !== refreshed.text;
+              const stillDirty = doc.draftText !== doc.baselineText;
               return {
                 ...doc,
+                refreshPending: false,
+                activeSaveOpId: null,
                 activeTransferJobId: null,
-                savePlan: null,
-                editDocumentId: refreshed.id,
-                retainedAuthority: refreshedAuthority,
-                baselineText: refreshed.text,
-                text: refreshed.text,
-                originalBytes: refreshed.originalBytes,
-                newline: refreshed.newline,
-                bom: refreshed.bom,
-                maxBytes: refreshed.maxBytes,
-                dirty: stillDirty,
-                editState: stillDirty ? 'editableModified' : 'saveConfirmed',
-                lastSaveOutcome: 'confirmed',
-                staleRevision: false,
-                editError: null,
-                lastSavedAt: savedAt,
-              };
-            });
-          } catch (refreshError) {
-            const err = applicationError(refreshError);
-            updateTab(tabId, (doc) => {
-              if (opGenByTabRef.current.get(tabId) !== refreshGen) {
-                return doc;
-              }
-              const liveNow = isSessionLive(session) && !doc.disconnected;
-              const stillDirty = doc.draftText !== snapshotText;
-              return {
-                ...doc,
-                activeTransferJobId: null,
-                savePlan: null,
                 editDocumentId: null,
                 retainedAuthority: null,
-                baselineText: snapshotText,
-                dirty: stillDirty,
+                savePlan: null,
                 editState: !liveNow
                   ? 'disconnected'
                   : stillDirty
@@ -1216,83 +1217,328 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
                 lastSaveOutcome: 'confirmed',
                 disconnected: !liveNow,
                 staleRevision: true,
-                lastSavedAt: savedAt,
-                editError: `Saved remotely, but refreshing editor authority failed (${err.message}). Reload before saving again.`,
+                lastSavedAt: refresh.savedAt,
+                editError:
+                  'Saved remotely, but the refreshed document identity did not match the current session. Reload before saving again.',
               };
             });
           }
           return;
         }
 
-        if (job.state === 'outcomeUnknown') {
-          settledJobsRef.current.set(job.id, 'outcomeUnknown');
-          inFlightSaveRef.current.delete(tabId);
-          updateTab(tabId, (doc) =>
-            doc.lastSaveOutcome === 'confirmed'
-              ? doc
-              : {
-                  ...doc,
-                  activeTransferJobId: null,
-                  savePlan: null,
-                  editDocumentId: null,
-                  retainedAuthority: null,
-                  staleRevision: true,
-                  editState: 'outcomeUnknown',
-                  lastSaveOutcome: 'outcomeUnknown',
-                  editError:
-                    job.error?.message ??
-                    'The remote save outcome is unknown. Verify or reload the remote file before trying again.',
-                },
-          );
+        activeRefreshByTabRef.current.delete(refresh.tabId);
+
+        const fidelityOk =
+          refreshed.newline === refresh.expectedNewline &&
+          refreshed.bom === refresh.expectedBom &&
+          refreshed.text === refresh.snapshotText;
+
+        if (!fidelityOk) {
+          const fenceHandle: EditorAuthorityHandle = {
+            ...allocateAuthority(refreshed.id, refreshedOwner, refreshed.path),
+            usable: false,
+            ownershipState: 'staleCleanupRequired',
+          };
+          const discardOk = await filesApi
+            .discardTextDocument(refreshedOwner, refreshed.id)
+            .then(() => true)
+            .catch(() => false);
+          if (!discardOk && isSessionLive(refreshedOwner)) {
+            recordAuthorityFence(fenceHandle, false);
+          }
+          updateTab(refresh.tabId, (doc) => {
+            if (opGenByTabRef.current.get(refresh.tabId) !== refreshGen) {
+              return doc;
+            }
+            return {
+              ...doc,
+              refreshPending: false,
+              activeSaveOpId: null,
+              activeTransferJobId: null,
+              editDocumentId: null,
+              retainedAuthority: !discardOk ? fenceHandle : null,
+              savePlan: null,
+              baselineText: refresh.snapshotText,
+              dirty: doc.draftText !== refresh.snapshotText,
+              editState: 'conflictDetected',
+              lastSaveOutcome: 'confirmed',
+              staleRevision: true,
+              lastSavedAt: refresh.savedAt,
+              editError:
+                'Saved remotely, but the remote file contents or encoding changed before authority refreshed. Your editor buffer was preserved; reload or resolve before saving again.',
+            };
+          });
           return;
         }
 
-        if (job.state === 'failed' || job.state === 'cancelled') {
-          settledJobsRef.current.set(job.id, job.state);
-          inFlightSaveRef.current.delete(tabId);
-          const errorCode = job.error?.code;
-          const message =
-            job.error?.message ??
-            (job.state === 'cancelled'
-              ? 'Save transfer was cancelled; reload the remote file before saving again.'
-              : 'Save transfer failed.');
-          const isConflict =
-            errorCode === 'conflict' || /changed since|revision|conflict|stale/i.test(message);
-          updateTab(tabId, (doc) =>
-            doc.lastSaveOutcome === 'confirmed'
-              ? doc
-              : {
-                  ...doc,
-                  activeTransferJobId: null,
-                  savePlan: null,
-                  editDocumentId: null,
-                  retainedAuthority: null,
-                  staleRevision: true,
-                  editState: isConflict ? 'conflictDetected' : 'saveFailed',
-                  lastSaveOutcome: isConflict ? 'conflict' : 'failed',
-                  editError: message,
-                },
-          );
+        const refreshedAuthority = allocateAuthority(refreshed.id, refreshedOwner, refreshed.path);
+        updateTab(refresh.tabId, (doc) => {
+          if (opGenByTabRef.current.get(refresh.tabId) !== refreshGen) {
+            return doc;
+          }
+          const stillDirty = doc.draftText !== refreshed.text;
+          return {
+            ...doc,
+            refreshPending: false,
+            activeSaveOpId: null,
+            activeTransferJobId: null,
+            savePlan: null,
+            editDocumentId: refreshed.id,
+            retainedAuthority: refreshedAuthority,
+            baselineText: refreshed.text,
+            text: refreshed.text,
+            originalBytes: refreshed.originalBytes,
+            newline: refreshed.newline,
+            bom: refreshed.bom,
+            maxBytes: refreshed.maxBytes,
+            dirty: stillDirty,
+            editState: stillDirty ? 'editableModified' : 'saveConfirmed',
+            lastSaveOutcome: 'confirmed',
+            staleRevision: false,
+            editError: null,
+            lastSavedAt: refresh.savedAt,
+          };
+        });
+      } catch (refreshError) {
+        const activeRefresh = activeRefreshByTabRef.current.get(refresh.tabId);
+        if (activeRefresh?.refreshOpId === refresh.refreshOpId) {
+          activeRefreshByTabRef.current.delete(refresh.tabId);
         }
-      } finally {
-        settlingJobIdsRef.current.delete(job.id);
+        const err = applicationError(refreshError);
+        updateTab(refresh.tabId, (doc) => {
+          if (opGenByTabRef.current.get(refresh.tabId) !== refreshGen) {
+            return doc;
+          }
+          const liveNow = isSessionLive(refresh.session) && !doc.disconnected;
+          const stillDirty = doc.draftText !== refresh.snapshotText;
+          return {
+            ...doc,
+            refreshPending: false,
+            activeSaveOpId: null,
+            activeTransferJobId: null,
+            savePlan: null,
+            editDocumentId: null,
+            retainedAuthority: null,
+            baselineText: refresh.snapshotText,
+            dirty: stillDirty,
+            editState: !liveNow
+              ? 'disconnected'
+              : stillDirty
+                ? 'editableModified'
+                : 'saveConfirmed',
+            lastSaveOutcome: 'confirmed',
+            disconnected: !liveNow,
+            staleRevision: true,
+            lastSavedAt: refresh.savedAt,
+            editError: `Saved remotely, but refreshing editor authority failed (${err.message}). Reload before saving again.`,
+          };
+        });
       }
     },
-    [allocateAuthority, bumpTabGen, isSessionLive, updateTab],
+    [
+      allocateAuthority,
+      fenceOrDiscardAbandonedAuthority,
+      isSessionLive,
+      recordAuthorityFence,
+      updateTab,
+    ],
+  );
+
+  const settleSaveAttempt = useCallback(
+    async (
+      attempt: SaveAttemptRecord,
+      outcome: Exclude<SaveAttemptOutcome, 'pending'>,
+      details?: {
+        errorCode?: string | null;
+        errorMessage?: string | null;
+        disconnectMessage?: string | null;
+        retainedAuthorityOverride?: EditorAuthorityHandle | null;
+      },
+    ): Promise<void> => {
+      // Strictly monotonic per exact active saveOpId.
+      const currentActive = activeSaveAttemptByTabRef.current.get(attempt.tabId);
+      if (
+        attempt.phase === 'settled' ||
+        !currentActive ||
+        currentActive.saveOpId !== attempt.saveOpId
+      ) {
+        return;
+      }
+
+      const tabBefore = documentsRef.current.find((doc) => doc.id === attempt.tabId);
+      attempt.phase = 'settled';
+      attempt.outcome = outcome;
+      activeSaveAttemptByTabRef.current.delete(attempt.tabId);
+      if (attempt.jobId) {
+        settledJobHistoryRef.current.record(attempt.jobId, outcome);
+      }
+
+      if (!tabBefore || tabBefore.activeSaveOpId !== attempt.saveOpId) {
+        return;
+      }
+
+      if (outcome === 'confirmed') {
+        const savedAt = new Date().toISOString();
+        const refreshGen = bumpTabGen(attempt.tabId);
+
+        if (!isSessionLive(attempt.session) || tabBefore.disconnected) {
+          updateTab(attempt.tabId, (doc) => {
+            if (doc.activeSaveOpId !== attempt.saveOpId) return doc;
+            return {
+              ...doc,
+              activeSaveOpId: null,
+              refreshPending: false,
+              activeTransferJobId: null,
+              editDocumentId: null,
+              retainedAuthority: null,
+              savePlan: null,
+              baselineText: attempt.snapshotText,
+              text: attempt.snapshotText,
+              dirty: doc.draftText !== attempt.snapshotText,
+              editState: 'disconnected',
+              lastSaveOutcome: 'confirmed',
+              disconnected: true,
+              staleRevision: true,
+              lastSavedAt: savedAt,
+              editError:
+                'Saved remotely, but the session disconnected before refreshing edit authority.',
+            };
+          });
+          return;
+        }
+
+        const refreshRecord: PostSaveRefreshRecord = {
+          refreshOpId: ++nextRefreshOpIdRef.current,
+          saveOpId: attempt.saveOpId,
+          tabId: attempt.tabId,
+          session: attempt.session,
+          path: attempt.path,
+          snapshotText: attempt.snapshotText,
+          expectedNewline: tabBefore.newline,
+          expectedBom: tabBefore.bom,
+          savedAt,
+          superseded: false,
+        };
+        activeRefreshByTabRef.current.set(attempt.tabId, refreshRecord);
+
+        // Commit confirmed settlement SYNCHRONOUSLY with refreshPending: true BEFORE openText awaits.
+        updateTab(attempt.tabId, (doc) => {
+          if (doc.activeSaveOpId !== attempt.saveOpId) return doc;
+          const stillDirty = doc.draftText !== attempt.snapshotText;
+          return {
+            ...doc,
+            activeSaveOpId: null,
+            refreshPending: true,
+            activeTransferJobId: null,
+            editDocumentId: null,
+            retainedAuthority: null,
+            savePlan: null,
+            baselineText: attempt.snapshotText,
+            text: attempt.snapshotText,
+            dirty: stillDirty,
+            editState: stillDirty ? 'editableModified' : 'saveConfirmed',
+            lastSaveOutcome: 'confirmed',
+            staleRevision: true,
+            lastSavedAt: savedAt,
+            editError: null,
+          };
+        });
+
+        await runPostSaveRefresh(refreshRecord, refreshGen);
+        return;
+      }
+
+      const rawMessage = details?.errorMessage ?? null;
+      const isConflict =
+        outcome === 'conflict' ||
+        details?.errorCode === 'conflict' ||
+        (rawMessage !== null && /changed since|revision|conflict|stale/i.test(rawMessage));
+
+      const nextEditState: DocumentEditState =
+        outcome === 'outcomeUnknown'
+          ? 'outcomeUnknown'
+          : isConflict
+            ? 'conflictDetected'
+            : 'saveFailed';
+
+      const nextLastSaveOutcome: SaveOutcomeStatus =
+        outcome === 'outcomeUnknown' ? 'outcomeUnknown' : isConflict ? 'conflict' : 'failed';
+
+      const message =
+        details?.disconnectMessage ??
+        rawMessage ??
+        (outcome === 'outcomeUnknown'
+          ? 'The remote save outcome is unknown. Verify or reload the remote file before trying again.'
+          : outcome === 'cancelled'
+            ? 'Save transfer was cancelled; reload the remote file before saving again.'
+            : 'Save transfer failed.');
+
+      const liveNow = isSessionLive(attempt.session) && !tabBefore.disconnected;
+      const retainedAuth =
+        liveNow && details?.retainedAuthorityOverride ? details.retainedAuthorityOverride : null;
+
+      updateTab(attempt.tabId, (doc) => {
+        if (doc.activeSaveOpId !== attempt.saveOpId) return doc;
+        return {
+          ...doc,
+          activeSaveOpId: null,
+          refreshPending: false,
+          activeTransferJobId: null,
+          savePlan: null,
+          editDocumentId: null,
+          retainedAuthority: retainedAuth,
+          staleRevision: true,
+          editState: !liveNow && outcome !== 'outcomeUnknown' ? 'disconnected' : nextEditState,
+          disconnected: !liveNow,
+          lastSaveOutcome: nextLastSaveOutcome,
+          editError: message,
+        };
+      });
+    },
+    [bumpTabGen, isSessionLive, runPostSaveRefresh, updateTab],
+  );
+
+  const settleTransferJobRecord = useCallback(
+    async (attempt: SaveAttemptRecord, job: TransferJob) => {
+      if (job.state === 'completed') {
+        await settleSaveAttempt(attempt, 'confirmed');
+        return;
+      }
+      if (job.state === 'outcomeUnknown') {
+        await settleSaveAttempt(attempt, 'outcomeUnknown', {
+          errorCode: job.error?.code ?? null,
+          errorMessage:
+            job.error?.message ??
+            'The remote save outcome is unknown. Verify or reload the remote file before trying again.',
+        });
+        return;
+      }
+      if (job.state === 'failed' || job.state === 'cancelled') {
+        const errorCode = job.error?.code ?? null;
+        const message =
+          job.error?.message ??
+          (job.state === 'cancelled'
+            ? 'Save transfer was cancelled; reload the remote file before saving again.'
+            : 'Save transfer failed.');
+        const isConflict =
+          errorCode === 'conflict' || /changed since|revision|conflict|stale/i.test(message);
+        await settleSaveAttempt(
+          attempt,
+          isConflict ? 'conflict' : job.state === 'cancelled' ? 'cancelled' : 'failed',
+          { errorCode, errorMessage: message },
+        );
+      }
+    },
+    [settleSaveAttempt],
   );
 
   const syncTransfers = useCallback(
     (jobs: readonly TransferJob[]) => {
       if (jobs.length === 0) return;
-      for (const doc of documentsRef.current) {
-        if (!doc.activeTransferJobId) continue;
-        if (settledJobsRef.current.has(doc.activeTransferJobId)) continue;
-        const canReconcile =
-          doc.editState === 'saving' ||
-          (doc.editState === 'outcomeUnknown' &&
-            inFlightSaveRef.current.get(doc.id)?.jobId === doc.activeTransferJobId);
-        if (!canReconcile) continue;
-        const matched = jobs.find((job) => job.id === doc.activeTransferJobId);
+      for (const attempt of Array.from(activeSaveAttemptByTabRef.current.values())) {
+        if (attempt.phase !== 'transferring' || !attempt.jobId) continue;
+        if (settledJobHistoryRef.current.has(attempt.jobId)) continue;
+        const matched = jobs.find((job) => job.id === attempt.jobId);
         if (
           matched &&
           (matched.state === 'completed' ||
@@ -1300,16 +1546,21 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
             matched.state === 'cancelled' ||
             matched.state === 'outcomeUnknown')
         ) {
-          void settleTransferJob(doc.id, matched);
+          void settleTransferJobRecord(attempt, matched);
         }
       }
     },
-    [settleTransferJob],
+    [settleTransferJobRecord],
   );
 
-  // Root-owned bounded transfer polling loop so saves settle even when host view is switched or hidden.
+  // Root-owned bounded transfer polling loop bound to active save attempts.
   const hasSavingDocuments = useMemo(
-    () => documents.some((doc) => doc.editState === 'saving' && doc.activeTransferJobId !== null),
+    () =>
+      documents.some(
+        (doc) =>
+          (doc.activeSaveOpId !== null || doc.editState === 'saving') &&
+          doc.activeTransferJobId !== null,
+      ),
     [documents],
   );
   useEffect(() => {
@@ -1321,54 +1572,26 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       try {
         const jobs = await filesApi.transfers();
         if (!active || !mountedRef.current) return;
-        // Ignore stale out-of-order poll responses, except check terminal jobs via syncTransfers only if newest.
         if (pollSeq < lastAppliedPollSeqRef.current) {
           return;
         }
         lastAppliedPollSeqRef.current = pollSeq;
         syncTransfers(jobs);
-        for (const doc of documentsRef.current) {
-          const jobId = doc.activeTransferJobId;
-          if (
-            doc.editState !== 'saving' ||
-            !jobId ||
-            settledJobsRef.current.has(jobId) ||
-            settlingJobIdsRef.current.has(jobId)
-          ) {
-            continue;
-          }
-          const jobEntry = jobs.find((job) => job.id === jobId);
-          const tracker = pollTrackerRef.current.get(doc.id) ?? {
-            consecutiveErrors: 0,
-            missingPolls: 0,
-          };
-          tracker.consecutiveErrors = 0;
+        for (const attempt of Array.from(activeSaveAttemptByTabRef.current.values())) {
+          if (attempt.phase !== 'transferring' || !attempt.jobId) continue;
+          if (pollSeq < attempt.lastPollSeq) continue;
+          attempt.lastPollSeq = pollSeq;
+          const jobEntry = jobs.find((job) => job.id === attempt.jobId);
+          attempt.consecutivePollErrors = 0;
           if (jobEntry) {
-            tracker.missingPolls = 0;
-            pollTrackerRef.current.set(doc.id, tracker);
+            attempt.missingJobPolls = 0;
           } else {
-            tracker.missingPolls += 1;
-            pollTrackerRef.current.set(doc.id, tracker);
-            if (tracker.missingPolls >= MAX_MISSING_JOB_POLLS) {
-              updateTab(doc.id, (current) =>
-                current.editState === 'saving' &&
-                current.activeTransferJobId === jobId &&
-                !settledJobsRef.current.has(jobId) &&
-                !settlingJobIdsRef.current.has(jobId) &&
-                current.lastSaveOutcome !== 'confirmed'
-                  ? {
-                      ...current,
-                      savePlan: null,
-                      editDocumentId: null,
-                      retainedAuthority: null,
-                      staleRevision: true,
-                      editState: 'outcomeUnknown',
-                      lastSaveOutcome: 'outcomeUnknown',
-                      editError:
-                        'The save transfer is no longer reported by the transfer manager before settlement was confirmed. Verify or reload the remote file.',
-                    }
-                  : current,
-              );
+            attempt.missingJobPolls += 1;
+            if (attempt.missingJobPolls >= MAX_MISSING_JOB_POLLS) {
+              void settleSaveAttempt(attempt, 'outcomeUnknown', {
+                errorMessage:
+                  'The save transfer is no longer reported by the transfer manager before settlement was confirmed. Verify or reload the remote file.',
+              });
             }
           }
         }
@@ -1378,42 +1601,16 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           return;
         }
         lastAppliedPollSeqRef.current = pollSeq;
-        for (const doc of documentsRef.current) {
-          const jobId = doc.activeTransferJobId;
-          if (
-            doc.editState !== 'saving' ||
-            !jobId ||
-            settledJobsRef.current.has(jobId) ||
-            settlingJobIdsRef.current.has(jobId)
-          ) {
-            continue;
-          }
-          const tracker = pollTrackerRef.current.get(doc.id) ?? {
-            consecutiveErrors: 0,
-            missingPolls: 0,
-          };
-          tracker.consecutiveErrors += 1;
-          pollTrackerRef.current.set(doc.id, tracker);
-          if (tracker.consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
-            updateTab(doc.id, (current) =>
-              current.editState === 'saving' &&
-              current.activeTransferJobId === jobId &&
-              !settledJobsRef.current.has(jobId) &&
-              !settlingJobIdsRef.current.has(jobId) &&
-              current.lastSaveOutcome !== 'confirmed'
-                ? {
-                    ...current,
-                    savePlan: null,
-                    editDocumentId: null,
-                    retainedAuthority: null,
-                    staleRevision: true,
-                    editState: 'outcomeUnknown',
-                    lastSaveOutcome: 'outcomeUnknown',
-                    editError:
-                      'Lost status updates while polling the save transfer. Verify or reload the remote file before trying again.',
-                  }
-                : current,
-            );
+        for (const attempt of Array.from(activeSaveAttemptByTabRef.current.values())) {
+          if (attempt.phase !== 'transferring' || !attempt.jobId) continue;
+          if (pollSeq < attempt.lastPollSeq) continue;
+          attempt.lastPollSeq = pollSeq;
+          attempt.consecutivePollErrors += 1;
+          if (attempt.consecutivePollErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+            void settleSaveAttempt(attempt, 'outcomeUnknown', {
+              errorMessage:
+                'Lost status updates while polling the save transfer. Verify or reload the remote file before trying again.',
+            });
           }
         }
       }
@@ -1426,7 +1623,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       active = false;
       window.clearInterval(timer);
     };
-  }, [hasSavingDocuments, syncTransfers, updateTab]);
+  }, [hasSavingDocuments, settleSaveAttempt, syncTransfers]);
 
   const syncHostConnection = useCallback(
     (
@@ -1437,15 +1634,17 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
     ) => {
       sessionByHostRef.current.set(hostId, { connected, hostSessionId, sftpSessionId });
 
-      for (const [key, auth] of unreleasedAuthoritiesRef.current.entries()) {
-        if (auth.session.hostId !== hostId) continue;
-        const stillLive =
-          connected &&
-          hostSessionId !== null &&
-          sftpSessionId !== null &&
-          auth.session.hostSessionId === hostSessionId &&
-          auth.session.id === sftpSessionId;
-        if (!stillLive) {
+      // Idempotent fence pruning: ONLY delete fences whose exact bound session generation retired.
+      for (const [key, rec] of unreleasedAuthoritiesRef.current.entries()) {
+        if (
+          !isSessionOwnerMatching(
+            rec.authority.session,
+            hostId,
+            connected,
+            hostSessionId,
+            sftpSessionId,
+          )
+        ) {
           unreleasedAuthoritiesRef.current.delete(key);
         }
       }
@@ -1464,21 +1663,36 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           void filesApi.cancelReadOnlyOpen(pending.session, id).catch(() => undefined);
         }
       }
-      for (const [key, auth] of unreleasedAuthoritiesRef.current.entries()) {
-        if (auth.session.hostId === hostId) {
-          unreleasedAuthoritiesRef.current.delete(key);
-        }
-      }
       if (changedPending) syncPendingState();
 
       for (const item of pendingEditOpenRef.current.values()) {
         if (item.session.hostId !== hostId) continue;
-        const stillLive =
-          connected &&
-          item.session.hostSessionId === hostSessionId &&
-          item.session.id === sftpSessionId;
-        if (!stillLive) {
+        if (
+          !isSessionOwnerMatching(item.session, hostId, connected, hostSessionId, sftpSessionId)
+        ) {
           item.cancelled = true;
+        }
+      }
+
+      for (const [tabId, refresh] of activeRefreshByTabRef.current.entries()) {
+        if (
+          !isSessionOwnerMatching(refresh.session, hostId, connected, hostSessionId, sftpSessionId)
+        ) {
+          refresh.superseded = true;
+          activeRefreshByTabRef.current.delete(tabId);
+        }
+      }
+
+      for (const [tabId, attempt] of activeSaveAttemptByTabRef.current.entries()) {
+        if (
+          !isSessionOwnerMatching(attempt.session, hostId, connected, hostSessionId, sftpSessionId)
+        ) {
+          attempt.phase = 'settled';
+          attempt.outcome = 'outcomeUnknown';
+          activeSaveAttemptByTabRef.current.delete(tabId);
+          if (attempt.jobId) {
+            settledJobHistoryRef.current.record(attempt.jobId, 'outcomeUnknown');
+          }
         }
       }
 
@@ -1518,28 +1732,42 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
             bestEffortDiscardPlan(doc.savePlan.session, doc.savePlan.plan.id);
           }
           bumpTabGen(doc.id);
+          const wasInFlightSave = doc.activeSaveOpId !== null || doc.editState === 'saving';
           const nextState: DocumentEditState =
-            doc.editState === 'outcomeUnknown'
+            doc.editState === 'outcomeUnknown' || wasInFlightSave
               ? 'outcomeUnknown'
-              : doc.editState === 'saving'
-                ? 'saving'
-                : 'disconnected';
+              : 'disconnected';
+          const nextOutcome: SaveOutcomeStatus =
+            wasInFlightSave && doc.lastSaveOutcome !== 'confirmed'
+              ? 'outcomeUnknown'
+              : doc.lastSaveOutcome;
           if (
             !doc.disconnected ||
             doc.editDocumentId !== null ||
             doc.retainedAuthority !== null ||
             doc.savePlan !== null ||
-            doc.editState !== nextState
+            doc.activeSaveOpId !== null ||
+            doc.activeTransferJobId !== null ||
+            doc.refreshPending ||
+            doc.editState !== nextState ||
+            doc.lastSaveOutcome !== nextOutcome
           ) {
             changedDocs = true;
             return {
               ...doc,
               disconnected: true,
+              activeSaveOpId: null,
+              refreshPending: false,
+              activeTransferJobId: null,
               editDocumentId: null,
               retainedAuthority: null,
               savePlan: null,
               staleRevision: doc.editable ? true : doc.staleRevision,
               editState: nextState,
+              lastSaveOutcome: nextOutcome,
+              editError: wasInFlightSave
+                ? 'Connection lost while remote save was in flight. Reconnect and verify remote content before saving again.'
+                : doc.editError,
             };
           }
         }
@@ -1692,6 +1920,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           editable: false,
           editState: 'readOnly',
           lastSaveOutcome: 'none',
+          activeSaveOpId: null,
+          refreshPending: false,
           editDocumentId: null,
           retainedAuthority: null,
           baselineText: result.text,
@@ -1749,6 +1979,14 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           ...doc,
           editError: 'Cannot enable editing because the SFTP session is no longer current.',
         }));
+        return null;
+      }
+      if (isFenceBudgetExhausted()) {
+        const message = `Cannot open another editable document while ${MAX_UNRESOLVED_AUTHORITY_FENCES} unresolved authorities are still fenced. Reload or disconnect a host session.`;
+        updateTab(documentId, (doc) => ({ ...doc, editError: message }));
+        if (mountedRef.current) {
+          setErrorsByHost((current) => ({ ...current, [session.hostId]: message }));
+        }
         return null;
       }
       if (hasActiveEditAuthority(session, target.path)) {
@@ -1819,7 +2057,12 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           result.hostSessionId !== session.hostSessionId ||
           result.sftpSessionId !== session.id
         ) {
-          void filesApi.discardTextDocument(owner, result.id).catch(() => undefined);
+          fenceOrDiscardAbandonedAuthority(
+            { hostId: result.hostId, hostSessionId: result.hostSessionId, id: result.sftpSessionId },
+            result.id,
+            result.path,
+            'staleCleanupRequired',
+          );
           return null;
         }
 
@@ -1838,6 +2081,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
             editable: true,
             editState: 'editableClean',
             lastSaveOutcome: 'none',
+            activeSaveOpId: null,
+            refreshPending: false,
             editDocumentId: result.id,
             retainedAuthority: authority,
             baselineText: result.text,
@@ -1872,7 +2117,16 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         pendingEditOpenRef.current.delete(requestKey);
       }
     },
-    [allocateAuthority, bumpTabGen, commitDocuments, hasActiveEditAuthority, isSessionLive, updateTab],
+    [
+      allocateAuthority,
+      bumpTabGen,
+      commitDocuments,
+      fenceOrDiscardAbandonedAuthority,
+      hasActiveEditAuthority,
+      isFenceBudgetExhausted,
+      isSessionLive,
+      updateTab,
+    ],
   );
 
   const openEditableDocument = useCallback(
@@ -1904,6 +2158,16 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           return existing;
         }
         return promoteToEditable(existing.id, session);
+      }
+
+      if (isFenceBudgetExhausted()) {
+        if (mountedRef.current) {
+          setErrorsByHost((current) => ({
+            ...current,
+            [session.hostId]: `Cannot open another editable document while ${MAX_UNRESOLVED_AUTHORITY_FENCES} unresolved authorities are still fenced. Reload or disconnect a host session.`,
+          }));
+        }
+        return null;
       }
 
       if (hasActiveEditAuthority(session, path)) {
@@ -2011,7 +2275,12 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           documentsRef.current.length >= MAX_READONLY_DOCUMENTS ||
           otherEditConflict
         ) {
-          void filesApi.discardTextDocument(owner, result.id).catch(() => undefined);
+          fenceOrDiscardAbandonedAuthority(
+            { hostId: result.hostId, hostSessionId: result.hostSessionId, id: result.sftpSessionId },
+            result.id,
+            result.path,
+            'staleCleanupRequired',
+          );
           return null;
         }
 
@@ -2038,6 +2307,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           editable: true,
           editState: 'editableClean',
           lastSaveOutcome: 'none',
+          activeSaveOpId: null,
+          refreshPending: false,
           editDocumentId: result.id,
           retainedAuthority: authority,
           baselineText: result.text,
@@ -2074,7 +2345,9 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       allocateAuthority,
       clearHostError,
       commitDocuments,
+      fenceOrDiscardAbandonedAuthority,
       hasActiveEditAuthority,
+      isFenceBudgetExhausted,
       isSessionLive,
       promoteToEditable,
       syncPendingState,
@@ -2090,7 +2363,6 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       const target = documentsRef.current.find((doc) => doc.id === documentId);
       if (!target || !target.editable) return;
 
-      // Equal-text updates preserve an active savePlan cleanly without creating server plan orphans.
       if (target.savePlan && nextLfText === target.savePlan.snapshotText) {
         if (
           undoRedo &&
@@ -2211,6 +2483,10 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         !target ||
         !target.editable ||
         target.disconnected ||
+        target.refreshPending ||
+        target.activeSaveOpId !== null ||
+        activeSaveAttemptByTabRef.current.has(documentId) ||
+        activeRefreshByTabRef.current.has(documentId) ||
         !target.editDocumentId ||
         target.staleRevision ||
         target.editState === 'openingForEdit' ||
@@ -2441,7 +2717,16 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
     async (documentId: string, session: SftpSessionInfo): Promise<TransferJob | null> => {
       const target = documentsRef.current.find((doc) => doc.id === documentId);
       const pending = target?.savePlan ?? null;
-      if (!target || !pending || target.disconnected || target.editState !== 'savePreparation') {
+      if (
+        !target ||
+        !pending ||
+        target.disconnected ||
+        target.refreshPending ||
+        target.activeSaveOpId !== null ||
+        target.editState !== 'savePreparation' ||
+        activeSaveAttemptByTabRef.current.has(documentId) ||
+        activeRefreshByTabRef.current.has(documentId)
+      ) {
         return null;
       }
 
@@ -2486,18 +2771,49 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
               ownershipState: 'active',
             }
           : null);
+
+      const saveOpId = ++nextSaveOpIdRef.current;
+      const attempt: SaveAttemptRecord = {
+        saveOpId,
+        tabId: documentId,
+        session: owner,
+        path: target.path,
+        authority: prevAuthority,
+        planId: pending.plan.id,
+        snapshotText: pending.snapshotText,
+        snapshotGeneration: pending.bufferGeneration,
+        jobId: null,
+        phase: 'executing',
+        outcome: 'pending',
+        consecutivePollErrors: 0,
+        missingJobPolls: 0,
+        lastPollSeq: pollSeqRef.current,
+      };
+      activeSaveAttemptByTabRef.current.set(documentId, attempt);
       bumpTabGen(documentId);
-      pollTrackerRef.current.delete(documentId);
+
+      // Establish fresh operation context without disturbing confirmed baselineText/lastSavedAt.
       updateTab(documentId, (doc) => ({
         ...doc,
         editState: 'saving',
+        activeSaveOpId: saveOpId,
+        activeTransferJobId: null,
         savePlan: null,
+        lastSaveOutcome: 'none',
         editError: null,
       }));
 
       try {
         const jobs = await filesApi.execute(owner, pending.plan.id);
         const job = jobs[0];
+
+        if (
+          attempt.phase !== 'executing' ||
+          activeSaveAttemptByTabRef.current.get(documentId)?.saveOpId !== saveOpId
+        ) {
+          return null;
+        }
+
         if (jobs.length !== 1 || !job) {
           const ambiguousAuthority: EditorAuthorityHandle | null = prevAuthority
             ? {
@@ -2506,35 +2822,26 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
                 ownershipState: 'executionAmbiguous',
               }
             : null;
-          updateTab(documentId, (doc) => ({
-            ...doc,
-            editDocumentId: null,
-            retainedAuthority: doc.disconnected ? null : ambiguousAuthority,
-            activeTransferJobId: null,
-            staleRevision: true,
-            editState: 'outcomeUnknown',
-            lastSaveOutcome: 'outcomeUnknown',
-            editError:
+          await settleSaveAttempt(attempt, 'outcomeUnknown', {
+            errorMessage:
               'Save execution returned an unexpected transfer status. Reload or verify remote content.',
-          }));
+            retainedAuthorityOverride: ambiguousAuthority,
+          });
           return null;
         }
 
-        // FilePlanStore::consume permanently consumed the document authority when queuing this TransferJob.
-        inFlightSaveRef.current.set(documentId, {
-          session: owner,
-          planId: pending.plan.id,
-          jobId: job.id,
-          snapshotText: pending.snapshotText,
-          snapshotGeneration: pending.bufferGeneration,
-          prevEditDocumentId,
+        // FilePlanStore::consume permanently consumed the document authority when queuing this job.
+        attempt.jobId = job.id;
+        attempt.phase = 'transferring';
+        updateTab(documentId, (doc) => {
+          if (doc.activeSaveOpId !== saveOpId) return doc;
+          return {
+            ...doc,
+            activeTransferJobId: job.id,
+            editDocumentId: null,
+            retainedAuthority: null,
+          };
         });
-        updateTab(documentId, (doc) => ({
-          ...doc,
-          activeTransferJobId: job.id,
-          editDocumentId: null,
-          retainedAuthority: null,
-        }));
 
         if (
           job.state === 'completed' ||
@@ -2542,45 +2849,39 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           job.state === 'cancelled' ||
           job.state === 'outcomeUnknown'
         ) {
-          await settleTransferJob(documentId, job);
+          await settleTransferJobRecord(attempt, job);
         }
         return job;
       } catch (reason) {
+        if (
+          attempt.phase !== 'executing' ||
+          activeSaveAttemptByTabRef.current.get(documentId)?.saveOpId !== saveOpId
+        ) {
+          return null;
+        }
         const classification = classifyExecuteRejection(reason);
-        updateTab(documentId, (doc) => {
-          if (doc.editState !== 'saving') return doc;
-          const preservedAuthority: EditorAuthorityHandle | null =
-            doc.disconnected || !prevAuthority
-              ? null
-              : {
-                  ...prevAuthority,
-                  usable: false,
-                  ownershipState:
-                    classification.nextState === 'outcomeUnknown'
-                      ? 'executionAmbiguous'
-                      : 'staleCleanupRequired',
-                };
-          return {
-            ...doc,
-            activeTransferJobId: null,
-            savePlan: null,
-            editDocumentId: null,
-            retainedAuthority: preservedAuthority,
-            staleRevision: true,
-            editState: classification.nextState,
-            lastSaveOutcome:
-              classification.nextState === 'conflictDetected'
-                ? 'conflict'
-                : classification.nextState === 'saveFailed'
-                  ? 'failed'
-                  : 'outcomeUnknown',
-            editError: classification.message,
-          };
+        const preservedAuthority: EditorAuthorityHandle | null = prevAuthority
+          ? {
+              ...prevAuthority,
+              usable: false,
+              ownershipState: classification.ownershipState,
+            }
+          : null;
+        await settleSaveAttempt(attempt, classification.outcome, {
+          errorCode: applicationError(reason).code,
+          errorMessage: classification.message,
+          retainedAuthorityOverride: preservedAuthority,
         });
         return null;
       }
     },
-    [bumpTabGen, isSessionLive, settleTransferJob, updateTab],
+    [
+      bumpTabGen,
+      isSessionLive,
+      settleSaveAttempt,
+      settleTransferJobRecord,
+      updateTab,
+    ],
   );
 
   const reloadDocument = useCallback(
@@ -2592,6 +2893,10 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       const target = documentsRef.current.find((doc) => doc.id === documentId);
       if (!target) return null;
       if (
+        target.refreshPending ||
+        target.activeSaveOpId !== null ||
+        activeSaveAttemptByTabRef.current.has(documentId) ||
+        activeRefreshByTabRef.current.has(documentId) ||
         target.editState === 'saving' ||
         target.editState === 'cancellingSave' ||
         target.editState === 'openingForEdit'
@@ -2615,8 +2920,6 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       }
 
       const reloadGen = bumpTabGen(documentId);
-      inFlightSaveRef.current.delete(documentId);
-      pollTrackerRef.current.delete(documentId);
 
       if (target.savePlan && isSessionLive(target.savePlan.session)) {
         try {
@@ -2643,6 +2946,10 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           await filesApi.discardTextDocument(
             authorityToDiscard.session,
             authorityToDiscard.documentId,
+          );
+          removeFenceIfExactGeneration(
+            authorityFenceKey(authorityToDiscard),
+            authorityToDiscard.authorityGeneration,
           );
           updateTab(documentId, (doc) => {
             if (opGenByTabRef.current.get(documentId) !== reloadGen) return doc;
@@ -2705,6 +3012,17 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         target.editState === 'saveConfirmed' ||
         target.lastSaveOutcome !== 'none'
       ) {
+        if (isFenceBudgetExhausted()) {
+          updateTab(documentId, (doc) =>
+            opGenByTabRef.current.get(documentId) === reloadGen
+              ? {
+                  ...doc,
+                  editError: `Cannot reopen editable authority while ${MAX_UNRESOLVED_AUTHORITY_FENCES} unresolved authorities are fenced.`,
+                }
+              : doc,
+          );
+          return null;
+        }
         try {
           const fresh = await filesApi.openText(owner, target.path);
           const freshOwner: SessionOwnerTuple = {
@@ -2723,7 +3041,12 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
             fresh.sftpSessionId !== owner.id ||
             fresh.path !== target.path
           ) {
-            void filesApi.discardTextDocument(freshOwner, fresh.id).catch(() => undefined);
+            fenceOrDiscardAbandonedAuthority(
+              freshOwner,
+              fresh.id,
+              fresh.path,
+              'staleCleanupRequired',
+            );
             return null;
           }
           const freshAuthority = allocateAuthority(fresh.id, freshOwner, fresh.path);
@@ -2746,6 +3069,8 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
               editable: true,
               editState: 'editableClean',
               lastSaveOutcome: 'none',
+              activeSaveOpId: null,
+              refreshPending: false,
               editDocumentId: fresh.id,
               retainedAuthority: freshAuthority,
               dirty: false,
@@ -2835,7 +3160,16 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
         return null;
       }
     },
-    [allocateAuthority, bumpTabGen, commitDocuments, isSessionLive, updateTab],
+    [
+      allocateAuthority,
+      bumpTabGen,
+      commitDocuments,
+      fenceOrDiscardAbandonedAuthority,
+      isFenceBudgetExhausted,
+      isSessionLive,
+      removeFenceIfExactGeneration,
+      updateTab,
+    ],
   );
 
   const discardChanges = useCallback(
@@ -2843,18 +3177,51 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       const target = documentsRef.current.find((doc) => doc.id === documentId);
       if (
         !target ||
+        target.refreshPending ||
+        target.activeSaveOpId !== null ||
+        activeSaveAttemptByTabRef.current.has(documentId) ||
+        activeRefreshByTabRef.current.has(documentId) ||
         target.editState === 'saving' ||
         target.editState === 'cancellingSave' ||
         target.editState === 'openingForEdit'
       ) {
         return false;
       }
+      let planDiscardFailed = false;
       if (target.savePlan) {
-        await filesApi
-          .discardEditorPlan(target.savePlan.session, target.savePlan.plan.id)
-          .catch(() => undefined);
+        try {
+          const released = await filesApi.discardEditorPlan(
+            target.savePlan.session,
+            target.savePlan.plan.id,
+          );
+          if (!released) {
+            planDiscardFailed = true;
+          }
+        } catch {
+          planDiscardFailed = true;
+        }
       }
       return updateTab(documentId, (doc) => {
+        const mustRetainCleanup = planDiscardFailed && !doc.disconnected;
+        const retainedAuth: EditorAuthorityHandle | null = mustRetainCleanup
+          ? doc.retainedAuthority
+            ? {
+                ...doc.retainedAuthority,
+                usable: false,
+                ownershipState: 'staleCleanupRequired',
+              }
+            : doc.editDocumentId
+              ? {
+                  documentId: doc.editDocumentId,
+                  session: tabSession(doc),
+                  path: doc.path,
+                  authorityGeneration: -1,
+                  usable: false,
+                  ownershipState: 'staleCleanupRequired',
+                }
+              : null
+          : doc.retainedAuthority;
+
         const restoredState: DocumentEditState =
           doc.editState === 'outcomeUnknown' || doc.lastSaveOutcome === 'outcomeUnknown'
             ? 'outcomeUnknown'
@@ -2862,7 +3229,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
               ? 'disconnected'
               : !doc.editable
                 ? 'readOnly'
-                : doc.staleRevision
+                : doc.staleRevision || mustRetainCleanup
                   ? 'conflictDetected'
                   : 'editableClean';
         return {
@@ -2872,6 +3239,9 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
           bufferGeneration: doc.bufferGeneration + 1,
           modelRevision: doc.modelRevision + 1,
           savePlan: null,
+          editDocumentId: mustRetainCleanup ? null : doc.editDocumentId,
+          retainedAuthority: retainedAuth,
+          staleRevision: doc.staleRevision || mustRetainCleanup,
           editState: restoredState,
           editError: null,
           canUndo: false,
@@ -2907,6 +3277,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       canCloseTab,
       canPurgeHost,
       getUnsavedWorkSummary,
+      getLifecycleDiagnostics,
       cancelOpen,
       selectDocument,
       setDocumentLanguage,
@@ -2940,6 +3311,7 @@ export function ReadOnlyEditorProvider({ children }: { children: ReactNode }) {
       canCloseTab,
       canPurgeHost,
       getUnsavedWorkSummary,
+      getLifecycleDiagnostics,
       cancelOpen,
       selectDocument,
       setDocumentLanguage,
