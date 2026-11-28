@@ -260,6 +260,46 @@ impl FilePlanStore {
         }
     }
 
+    pub fn has_active_editor_document(
+        &self,
+        host: HostId,
+        host_session: HostSessionId,
+        sftp: SftpSessionId,
+        path: &str,
+    ) -> Result<bool, AppError> {
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|_| policy_error("The editor authority store is unavailable."))?;
+        let now = Instant::now();
+        let expired: Vec<_> = documents
+            .iter()
+            .filter_map(|(id, value)| (value.expires <= now).then_some(*id))
+            .collect();
+        for id in &expired {
+            documents.remove(id);
+        }
+        if !expired.is_empty() {
+            let mut plans = self
+                .plans
+                .lock()
+                .map_err(|_| policy_error("The file plan store is unavailable."))?;
+            plans.retain(|_, stored| {
+                !stored
+                    .editor_document
+                    .is_some_and(|id| expired.contains(&id))
+            });
+        }
+        Ok(documents.values().any(|value| {
+            (
+                value.host,
+                value.host_session,
+                value.sftp,
+                value.path.as_str(),
+            ) == (host, host_session, sftp, path)
+        }))
+    }
+
     pub fn register_editor_document(
         &self,
         client: &dyn SftpClient,
@@ -275,23 +315,15 @@ impl FilePlanStore {
             .documents
             .lock()
             .map_err(|_| policy_error("The editor authority store is unavailable."))?;
-        let retired: Vec<_> = documents
+        let now = Instant::now();
+        let expired: Vec<_> = documents
             .iter()
-            .filter_map(|(id, value)| {
-                (value.expires <= Instant::now()
-                    || (
-                        value.host,
-                        value.host_session,
-                        value.sftp,
-                        value.path.as_str(),
-                    ) == (info.host_id, info.host_session_id, info.id, path.as_str()))
-                    .then_some(*id)
-            })
+            .filter_map(|(id, value)| (value.expires <= now).then_some(*id))
             .collect();
-        for id in &retired {
+        for id in &expired {
             documents.remove(id);
         }
-        if !retired.is_empty() {
+        if !expired.is_empty() {
             let mut plans = self
                 .plans
                 .lock()
@@ -299,8 +331,21 @@ impl FilePlanStore {
             plans.retain(|_, stored| {
                 !stored
                     .editor_document
-                    .is_some_and(|id| retired.contains(&id))
+                    .is_some_and(|id| expired.contains(&id))
             });
+        }
+        if documents.values().any(|value| {
+            (
+                value.host,
+                value.host_session,
+                value.sftp,
+                value.path.as_str(),
+            ) == (info.host_id, info.host_session_id, info.id, path.as_str())
+        }) {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "An active editor authority already exists for this file in this SFTP session. Discard or close it before opening again.",
+            ));
         }
         if documents.len() >= PLAN_CAP {
             return Err(policy_error("Too many editor documents are open."));
@@ -2414,5 +2459,187 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(expiring_store.plans.lock().unwrap().is_empty());
         std::fs::rename(&expiring_path, parent.path().join("expiry-released")).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_authority_rejects_duplicate_open_across_document_and_plan_and_allows_after_expiry_or_consume()
+     {
+        let client = PlanClient::with_extensions(vec![ubgops_model::SftpExtension {
+            name: "posix-rename@openssh.com".into(),
+            version: "1".into(),
+        }]);
+        let store = FilePlanStore {
+            plans: Arc::default(),
+            documents: Arc::default(),
+            lifetime: Duration::from_secs(10),
+        };
+        let rev = client
+            .editor_revision("/home/test/single.txt")
+            .await
+            .unwrap();
+        let doc1 = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                rev.clone(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        assert!(
+            store
+                .has_active_editor_document(
+                    client.info().host_id,
+                    client.info().host_session_id,
+                    client.info().id,
+                    "/home/test/single.txt",
+                )
+                .unwrap()
+        );
+
+        // Second registration while Ready document is active MUST fail with Conflict.
+        let dup_doc = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                rev.clone(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(dup_doc.code, ErrorCode::Conflict);
+
+        // Move document into active SavePlan (Planning/Pending); duplicate registration MUST still Conflict.
+        let plan = store
+            .plan_editor_save(client.clone(), doc1, "v2".into())
+            .await
+            .unwrap();
+        let dup_during_plan = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                rev.clone(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(dup_during_plan.code, ErrorCode::Conflict);
+
+        // Consuming the plan removes both document authority and pending plan so reload succeeds.
+        store
+            .consume(
+                plan.id,
+                plan.host_id,
+                plan.host_session_id,
+                plan.sftp_session_id,
+            )
+            .unwrap();
+        let doc2 = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                rev.clone(),
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+
+        // Mark doc2 expired; register_editor_document purges expired authorities automatically.
+        store
+            .documents
+            .lock()
+            .unwrap()
+            .get_mut(&doc2)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        let doc3 = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                rev,
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        assert_ne!(doc2, doc3);
+
+        // Expired pending plan: consume rejects with Policy ("expired"), releases doc3 to Ready,
+        // leaving doc3 active until explicit discard_editor_document unlocks re-registration.
+        let plan_exp = store
+            .plan_editor_save(client.clone(), doc3, "v-exp".into())
+            .await
+            .unwrap();
+        store
+            .plans
+            .lock()
+            .unwrap()
+            .get_mut(&plan_exp.id)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        let Err(exp_err) = store.consume(
+            plan_exp.id,
+            plan_exp.host_id,
+            plan_exp.host_session_id,
+            plan_exp.sftp_session_id,
+        ) else {
+            panic!("expected expired plan consume to fail");
+        };
+        assert_eq!(exp_err.code, ErrorCode::FilePolicy);
+
+        // Authority doc3 still blocks new registration until discarded.
+        let blocked = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                crate::EditorRevision {
+                    identity: EntryIdentity {
+                        kind: RemoteEntryKind::File,
+                        size: Some(4),
+                        modified: Some(1),
+                    },
+                    raw_mode: 0o100644,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(blocked.code, ErrorCode::Conflict);
+
+        store
+            .discard_editor_document(
+                doc3,
+                plan_exp.host_id,
+                plan_exp.host_session_id,
+                plan_exp.sftp_session_id,
+            )
+            .unwrap();
+        let doc4 = store
+            .register_editor_document(
+                client.as_ref(),
+                "/home/test/single.txt".into(),
+                crate::EditorRevision {
+                    identity: EntryIdentity {
+                        kind: RemoteEntryKind::File,
+                        size: Some(4),
+                        modified: Some(1),
+                    },
+                    raw_mode: 0o100644,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                b"data",
+                TextNewline::Lf,
+                false,
+            )
+            .unwrap();
+        assert_ne!(doc3, doc4);
     }
 }

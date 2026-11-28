@@ -259,6 +259,28 @@ impl TransferManager {
             .collect()
     }
 
+    pub fn has_active_editor_save(
+        &self,
+        host: HostId,
+        host_session: HostSessionId,
+        sftp: SftpSessionId,
+        path: &str,
+    ) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        state.jobs.values().any(|job| {
+            !terminal(&job.view.state)
+                && job.view.host_id == host
+                && job.view.host_session_id == host_session
+                && job.view.sftp_session_id == sftp
+                && job.active_spec.as_ref().is_some_and(|spec| {
+                    matches!(spec.source, Source::Editor { .. })
+                        && matches!(&spec.destination, Destination::Remote { path: dst, .. } if dst == path)
+                })
+        })
+    }
+
     pub fn cancel(
         &self,
         id: TransferJobId,

@@ -330,7 +330,7 @@ function AppShellContent({
   initialSection?: WorkspaceSection;
   initialTerminalMonitoring?: boolean;
 }) {
-  const { documents, purgeHost } = useReadOnlyEditor();
+  const { documents, canPurgeHost, purgeHost } = useReadOnlyEditor();
   const hostsQuery = useHosts();
   const queryClient = useQueryClient();
   const { hostId, select } = useSelection();
@@ -454,6 +454,14 @@ function AppShellContent({
     if (section === 'terminal') visitTerminal(saved);
   }
   async function deleteHost(host: Host) {
+    const purgeCheck = canPurgeHost(host.id);
+    if (!purgeCheck.allowed) {
+      setDeleteError(
+        purgeCheck.reason ??
+          'Resolve or save unsaved editor work on this host before deleting it.',
+      );
+      return;
+    }
     setDeleting(true);
     setDeleteError(null);
     try {

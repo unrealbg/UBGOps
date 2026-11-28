@@ -1,12 +1,14 @@
 use crate::application::{MAX_CONCURRENT_READONLY_OPENS, ReadOnlyOpenKey};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
-use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId};
+use ubgops_model::{AppError, ErrorCode, HostId, HostSessionId, SftpSessionId};
+
+pub(crate) const MAX_SEALED_SESSIONS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOnlyOpenMetrics {
@@ -30,6 +32,7 @@ pub(crate) struct ActiveReadOnlyRegistration {
 pub(crate) struct SupervisedReadOnlyOp {
     pub host_id: HostId,
     pub host_session_id: HostSessionId,
+    pub sftp_session_id: SftpSessionId,
     pub cancel: CancellationToken,
     pub done: watch::Receiver<bool>,
 }
@@ -40,10 +43,40 @@ pub(crate) struct ReadOnlySupervisorState {
     pub next_op_id: u64,
     pub active_by_key: HashMap<ReadOnlyOpenKey, ActiveReadOnlyRegistration>,
     pub supervised_ops: HashMap<u64, SupervisedReadOnlyOp>,
+    pub sealed_sessions: HashSet<(HostId, HostSessionId)>,
+    pub sealed_order: VecDeque<(HostId, HostSessionId)>,
+    pub sealed_sftp_channels: HashSet<SftpSessionId>,
+    pub sealed_sftp_order: VecDeque<SftpSessionId>,
     pub peak_supervised_tasks: usize,
     pub peak_registered_requests: usize,
     pub confirmed_cleanups: u64,
     pub retired_channel_unknown_settlements: u64,
+    #[cfg(test)]
+    pub before_register_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Barrier>)>,
+}
+
+impl ReadOnlySupervisorState {
+    fn seal_session_locked(&mut self, session: (HostId, HostSessionId)) {
+        if self.sealed_sessions.insert(session) {
+            if self.sealed_order.len() >= MAX_SEALED_SESSIONS
+                && let Some(evicted) = self.sealed_order.pop_front()
+            {
+                self.sealed_sessions.remove(&evicted);
+            }
+            self.sealed_order.push_back(session);
+        }
+    }
+
+    fn seal_sftp_locked(&mut self, sftp_session_id: SftpSessionId) {
+        if self.sealed_sftp_channels.insert(sftp_session_id) {
+            if self.sealed_sftp_order.len() >= MAX_SEALED_SESSIONS
+                && let Some(evicted) = self.sealed_sftp_order.pop_front()
+            {
+                self.sealed_sftp_channels.remove(&evicted);
+            }
+            self.sealed_sftp_order.push_back(sftp_session_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -66,15 +99,6 @@ impl ReadOnlyOpenSupervisor {
         Arc::clone(&self.state)
     }
 
-    pub fn try_acquire_permit(&self) -> Result<OwnedSemaphorePermit, AppError> {
-        Arc::clone(&self.limit).try_acquire_owned().map_err(|_| {
-            AppError::new(
-                ErrorCode::Conflict,
-                "Too many read-only file loads are already in progress.",
-            )
-        })
-    }
-
     pub fn is_shutdown(&self) -> bool {
         self.state
             .lock()
@@ -82,9 +106,148 @@ impl ReadOnlyOpenSupervisor {
             .shutdown
     }
 
+    pub fn is_sftp_sealed_channel(&self, sftp_session_id: SftpSessionId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sealed_sftp_channels
+            .contains(&sftp_session_id)
+    }
+
+    pub fn seal_sftp_channel(&self, sftp_session_id: SftpSessionId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.seal_sftp_locked(sftp_session_id);
+    }
+
+    /// Atomically seals `sftp_session_id`, clears pending key registrations for that
+    /// exact SFTP channel generation, and signals all matching supervised tasks without
+    /// touching unrelated hosts, newer SFTP channels, or SSH/PTY sessions.
+    pub fn cancel_sftp_channel(
+        &self,
+        sftp_session_id: SftpSessionId,
+    ) -> Vec<watch::Receiver<bool>> {
+        self.cancel_sftp_channel_except(sftp_session_id, None)
+    }
+
+    /// Seals `sftp_session_id` and cancels any sibling in-flight operations on that
+    /// retired channel without masking `except_op_id`'s own protocol error behind `Cancelled`.
+    pub fn cancel_sftp_channel_except(
+        &self,
+        sftp_session_id: SftpSessionId,
+        except_op_id: Option<u64>,
+    ) -> Vec<watch::Receiver<bool>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.seal_sftp_locked(sftp_session_id);
+        let active_keys = state
+            .active_by_key
+            .iter()
+            .filter(|((_, _, sftp, _), entry)| {
+                *sftp == sftp_session_id && except_op_id != Some(entry.op_id)
+            })
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
+        for key in active_keys {
+            if let Some(entry) = state.active_by_key.remove(&key) {
+                entry.cancel.cancel();
+            }
+        }
+        let mut receivers = Vec::new();
+        for (&op_id, op) in &state.supervised_ops {
+            if op.sftp_session_id == sftp_session_id && except_op_id != Some(op_id) {
+                op.cancel.cancel();
+                receivers.push(op.done.clone());
+            }
+        }
+        receivers
+    }
+
+    /// Atomically checks admission state, acquires one global permit, and registers the
+    /// supervised read-only operation. Callers hold the live session & SFTP map locks
+    /// across this synchronous call so disconnect/channel replacement linearizes cleanly.
+    pub fn try_admit(
+        &self,
+        key: ReadOnlyOpenKey,
+        cancel: CancellationToken,
+        done_rx: watch::Receiver<bool>,
+    ) -> Result<(u64, OwnedSemaphorePermit), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "UBGOps is shutting down.",
+            ));
+        }
+        if state.sealed_sessions.contains(&(key.0, key.1)) {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "The SSH connection for this file operation has disconnected.",
+            ));
+        }
+        if state.sealed_sftp_channels.contains(&key.2) {
+            return Err(AppError::new(
+                ErrorCode::SftpUnavailable,
+                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
+            ));
+        }
+        if state.active_by_key.contains_key(&key) {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "A read-only open with this request identity is already in progress.",
+            ));
+        }
+        if state.active_by_key.len() >= MAX_CONCURRENT_READONLY_OPENS
+            || state.supervised_ops.len() >= MAX_CONCURRENT_READONLY_OPENS
+        {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "Too many read-only file loads are already in progress.",
+            ));
+        }
+        let permit = Arc::clone(&self.limit).try_acquire_owned().map_err(|_| {
+            AppError::new(
+                ErrorCode::Conflict,
+                "Too many read-only file loads are already in progress.",
+            )
+        })?;
+        state.next_op_id = state.next_op_id.wrapping_add(1).max(1);
+        let op_id = state.next_op_id;
+        state.active_by_key.insert(
+            key,
+            ActiveReadOnlyRegistration {
+                op_id,
+                cancel: cancel.clone(),
+            },
+        );
+        state.supervised_ops.insert(
+            op_id,
+            SupervisedReadOnlyOp {
+                host_id: key.0,
+                host_session_id: key.1,
+                sftp_session_id: key.2,
+                cancel,
+                done: done_rx,
+            },
+        );
+        state.peak_registered_requests = state
+            .peak_registered_requests
+            .max(state.active_by_key.len());
+        state.peak_supervised_tasks = state.peak_supervised_tasks.max(state.supervised_ops.len());
+        Ok((op_id, permit))
+    }
+
     /// Registers a newly admitted supervised read-only operation. The returned `op_id`
     /// identifies this exact execution instance so overlapping cancellation or drop guards
     /// never remove a newer registration under a reused `request_id`.
+    #[cfg(test)]
     pub fn register(
         &self,
         key: ReadOnlyOpenKey,
@@ -99,6 +262,18 @@ impl ReadOnlyOpenSupervisor {
             return Err(AppError::new(
                 ErrorCode::Cancelled,
                 "UBGOps is shutting down.",
+            ));
+        }
+        if state.sealed_sessions.contains(&(key.0, key.1)) {
+            return Err(AppError::new(
+                ErrorCode::Cancelled,
+                "The SSH connection for this file operation has disconnected.",
+            ));
+        }
+        if state.sealed_sftp_channels.contains(&key.2) {
+            return Err(AppError::new(
+                ErrorCode::SftpUnavailable,
+                "The SFTP channel was retired after an unresolved operation; reopen Files to start a fresh SFTP session.",
             ));
         }
         if state.active_by_key.contains_key(&key) {
@@ -129,6 +304,7 @@ impl ReadOnlyOpenSupervisor {
             SupervisedReadOnlyOp {
                 host_id: key.0,
                 host_session_id: key.1,
+                sftp_session_id: key.2,
                 cancel,
                 done: done_rx,
             },
@@ -167,6 +343,7 @@ impl ReadOnlyOpenSupervisor {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.seal_session_locked((host_id, host_session_id));
         let active_keys = state
             .active_by_key
             .keys()
@@ -247,6 +424,49 @@ impl ReadOnlyOpenSupervisor {
             confirmed_cleanups: state.confirmed_cleanups,
             retired_channel_unknown_settlements: state.retired_channel_unknown_settlements,
         }
+    }
+    #[cfg(test)]
+    pub fn set_before_register_barrier(
+        &self,
+        hook: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Barrier>)>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.before_register_barrier = hook;
+    }
+
+    #[cfg(test)]
+    pub async fn wait_before_register(&self) {
+        let hook = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .before_register_barrier
+            .clone();
+        if let Some((entered, barrier)) = hook {
+            entered.notify_one();
+            barrier.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_session_sealed(&self, host_id: HostId, host_session_id: HostSessionId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sealed_sessions
+            .contains(&(host_id, host_session_id))
+    }
+
+    #[cfg(test)]
+    pub fn sealed_session_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sealed_sessions
+            .len()
     }
 }
 
@@ -343,5 +563,60 @@ impl Drop for SupervisedTaskGuard {
         }
         drop(self.permit.take());
         let _ = self.done_tx.send(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ubgops_model::ReadOnlyDocumentId;
+
+    #[tokio::test]
+    async fn supervisor_cancel_session_seals_across_quiesce_and_bounds_fifo() {
+        let supervisor = ReadOnlyOpenSupervisor::default();
+        let host_id = HostId::new();
+        let old_session = HostSessionId::new();
+        let sftp_id = SftpSessionId::new();
+        let req_id = ReadOnlyDocumentId::new();
+
+        let receivers = supervisor.cancel_session(host_id, old_session);
+        ReadOnlyOpenSupervisor::quiesce(receivers, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(supervisor.is_session_sealed(host_id, old_session));
+
+        let cancel = CancellationToken::new();
+        let (_tx, rx) = watch::channel(false);
+        let err = supervisor
+            .register((host_id, old_session, sftp_id, req_id), cancel, rx)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+
+        // Idempotent repeat seal does not grow sealed FIFO unexpectedly, and exceeding
+        // MAX_SEALED_SESSIONS evicts oldest entries cleanly without unbounded growth.
+        for _ in 0..(MAX_SEALED_SESSIONS + 25) {
+            let h = HostId::new();
+            let s = HostSessionId::new();
+            supervisor.cancel_session(h, s);
+        }
+        assert_eq!(supervisor.sealed_session_count(), MAX_SEALED_SESSIONS);
+        assert!(!supervisor.is_session_sealed(host_id, old_session));
+    }
+
+    #[tokio::test]
+    async fn supervisor_retired_sftp_channel_is_sealed() {
+        let supervisor = ReadOnlyOpenSupervisor::default();
+        let host_id = HostId::new();
+        let session_id = HostSessionId::new();
+        let sftp_id = SftpSessionId::new();
+        let req_id = ReadOnlyDocumentId::new();
+
+        supervisor.seal_sftp_channel(sftp_id);
+        let cancel = CancellationToken::new();
+        let (_tx, rx) = watch::channel(false);
+        let err = supervisor
+            .register((host_id, session_id, sftp_id, req_id), cancel, rx)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SftpUnavailable);
     }
 }

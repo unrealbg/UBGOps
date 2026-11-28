@@ -145,7 +145,25 @@ export function opaqueReadOnlyModelUri(documentId: string): monaco.Uri {
   return monaco.Uri.parse(`${READONLY_MODEL_SCHEME}://document/${encodeURIComponent(documentId)}`);
 }
 
-export function ensureReadOnlyModel(
+export function getModelValueLf(model: monaco.editor.ITextModel): string {
+  return model.getValue(monaco.editor.EndOfLinePreference.LF);
+}
+
+export function getModelAlternativeVersionId(model: monaco.editor.ITextModel): number {
+  return model.getAlternativeVersionId();
+}
+
+export function getModelUndoRedoState(model: monaco.editor.ITextModel): {
+  canUndo: boolean;
+  canRedo: boolean;
+} {
+  return {
+    canUndo: model.canUndo(),
+    canRedo: model.canRedo(),
+  };
+}
+
+export function ensureDocumentModel(
   documentId: string,
   text: string,
   languageId: string,
@@ -154,7 +172,8 @@ export function ensureReadOnlyModel(
   const uri = opaqueReadOnlyModelUri(documentId);
   const existing = monaco.editor.getModel(uri);
   if (existing) {
-    if (existing.getValue() !== text) {
+    existing.setEOL(monaco.editor.EndOfLineSequence.LF);
+    if (getModelValueLf(existing) !== text) {
       existing.setValue(text);
     }
     if (existing.getLanguageId() !== languageId) {
@@ -162,12 +181,138 @@ export function ensureReadOnlyModel(
     }
     return existing;
   }
-  return monaco.editor.createModel(text, languageId, uri);
+  const created = monaco.editor.createModel(text, languageId, uri);
+  created.setEOL(monaco.editor.EndOfLineSequence.LF);
+  return created;
+}
+
+export function resetModelValueLf(
+  model: monaco.editor.ITextModel,
+  text: string,
+): void {
+  model.setEOL(monaco.editor.EndOfLineSequence.LF);
+  model.setValue(text);
+}
+
+export function ensureReadOnlyModel(
+  documentId: string,
+  text: string,
+  languageId: string,
+): monaco.editor.ITextModel {
+  return ensureDocumentModel(documentId, text, languageId);
+}
+
+export interface RetainedDocumentMetadata {
+  modelGeneration: number;
+  appliedRevision?: number;
+  undoBytes: number;
+  undoSteps: number;
+  lastValidLf?: string;
+  viewState: monaco.editor.ICodeEditorViewState | null;
+}
+
+let nextModelGeneration = 0;
+const retainedDocumentMetadata = new Map<string, RetainedDocumentMetadata>();
+
+function nextGenerationId(): number {
+  nextModelGeneration += 1;
+  return nextModelGeneration;
+}
+
+function getLiveModelById(documentId: string): monaco.editor.ITextModel | null {
+  const model = monaco.editor.getModel(opaqueReadOnlyModelUri(documentId));
+  if (!model) return null;
+  if (typeof (model as { isDisposed?: () => boolean }).isDisposed === 'function' && (model as { isDisposed: () => boolean }).isDisposed()) {
+    return null;
+  }
+  return model;
+}
+
+export function hasLiveDocumentModel(documentId: string): boolean {
+  return getLiveModelById(documentId) !== null;
+}
+
+export function peekRetainedDocumentMetadata(documentId: string): RetainedDocumentMetadata | undefined {
+  return retainedDocumentMetadata.get(documentId);
+}
+
+export function getRetainedMetadataCount(): number {
+  return retainedDocumentMetadata.size;
+}
+
+export function getRetainedDocumentMetadata(documentId: string): RetainedDocumentMetadata {
+  let entry = retainedDocumentMetadata.get(documentId);
+  if (!entry) {
+    entry = { modelGeneration: nextGenerationId(), undoBytes: 0, undoSteps: 0, viewState: null };
+    retainedDocumentMetadata.set(documentId, entry);
+  }
+  return entry;
+}
+
+export function saveRetainedViewStateIfLive(
+  documentId: string,
+  expectedModel: monaco.editor.ITextModel | null,
+  expectedModelGeneration: number | null,
+  viewState: monaco.editor.ICodeEditorViewState | null,
+): boolean {
+  const liveModel = getLiveModelById(documentId);
+  const entry = retainedDocumentMetadata.get(documentId);
+  if (!liveModel || !entry) {
+    return false;
+  }
+  if (expectedModel !== null && liveModel !== expectedModel) {
+    return false;
+  }
+  if (expectedModelGeneration !== null && entry.modelGeneration !== expectedModelGeneration) {
+    return false;
+  }
+  entry.viewState = viewState;
+  return true;
+}
+
+/**
+ * Rebuilds a clean Monaco undo step from `preInvalidLf` to `currentValidLf` after an
+ * invalid edit is superseded synchronously. This intentionally clears undo history prior
+ * to `preInvalidLf` via `setValue(preInvalidLf)` because Monaco cannot selectively excise
+ * tainted undo frames, ensuring invalid bytes can never be resurrected via Undo/Redo.
+ *
+ * Returns `true` when the live model text strictly equals `currentValidLf`.
+ */
+export function sanitizeModelUndoWithValidText(
+  model: monaco.editor.ITextModel,
+  preInvalidLf: string,
+  currentValidLf: string,
+): boolean {
+  if (preInvalidLf === currentValidLf) {
+    resetModelValueLf(model, currentValidLf);
+    return getModelValueLf(model) === currentValidLf;
+  }
+  model.setEOL(monaco.editor.EndOfLineSequence.LF);
+  model.setValue(preInvalidLf);
+  const hasRangeOps =
+    typeof (model as { getFullModelRange?: () => monaco.IRange }).getFullModelRange === 'function' &&
+    typeof model.pushEditOperations === 'function';
+  if (hasRangeOps) {
+    model.pushStackElement?.();
+    // Compute replacement range AFTER restoring preInvalidLf so shorter valid edits replace all lines/cols.
+    const fullRange = (model as { getFullModelRange: () => monaco.IRange }).getFullModelRange();
+    model.pushEditOperations([], [{ range: fullRange, text: currentValidLf }], () => null);
+    model.pushStackElement?.();
+    if (getModelValueLf(model) === currentValidLf) {
+      return true;
+    }
+  }
+  resetModelValueLf(model, currentValidLf);
+  return getModelValueLf(model) === currentValidLf;
 }
 
 export function disposeReadOnlyModel(documentId: string): void {
+  retainedDocumentMetadata.delete(documentId);
   const uri = opaqueReadOnlyModelUri(documentId);
-  monaco.editor.getModel(uri)?.dispose();
+  const model = monaco.editor.getModel(uri);
+  if (model && !(typeof (model as { isDisposed?: () => boolean }).isDisposed === 'function' && (model as { isDisposed: () => boolean }).isDisposed())) {
+    model.dispose();
+  }
 }
 
 export function getRetainedModelCount(): number {

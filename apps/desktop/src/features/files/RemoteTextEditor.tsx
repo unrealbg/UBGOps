@@ -246,20 +246,35 @@ export function RemoteTextEditor({ initial, host, session, connected, visible, t
     const current = scopeRef.current;
     if (!current.connected || !current.session || !visible || retired.current || !mounted.current) return;
     const requestGeneration = ++generation.current;
-    forgetApproval();
+    const pending = approvalRef.current;
+    approvalRef.current = null;
+    setApproval(null);
+    setRevisionStale(true);
     setError(null);
     setCancelNotice(false);
     setReloading(true);
     try {
       const oldDocument = documentRef.current;
-      const next = await filesApi.openText(current.session, oldDocument.path);
+      if (pending && !discardedPlans.current.has(pending.plan.id)) {
+        discardedPlans.current.add(pending.plan.id);
+        await filesApi.discardPlan(pending.session, pending.plan.id).catch(() => undefined);
+      }
+      if (!discardedDocuments.current.has(oldDocument.id)) {
+        discardedDocuments.current.add(oldDocument.id);
+        await filesApi.discardTextDocument(documentOwner(oldDocument), oldDocument.id).catch(() => undefined);
+      }
+      const afterDiscard = scopeRef.current;
+      if (!mounted.current || retired.current || generation.current !== requestGeneration ||
+          !afterDiscard.connected || !afterDiscard.session || !afterDiscard.visible) {
+        return;
+      }
+      const next = await filesApi.openText(afterDiscard.session, oldDocument.path);
       const latest = scopeRef.current;
       if (!mounted.current || retired.current || generation.current !== requestGeneration ||
           !latest.connected || !latest.visible || !owns(latest.session, next)) {
         discardDocumentOnce(next);
         return;
       }
-      discardDocumentOnce(oldDocument);
       documentRef.current = next;
       textRef.current = next.text;
       bufferGeneration.current += 1;
